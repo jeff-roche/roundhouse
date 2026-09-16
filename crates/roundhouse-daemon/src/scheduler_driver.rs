@@ -4126,6 +4126,13 @@ mod delivery_tests {
             .to_string()
     }
 
+    fn parent_continuing_after_cancelled_child_workflow() -> String {
+        "name: parent-child-cancellation\nversion: 1\npermissions:\n  default: deny\n  unattended:\n    \
+         escalate: fail\nsteps:\n  - id: child\n    call: child-read\n    with: { path: greeting.txt }\n    \
+         continue_on_error: true\n  - id: after\n    needs: [child]\n    emit: { continued: true }\n"
+            .to_string()
+    }
+
     fn child_failing_workflow() -> String {
         "name: child-fails\nversion: 1\npermissions:\n  default: deny\n  unattended:\n    \
          escalate: fail\nsteps:\n  - id: broken\n    emit: \"${{ no_such_fn(1) }}\"\n"
@@ -5062,7 +5069,15 @@ mod delivery_tests {
         );
         let parent_session_id = row.session_id.expect("reserve stamps a session id");
         let conn = harness.store.pool.get().await.unwrap();
-        let (parent_steps, child_refunded_at, parent_child_task_events) = conn
+        let (
+            parent_steps,
+            child_refunded_at,
+            parent_agent_task_id,
+            parent_agent_failed_events,
+            second_refund,
+            parent_spend_before_second_refund,
+            parent_spend_after_second_refund,
+        ) = conn
             .interact(move |connection| {
                 let parent_steps = recover_run(connection, parent_run_id).unwrap().steps;
                 let child_run_id: String = connection
@@ -5077,22 +5092,63 @@ mod delivery_tests {
                     roundhouse_flow::ledger::run_ledger(connection, child_run_id)
                         .unwrap()
                         .refunded_at;
-                let parent_child_task_events = connection
-                    .prepare("SELECT payload FROM events WHERE session_id = ?1 ORDER BY seq")
+                let parent_events = connection
+                    .prepare(
+                        "SELECT task_id, payload FROM events WHERE session_id = ?1 ORDER BY seq",
+                    )
                     .unwrap()
                     .query_map([parent_session_id.to_string()], |row| {
-                        row.get::<_, String>(0)
+                        Ok((row.get::<_, Option<String>>(0)?, row.get::<_, String>(1)?))
                     })
                     .unwrap()
                     .map(Result::unwrap)
-                    .filter(|payload| {
+                    .collect::<Vec<_>>();
+                let parent_agent_task_id = parent_events
+                    .iter()
+                    .find_map(|(task_id, payload)| {
                         matches!(
                             serde_json::from_str::<EventPayload>(payload).unwrap(),
-                            EventPayload::TaskFailed { .. }
+                            EventPayload::TaskCreated {
+                                kind: TaskKind::Agent,
+                                ..
+                            }
                         )
+                        .then(|| task_id.clone())
+                        .flatten()
+                    })
+                    .expect("the call creates one parent agent task");
+                let parent_agent_failed_events = parent_events
+                    .iter()
+                    .filter(|payload| {
+                        payload.0.as_deref() == Some(parent_agent_task_id.as_str())
+                            && matches!(
+                                serde_json::from_str::<EventPayload>(&payload.1).unwrap(),
+                                EventPayload::TaskFailed { .. }
+                            )
                     })
                     .count();
-                (parent_steps, child_refunded_at, parent_child_task_events)
+                let parent_spend_before_second_refund =
+                    roundhouse_flow::ledger::run_ledger(connection, parent_run_id)
+                        .unwrap()
+                        .spent;
+                let second_refund = roundhouse_flow::ledger::refund_child_run(
+                    connection,
+                    child_run_id,
+                    Timestamp::from_unix_nanos(1),
+                );
+                let parent_spend_after_second_refund =
+                    roundhouse_flow::ledger::run_ledger(connection, parent_run_id)
+                        .unwrap()
+                        .spent;
+                (
+                    parent_steps,
+                    child_refunded_at,
+                    parent_agent_task_id,
+                    parent_agent_failed_events,
+                    second_refund,
+                    parent_spend_before_second_refund,
+                    parent_spend_after_second_refund,
+                )
             })
             .await
             .unwrap();
@@ -5119,8 +5175,205 @@ mod delivery_tests {
             "the child terminal path refunded its grant"
         );
         assert_eq!(
-            parent_child_task_events, 1,
-            "the failed parent call has one terminal task event rather than attempting another refund"
+            parent_agent_failed_events, 1,
+            "the failed parent call has one terminal event on the original agent task {parent_agent_task_id}"
+        );
+        assert!(
+            matches!(
+                second_refund,
+                Err(roundhouse_flow::ledger::LedgerError::AlreadyRefunded { .. })
+            ),
+            "a second refund must be rejected by the durable idempotency guard"
+        );
+        assert_eq!(
+            parent_spend_after_second_refund, parent_spend_before_second_refund,
+            "a refused second refund must not change the parent ledger"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_child_cancels_its_parent_agent_task_without_stopping_a_continuing_parent()
+    {
+        let mut harness = harness_with_overlap_and_rules(
+            parent_continuing_after_cancelled_child_workflow(),
+            OverlapPolicy::Skip,
+            allow_read_rules(),
+        )
+        .await;
+        std::fs::write(harness.workspace_root.join("greeting.txt"), "hello child").unwrap();
+        let child_source = harness.workspace_root.join("child.yaml");
+        std::fs::write(&child_source, child_reading_workflow()).unwrap();
+        let root = harness.workspace_root.clone();
+        let conn = harness.store.pool.get().await.unwrap();
+        conn.interact(move |connection| {
+            register_workflow_file(connection, &root, &child_source, template()).unwrap();
+        })
+        .await
+        .unwrap();
+
+        let gate = Arc::new(SegmentGapGate::new());
+        harness.executor.segment_gap_gate = Some(Arc::clone(&gate));
+        let executor = harness.executor.clone();
+        let delivery = harness.delivery.clone();
+        let stored = harness.stored.clone();
+        let drive = tokio::spawn(async move {
+            executor.claim_and_run(delivery, stored).await;
+        });
+
+        for _ in 0..100_000 {
+            if gate.entrants() == 1 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            gate.entrants(),
+            1,
+            "the parent waits before starting its child"
+        );
+        gate.release(1);
+        for _ in 0..100_000 {
+            if gate.entrants() == 2 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            gate.entrants(),
+            2,
+            "the child waits before completing its pending work"
+        );
+
+        let row = harness.delivery_row().await;
+        let parent_run_id = RunId::from_uuid(
+            Uuid::parse_str(row.run_id.as_deref().expect("reserve stamps a run id")).unwrap(),
+        );
+        let conn = harness.store.pool.get().await.unwrap();
+        let child_run_id = conn
+            .interact(move |connection| {
+                let child_run_id: String = connection
+                    .query_row(
+                        "SELECT id FROM workflow_run WHERE parent_run_id = ?1",
+                        [parent_run_id.to_string()],
+                        |row| row.get(0),
+                    )
+                    .unwrap();
+                let child_run_id = RunId::from_uuid(Uuid::parse_str(&child_run_id).unwrap());
+                roundhouse_flow::control::cancel(
+                    connection,
+                    child_run_id,
+                    Timestamp::from_unix_nanos(1),
+                )
+                .unwrap();
+                child_run_id
+            })
+            .await
+            .unwrap();
+        gate.release(1);
+        drive.await.unwrap();
+
+        let row = harness.delivery_row().await;
+        let parent_session_id = row.session_id.expect("reserve stamps a session id");
+        let conn = harness.store.pool.get().await.unwrap();
+        let (parent_steps, child_state, parent_events) = conn
+            .interact(move |connection| {
+                let parent_steps = recover_run(connection, parent_run_id).unwrap().steps;
+                let child_state = recover_run(connection, child_run_id).unwrap().run.state;
+                let parent_events = connection
+                    .prepare(
+                        "SELECT task_id, seq, payload FROM events WHERE session_id = ?1 ORDER BY seq",
+                    )
+                    .unwrap()
+                    .query_map([parent_session_id.to_string()], |row| {
+                        Ok((
+                            row.get::<_, Option<String>>(0)?,
+                            row.get::<_, i64>(1)?,
+                            row.get::<_, String>(2)?,
+                        ))
+                    })
+                    .unwrap()
+                    .map(Result::unwrap)
+                    .collect::<Vec<_>>();
+                (parent_steps, child_state, parent_events)
+            })
+            .await
+            .unwrap();
+        let parent_agent_task_id = parent_events
+            .iter()
+            .find_map(|(task_id, _, payload)| {
+                matches!(
+                    serde_json::from_str::<EventPayload>(payload).unwrap(),
+                    EventPayload::TaskCreated {
+                        kind: TaskKind::Agent,
+                        ..
+                    }
+                )
+                .then(|| task_id.clone())
+                .flatten()
+            })
+            .expect("the call creates one parent agent task");
+        let parent_agent_terminal_events = parent_events
+            .iter()
+            .filter(|(task_id, _, payload)| {
+                task_id.as_deref() == Some(parent_agent_task_id.as_str())
+                    && matches!(
+                        serde_json::from_str::<EventPayload>(payload).unwrap(),
+                        EventPayload::TaskCancelled { .. }
+                    )
+            })
+            .count();
+        let parent_agent_completions = parent_events
+            .iter()
+            .filter(|(task_id, _, payload)| {
+                task_id.as_deref() == Some(parent_agent_task_id.as_str())
+                    && matches!(
+                        serde_json::from_str::<EventPayload>(payload).unwrap(),
+                        EventPayload::TaskCompleted { .. }
+                    )
+            })
+            .count();
+        let parent_agent_bounds = parent_events
+            .iter()
+            .filter(|(task_id, _, payload)| {
+                task_id.as_deref() == Some(parent_agent_task_id.as_str())
+                    && matches!(
+                        serde_json::from_str::<EventPayload>(payload).unwrap(),
+                        EventPayload::TaskCreated {
+                            kind: TaskKind::Agent,
+                            ..
+                        } | EventPayload::TaskCancelled { .. }
+                    )
+            })
+            .map(|(_, seq, _)| u64::try_from(*seq).expect("event sequences are nonnegative"))
+            .collect::<Vec<_>>();
+        let child_step = parent_steps
+            .iter()
+            .find(|step| step.step_id == "child")
+            .expect("the cancelled child call is checkpointed");
+
+        assert_eq!(row.state, DeliveryState::Delivered);
+        assert_eq!(child_state, RunState::Cancelled);
+        assert_eq!(
+            child_step.state,
+            roundhouse_flow::durability::StepRunState::Failed
+        );
+        assert_eq!(
+            parent_steps
+                .iter()
+                .find(|step| step.step_id == "after")
+                .expect("continue_on_error allows the next parent step")
+                .state,
+            roundhouse_flow::durability::StepRunState::Completed
+        );
+        assert_eq!(parent_agent_terminal_events, 1);
+        assert_eq!(
+            parent_agent_completions, 0,
+            "a cancelled child must not complete its parent task"
+        );
+        assert_eq!(parent_agent_bounds.len(), 2);
+        assert_eq!(
+            (child_step.first_task_seq, child_step.last_task_seq),
+            (Some(parent_agent_bounds[0]), Some(parent_agent_bounds[1]))
         );
     }
 
