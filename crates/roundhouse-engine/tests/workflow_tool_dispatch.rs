@@ -12,11 +12,12 @@ use roundhouse_engine::SessionActor;
 use roundhouse_policy::engine::{
     CompiledRule, Outcome as PolicyOutcome, PolicyEngine, Predicate, Scope,
 };
+use roundhouse_policy::FsOp;
 use roundhouse_sandbox::{
     Attestation, Child, CommandSpec, Handle, Isolate, IsolationError, ProbeResult,
     Tier as SandboxTier,
 };
-use roundhouse_store::{open, session_events, spawn_writer};
+use roundhouse_store::{open, session_events, spawn_writer, StorePool};
 use serde_json::json;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
@@ -178,83 +179,167 @@ fn workspace_program(workspace_root: &Path, name: &str, contents: &str) -> Strin
         .into_owned()
 }
 
-/// `write` dispatches without hitting unsupported_workflow_tool gate.
+/// Reopens `db_path` and returns the `IsolationAttestation` carried by
+/// `task_id`'s own `TaskStarted` event — the only place an attestation is
+/// recorded (`dispatch_tool_for_workflow` never writes one to the `tasks`
+/// materialized view).
+async fn started_isolation(
+    db_path: &Path,
+    session_id: SessionId,
+    task_id: roundhouse_core::TaskId,
+) -> roundhouse_core::IsolationAttestation {
+    let reopened = open(db_path).await.unwrap();
+    session_events(&reopened, session_id)
+        .await
+        .unwrap()
+        .into_iter()
+        .find_map(|e| match e.payload {
+            EventPayload::TaskStarted { isolation, .. } if e.task_id == Some(task_id) => {
+                Some(isolation)
+            }
+            _ => None,
+        })
+        .expect("the dispatched task's own TaskStarted event must exist in the session log")
+}
+
+/// `write` dispatches through to a real in-workspace execution (Task 2,
+/// closing Task 1's own deferred gap — see this file's own
+/// `shell_tool_dispatches_through` doc comment for why an out-of-workspace
+/// fixture path can never reach `TaskStarted` at all: containment rejects
+/// it before admission), and — the point of this test post-Task-2 — keeps
+/// the placeholder `IsolationAttestation { tier: Tier::None, .. }`
+/// `dispatch_tool_for_workflow` reserves for in-process filesystem builtins.
 #[tokio::test]
 async fn write_tool_dispatches_through() {
     let dir = TempDir::new().unwrap();
-    let (actor, _workspace_root, _db_path, _session_id) = setup_actor(&dir, vec![]).await;
+    let target = dir.path().canonicalize().unwrap().join("out.txt");
+    let target_str = target.to_string_lossy().to_string();
+    let (actor, _workspace_root, db_path, session_id) = setup_actor(
+        &dir,
+        vec![CompiledRule::test_new(
+            Scope::Builtin,
+            PolicyOutcome::Allow,
+            Predicate::FsExact {
+                op: FsOp::Write,
+                path: target.clone(),
+            },
+        )],
+    )
+    .await;
 
     let result = dispatch_tool_for_workflow(
         &actor,
         TaskKind::Write,
-        json!({ "path": "/tmp/test.txt", "content": "hello" }),
-        json!({ "path": "/tmp/test.txt", "content": "hello" }),
+        json!({ "path": &target_str, "contents": "hello" }),
+        json!({ "path": &target_str, "contents": "hello" }),
     )
     .await;
 
     let dispatch = result.expect("dispatch should succeed");
-    // Should not contain "not wired yet" which is the unsupported tool message
-    match dispatch.result {
-        Ok(_) => {} // Success
-        Err(msg) => {
-            assert!(
-                !msg.contains("not wired yet"),
-                "write should be supported, not unsupported_workflow_tool: {msg}"
-            );
-        }
-    }
+    dispatch
+        .result
+        .as_ref()
+        .unwrap_or_else(|msg| panic!("an in-workspace, allowed write must actually run: {msg}"));
+
+    let isolation = started_isolation(&db_path, session_id, dispatch.task_id).await;
+    assert_eq!(
+        isolation.tier,
+        Tier::None,
+        "write stays in-process — it must keep the placeholder attestation, not inherit a real \
+         one, got {isolation:?}"
+    );
 }
 
-/// `edit` dispatches without hitting unsupported_workflow_tool gate.
+/// `edit` dispatches through to a real, in-workspace execution and keeps the
+/// placeholder `Tier::None` attestation — see `write_tool_dispatches_through`'s
+/// doc comment for why an in-workspace fixture is required to reach
+/// `TaskStarted` at all.
 #[tokio::test]
 async fn edit_tool_dispatches_through() {
     let dir = TempDir::new().unwrap();
-    let (actor, _workspace_root, _db_path, _session_id) = setup_actor(&dir, vec![]).await;
+    let workspace_root = dir.path().canonicalize().unwrap();
+    let target = workspace_root.join("edit.txt");
+    std::fs::write(&target, "a").unwrap();
+    let target_str = target.to_string_lossy().to_string();
+    let (actor, _workspace_root, db_path, session_id) = setup_actor(
+        &dir,
+        vec![CompiledRule::test_new(
+            Scope::Builtin,
+            PolicyOutcome::Allow,
+            Predicate::FsExact {
+                op: FsOp::Edit,
+                path: target.clone(),
+            },
+        )],
+    )
+    .await;
 
     let result = dispatch_tool_for_workflow(
         &actor,
         TaskKind::Edit,
-        json!({ "path": "/tmp/test.txt", "action": "replace_all", "old": "a", "new": "b" }),
-        json!({ "path": "/tmp/test.txt", "action": "replace_all", "old": "a", "new": "b" }),
+        json!({ "path": &target_str, "find": "a", "replace": "b" }),
+        json!({ "path": &target_str, "find": "a", "replace": "b" }),
     )
     .await;
 
     let dispatch = result.expect("dispatch should succeed");
-    match dispatch.result {
-        Ok(_) => {}
-        Err(msg) => {
-            assert!(
-                !msg.contains("not wired yet"),
-                "edit should be supported, not unsupported_workflow_tool: {msg}"
-            );
-        }
-    }
+    dispatch
+        .result
+        .as_ref()
+        .unwrap_or_else(|msg| panic!("an in-workspace, allowed edit must actually run: {msg}"));
+
+    let isolation = started_isolation(&db_path, session_id, dispatch.task_id).await;
+    assert_eq!(
+        isolation.tier,
+        Tier::None,
+        "edit stays in-process — it must keep the placeholder attestation, not inherit a real \
+         one, got {isolation:?}"
+    );
 }
 
-/// `find` dispatches without hitting unsupported_workflow_tool gate.
+/// `find` dispatches through to a real, in-workspace execution and keeps the
+/// placeholder `Tier::None` attestation — see `write_tool_dispatches_through`'s
+/// doc comment for why an in-workspace fixture is required to reach
+/// `TaskStarted` at all.
 #[tokio::test]
 async fn find_tool_dispatches_through() {
     let dir = TempDir::new().unwrap();
-    let (actor, _workspace_root, _db_path, _session_id) = setup_actor(&dir, vec![]).await;
+    let workspace_root = dir.path().canonicalize().unwrap();
+    let (actor, _workspace_root, db_path, session_id) = setup_actor(
+        &dir,
+        vec![CompiledRule::test_new(
+            Scope::Builtin,
+            PolicyOutcome::Allow,
+            Predicate::FsExact {
+                op: FsOp::Find,
+                path: workspace_root.clone(),
+            },
+        )],
+    )
+    .await;
+    let root_str = workspace_root.to_string_lossy().to_string();
 
     let result = dispatch_tool_for_workflow(
         &actor,
         TaskKind::Find,
-        json!({ "root": "/tmp", "regex": ".*\\.txt" }),
-        json!({ "root": "/tmp", "regex": ".*\\.txt" }),
+        json!({ "root": &root_str, "pattern": "*.txt" }),
+        json!({ "root": &root_str, "pattern": "*.txt" }),
     )
     .await;
 
     let dispatch = result.expect("dispatch should succeed");
-    match dispatch.result {
-        Ok(_) => {}
-        Err(msg) => {
-            assert!(
-                !msg.contains("not wired yet"),
-                "find should be supported, not unsupported_workflow_tool: {msg}"
-            );
-        }
-    }
+    dispatch
+        .result
+        .as_ref()
+        .unwrap_or_else(|msg| panic!("an in-workspace, allowed find must actually run: {msg}"));
+
+    let isolation = started_isolation(&db_path, session_id, dispatch.task_id).await;
+    assert_eq!(
+        isolation.tier,
+        Tier::None,
+        "find stays in-process — it must keep the placeholder attestation, not inherit a real \
+         one, got {isolation:?}"
+    );
 }
 
 /// An authored `tool: shell` step reaches — and runs through —
@@ -267,12 +352,11 @@ async fn find_tool_dispatches_through() {
 /// assertions below are on the script's own stdout and on the recorded
 /// `TaskStarted`/`TaskCompleted` pair: neither is reachable unless every
 /// chokepoint between the allowlist gate and `run_isolated_shell_dispatch`'s
-/// `spawn_isolated` call was actually cleared.
-///
-/// What this does *not* cover: the placeholder
-/// `IsolationAttestation { tier: Tier::None, .. }` `dispatch_tool_for_workflow`
-/// still records for a shell step, and execution under a real sandbox —
-/// both are Task 2's, per this phase's task brief.
+/// `spawn_isolated` call was actually cleared. This also asserts the
+/// `TaskStarted` event's `IsolationAttestation` is real (`TestIsolate::attest`'s
+/// `Tier::Sandbox`, not the `Tier::None` placeholder the fs kinds keep) —
+/// Task 2's own exit criterion, distinguishing this kind from
+/// `write`/`edit`/`find` (see those tests' own `Tier::None` assertions).
 #[tokio::test]
 async fn shell_tool_dispatches_through() {
     let dir = TempDir::new().unwrap();
@@ -342,6 +426,14 @@ async fn shell_tool_dispatches_through() {
         vec!["TaskCreated", "TaskStarted", "TaskCompleted"],
         "a shell step that executed must have the full S-LOG-1 lifecycle recorded"
     );
+
+    let isolation = started_isolation(&db_path, session_id, dispatch.task_id).await;
+    assert_ne!(
+        isolation.tier,
+        Tier::None,
+        "shell crosses the process isolation boundary — its TaskStarted must carry a real \
+         attestation, not the fs kinds' Tier::None placeholder, got {isolation:?}"
+    );
 }
 
 /// Unsupported tools (Http, Git, Mcp) are rejected with unsupported_workflow_tool.
@@ -361,5 +453,173 @@ async fn unsupported_tools_rejected() {
                 "Http should be rejected as unsupported: {msg}"
             );
         }
+    }
+}
+
+/// An isolate whose `spawn` records the pre-spawned child's real pid, then
+/// immediately closes `store`'s connection pool — a deterministic way to
+/// force `dispatch_tool_for_workflow`'s very next store write (the
+/// `TaskStarted` append that follows pre-spawn) to fail, with no
+/// sleep/timing race involved.
+///
+/// `StorePool.pool` is public specifically so integration tests can reach
+/// into pool internals directly (see that field's own doc comment in
+/// `roundhouse-store`'s `pool.rs`), and `deadpool_sqlite::Pool::close`'s own
+/// doc guarantees `PoolError::Closed` for every future `.get()` call
+/// immediately, not eventually — so closing it synchronously inside `spawn`,
+/// before returning the already-real child, is a genuine injection point,
+/// not a fabricated one.
+struct PoolClosingIsolate {
+    store: StorePool,
+    spawned_pid: std::sync::Mutex<Option<u32>>,
+}
+
+#[async_trait::async_trait]
+impl Isolate for PoolClosingIsolate {
+    fn declared(&self) -> SandboxTier {
+        SandboxTier::Sandbox
+    }
+    async fn probe(&self) -> ProbeResult {
+        ProbeResult {
+            achieved: SandboxTier::Sandbox,
+            degradations: vec![],
+        }
+    }
+    async fn prepare(
+        &self,
+        _spec: &roundhouse_core::SessionSpec,
+    ) -> Result<Handle, IsolationError> {
+        Ok(Handle {
+            id: "pool-closing-isolate".into(),
+        })
+    }
+    async fn spawn(&self, _handle: &Handle, command: CommandSpec) -> Result<Child, IsolationError> {
+        let mut process = tokio::process::Command::new(&command.program);
+        process
+            .args(&command.argv)
+            .current_dir(command.cwd.as_deref().unwrap_or("."))
+            .env_clear()
+            .envs(command.env)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        #[cfg(unix)]
+        process.process_group(0);
+        let child = process
+            .spawn()
+            .map_err(|err| IsolationError::Unsupported(err.to_string()))?;
+        let pid = child
+            .id()
+            .ok_or_else(|| IsolationError::Unsupported("test child has no pid".into()))?;
+        *self.spawned_pid.lock().unwrap() = Some(pid);
+        // The injection point: close the pool BEFORE returning the spawned
+        // child, so the very next store write (`TaskStarted`'s append, back
+        // in `dispatch_tool_for_workflow`) deterministically fails.
+        self.store.pool.close();
+        Ok(Child::from_process(pid, child))
+    }
+    fn attest(&self, _handle: &Handle) -> Attestation {
+        Attestation {
+            tier: SandboxTier::Sandbox,
+            digest: "test".into(),
+            net_enforced: false,
+        }
+    }
+    async fn teardown(&self, _handle: Handle) -> Result<(), IsolationError> {
+        Ok(())
+    }
+}
+
+/// A `TaskStarted`-append failure after a shell child has been pre-spawned
+/// must cancel that child, not orphan it — `dispatch_tool_for_workflow`'s
+/// cleanup branch, mirroring `agent_loop::dispatch_builtin`'s identical one
+/// (this task's brief, item 3).
+///
+/// The dispatched program is a long-lived real process (`sleep 30`): if
+/// cleanup never ran, it would still be alive well after this test's own
+/// call returns, which the final `kill -0` check below would catch.
+#[tokio::test]
+async fn shell_task_started_append_failure_cancels_the_pre_spawned_child() {
+    let dir = TempDir::new().unwrap();
+    let workspace_root = dir.path().canonicalize().unwrap();
+    let program = workspace_program(&workspace_root, "sleep_long.sh", "#!/bin/sh\nsleep 30\n");
+
+    let db_path = dir.path().join("events.db");
+    let store = open(&db_path).await.unwrap();
+    let writer = spawn_writer(store.clone()).await;
+
+    let isolate = Arc::new(PoolClosingIsolate {
+        store: store.clone(),
+        spawned_pid: std::sync::Mutex::new(None),
+    });
+    let session_spec =
+        roundhouse_core::SessionSpec::test_requesting(Tier::Sandbox, OnDegrade::Refuse);
+    let handle = isolate.prepare(&session_spec).await.unwrap();
+    let session_id = SessionId::new();
+
+    let rules = vec![CompiledRule::test_new(
+        Scope::Builtin,
+        PolicyOutcome::Allow,
+        Predicate::program(&program),
+    )];
+    let actor = Arc::new(SessionActor::new_with_workspace_root(
+        session_id,
+        writer,
+        SessionState::Running,
+        &RUNNER,
+        Arc::new(PolicyEngine::from_rules(rules)),
+        dir.path().join("state"),
+        dir.path().join("daemon-binary"),
+        workspace_root.clone(),
+        isolate.clone() as Arc<dyn Isolate>,
+        handle,
+        session_spec,
+        vec![],
+    ));
+
+    let cwd = workspace_root.to_string_lossy().to_string();
+    let result = dispatch_tool_for_workflow(
+        &actor,
+        TaskKind::Shell,
+        json!({ "program": &program, "argv": [], "cwd": &cwd }),
+        json!({ "program": &program, "argv": [], "cwd": &cwd }),
+    )
+    .await;
+
+    // The pool closing mid-dispatch means every store write after the
+    // pre-spawn fails, including the TaskFailed `dispatch_tool_for_workflow`
+    // tries to record on its way out — so the whole call surfaces as `Err`
+    // rather than the ordinary `Ok(WorkflowToolDispatch { result: Err(..) })`
+    // shape. That's expected: this test's point is the child, not the event
+    // log (which the closed pool makes unobservable for this run anyway).
+    assert!(
+        result.is_err(),
+        "a TaskStarted append against a closed pool must surface as an error, not silently \
+         succeed"
+    );
+
+    let pid =
+        isolate.spawned_pid.lock().unwrap().expect(
+            "PoolClosingIsolate::spawn must have recorded the pre-spawned child's real pid",
+        );
+
+    // By the time `dispatch_tool_for_workflow` returned, it must already
+    // have awaited `child.cancel()` in its TaskStarted-append-failure
+    // branch — no extra wait is needed here for that to have taken effect.
+    #[cfg(unix)]
+    {
+        let still_alive = std::process::Command::new("kill")
+            .arg("-0")
+            .arg(pid.to_string())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false);
+        assert!(
+            !still_alive,
+            "a pre-spawned shell child must be cancelled (SIGTERM/SIGKILL), not orphaned, when \
+             the TaskStarted append that follows it fails (pid {pid})"
+        );
     }
 }

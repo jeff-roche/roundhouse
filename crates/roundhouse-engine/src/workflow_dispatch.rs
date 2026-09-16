@@ -7,10 +7,13 @@
 //! contract this fills.
 //!
 //! **Scope: `TaskKind::Read | Write | Edit | Find | Shell`.** Every other
-//! built-in is refused with a named, recorded failure. `Shell` in particular
-//! gets its real isolation wiring in Task 2 of this phase; for now it
-//! dispatches with the placeholder `IsolationAttestation { tier: Tier::None, .. }`
-//! (see the comment at `task_started` below).
+//! built-in is refused with a named, recorded failure. `Shell` is the one
+//! kind that crosses the process isolation boundary: it pre-spawns its
+//! child before `TaskStarted` and attests to the real isolate, mirroring
+//! `agent_loop::dispatch_builtin`'s identical wiring (Phase 8 Task 25.4
+//! Task 2). `Read`/`Write`/`Edit`/`Find` stay in-process and keep the
+//! placeholder `IsolationAttestation { tier: Tier::None, .. }` (see the
+//! comment at its literal below).
 //!
 //! # Why this is not `dispatch_builtin` with different arguments
 //!
@@ -24,10 +27,11 @@
 //! which `dispatch_builtin`'s single `input` parameter cannot carry.
 
 use crate::agent_loop::now_ts;
-use crate::session_actor::{SessionActor, TaskCreateRequest};
+use crate::session_actor::{SessionActor, TaskCreateRequest, TaskIsolator};
 use roundhouse_core::{
     IsolationAttestation, Origin, TaskError, TaskId, TaskInput, TaskKind, TaskOutput, Tier, Usage,
 };
+use roundhouse_policy::TaskParams;
 
 /// What dispatching one workflow `tool:` step for real produced.
 ///
@@ -145,22 +149,97 @@ pub async fn dispatch_tool_for_workflow(
         });
     }
 
+    // Start a shell child before `TaskStarted` so its attestation reflects
+    // the live process that will execute the admitted task — mirrors
+    // `agent_loop::dispatch_builtin`'s identical, load-bearing ordering:
+    // the attestation appended below must describe the process that
+    // actually executes this task, so the spawn happens first. The child is
+    // handed to `execute_builtin` below; it is not spawned a second time.
+    let pre_spawned = if let TaskParams::Shell(cmd) = &params {
+        let cwd = match extras.shell_cwd.as_deref() {
+            Some(cwd) => cwd,
+            None => {
+                let last_task_seq = record_workflow_task_failed(
+                    actor,
+                    task_id,
+                    "isolation_error",
+                    "tool execution failed".into(),
+                )
+                .await?;
+                return Ok(WorkflowToolDispatch {
+                    task_id,
+                    first_task_seq,
+                    last_task_seq: Some(last_task_seq),
+                    result: Err("tool execution failed".into()),
+                });
+            }
+        };
+        match actor
+            .spawn_isolated(crate::tool_dispatch::isolated_shell_command(cmd, cwd))
+            .await
+        {
+            Ok(child) => Some(child),
+            Err(err) => {
+                tracing::warn!(error = %err, "admitted workflow shell isolation spawn failed");
+                let last_task_seq = record_workflow_task_failed(
+                    actor,
+                    task_id,
+                    "isolation_error",
+                    "tool execution failed".into(),
+                )
+                .await?;
+                return Ok(WorkflowToolDispatch {
+                    task_id,
+                    first_task_seq,
+                    last_task_seq: Some(last_task_seq),
+                    result: Err("tool execution failed".into()),
+                });
+            }
+        }
+    } else {
+        None
+    };
+
     let started = runner.record_task_started(
         actor.session_id(),
         0,
         now_ts(),
         task_id,
-        // Filesystem built-ins stay in-process — no isolation boundary to
-        // attest to, matching `dispatch_builtin`'s own non-shell arm.
-        IsolationAttestation {
-            tier: Tier::None,
-            digest: String::new(),
-            net_enforced: false,
+        // Only shell tasks cross the process isolation boundary. Filesystem
+        // helpers remain in-process and must not inherit the session's shell
+        // attestation in their per-task event — matches
+        // `agent_loop::dispatch_builtin`'s identical conditional. A future
+        // editor: do not "generalize" real attestation onto the
+        // Read/Write/Edit/Find arms above — they never pre-spawn a child.
+        if pre_spawned.is_some() {
+            let attestation = actor.isolation_attestation();
+            IsolationAttestation {
+                tier: attestation.tier,
+                digest: attestation.digest,
+                net_enforced: attestation.net_enforced,
+            }
+        } else {
+            IsolationAttestation {
+                tier: Tier::None,
+                digest: String::new(),
+                net_enforced: false,
+            }
         },
         None,
         1,
     );
     if let Err(err) = writer.append(started).await {
+        // A shell child that was pre-spawned above must not outlive a
+        // failed `TaskStarted` append — mirrors
+        // `agent_loop::dispatch_builtin`'s identical cleanup branch.
+        if let Some(child) = pre_spawned.as_ref() {
+            if let Err(cleanup_err) = child.cancel().await {
+                tracing::error!(
+                    error = %cleanup_err,
+                    "failed to clean up an isolated workflow shell child after TaskStarted append failure"
+                );
+            }
+        }
         let last_task_seq = record_workflow_task_failed(
             actor,
             task_id,
@@ -183,7 +262,7 @@ pub async fn dispatch_tool_for_workflow(
         &extras,
         &dispatch_input,
         Some(actor.subscribe()),
-        None,
+        pre_spawned,
         actor,
     )
     .await

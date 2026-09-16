@@ -46,10 +46,12 @@
 //! wall-clock alignment at run time — a real, unnecessary slowness/flakiness
 //! risk `Interval` avoids entirely by design.
 
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use std::sync::Arc;
 use std::time::Duration;
 
-use roundhouse_core::Tier;
+use roundhouse_core::{EventPayload, Tier};
 use roundhouse_daemon::scheduler_driver;
 use roundhouse_daemon::session_bootstrap::{policy_rules_from_files, BackgroundServices};
 use roundhouse_daemon::session_registry::SessionRegistry;
@@ -58,9 +60,14 @@ use roundhouse_flow::exec::RunId;
 use roundhouse_flow::job::SessionTemplate;
 use roundhouse_flow::job_store::register_workflow_file;
 use roundhouse_policy::config::compile_policy_layers;
+use roundhouse_policy::engine::{CompiledRule, Outcome as PolicyOutcome, Predicate, Scope};
 use roundhouse_policy::trust::{record_explicit_trust, TrustStore};
+use roundhouse_sandbox::{
+    Attestation, Child, CommandSpec, Handle, Isolate, IsolationError, ProbeResult,
+};
 use roundhouse_sched::delivery::DeliveryState;
 use roundhouse_sched::store::list_deliveries_in_states;
+use roundhouse_store::session_events;
 
 mod common;
 
@@ -524,6 +531,331 @@ async fn a_scheduled_runs_tool_read_step_executes_for_real_and_the_run_completes
     assert_eq!(
         read_task_count, 1,
         "the run's session must record exactly one completed Read-kind task"
+    );
+
+    running
+        .shutdown()
+        .await
+        .expect("the scheduler driver must observe cancellation and return Ok");
+}
+
+/// A real-process-spawning `Isolate` for the shell end-to-end test below.
+///
+/// `common::available_isolate` (`BwrapLandlockIsolate::test_with_probe`) is
+/// right for the other tests in this file, none of which actually spawn a
+/// process through it — but its `spawn` execs a hardcoded, nonexistent
+/// `bwrap_path` (`/usr/libexec/roundhouse/bwrap`), so it cannot be used
+/// where a test's whole point is a real dispatched process's real stdout.
+/// This copies `roundhouse-engine`'s own `tests/workflow_tool_dispatch.rs`
+/// `TestIsolate` — a real subprocess with no real sandbox — into this crate
+/// (a test-only double is not worth sharing across crates for one struct).
+struct RealSpawnTestIsolate;
+
+#[async_trait::async_trait]
+impl Isolate for RealSpawnTestIsolate {
+    fn declared(&self) -> Tier {
+        Tier::Sandbox
+    }
+    async fn probe(&self) -> ProbeResult {
+        ProbeResult {
+            achieved: Tier::Sandbox,
+            degradations: vec![],
+        }
+    }
+    async fn prepare(
+        &self,
+        _spec: &roundhouse_core::SessionSpec,
+    ) -> Result<Handle, IsolationError> {
+        Ok(Handle {
+            id: "real-spawn-test-isolate".into(),
+        })
+    }
+    async fn spawn(&self, _handle: &Handle, command: CommandSpec) -> Result<Child, IsolationError> {
+        let mut process = tokio::process::Command::new(&command.program);
+        process
+            .args(&command.argv)
+            .current_dir(command.cwd.as_deref().unwrap_or("."))
+            .env_clear()
+            .envs(command.env)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        #[cfg(unix)]
+        process.process_group(0);
+        let child = process
+            .spawn()
+            .map_err(|err| IsolationError::Unsupported(err.to_string()))?;
+        let pid = child
+            .id()
+            .ok_or_else(|| IsolationError::Unsupported("test child has no pid".into()))?;
+        Ok(Child::from_process(pid, child))
+    }
+    fn attest(&self, _handle: &Handle) -> Attestation {
+        // Must equal the session's requested tier: `sealed_tier_shortfall`
+        // (`roundhouse_policy::sealed`) denies every task when
+        // `attested_tier < requested_tier`, and `template()`'s
+        // `isolation: Tier::Sandbox` is what this test's session requests.
+        Attestation {
+            tier: Tier::Sandbox,
+            digest: "test".into(),
+            net_enforced: false,
+        }
+    }
+    async fn teardown(&self, _handle: Handle) -> Result<(), IsolationError> {
+        Ok(())
+    }
+}
+
+/// Writes an executable script `name` directly under `workspace_root` and
+/// returns the exact `program` string `resolve_shell_program`
+/// (`roundhouse-engine::tool_dispatch`) will derive for it — mirrors
+/// `roundhouse-engine`'s own `tests/workflow_tool_dispatch.rs`'s
+/// `workspace_program` helper (see that helper's own doc comment for why a
+/// `/`-containing, workspace-local path is required rather than a bare name
+/// resolved off `$PATH`: `Predicate::Shell`'s program comparison in
+/// `roundhouse-policy`'s `engine.rs` is an exact string match, and only this
+/// derivation is portable enough to write a rule against).
+fn workspace_shell_program(workspace_root: &std::path::Path, name: &str, contents: &str) -> String {
+    let script = workspace_root.join(name);
+    std::fs::write(&script, contents).unwrap();
+    #[cfg(unix)]
+    {
+        let mut perms = std::fs::metadata(&script).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&script, perms).unwrap();
+    }
+    script
+        .parent()
+        .unwrap()
+        .canonicalize()
+        .unwrap()
+        .join(name)
+        .to_string_lossy()
+        .into_owned()
+}
+
+/// A workflow whose single step is a real `tool: shell` — Phase 8 Task
+/// 25.4 Task 2's own exit criterion: this step must suspend the run
+/// (`RunOutcome::AwaitingWork`), be dispatched for real by
+/// `DeliveryExecutor::execute_pending`/`dispatch_tool_for_workflow`, cross
+/// the process isolation boundary through a real pre-spawned, attested
+/// child, and resume the run to completion.
+fn shell_workflow(program: &str, cwd: &str) -> String {
+    format!(
+        "name: scheduled-shell\nversion: 1\npermissions:\n  default: deny\n  unattended:\n    \
+         escalate: fail\nsteps:\n  - id: run_it\n    tool: shell\n    with: {{ program: \
+         {program:?}, argv: [], cwd: {cwd:?} }}\n"
+    )
+}
+
+/// Phase 8 Task 25.4 Task 2's exit criterion, proven end to end through the
+/// same real production composition path the sibling `tool: read` test
+/// uses: a scheduled run's `tool: shell` step actually runs a real process
+/// — admitted through the real `SessionActor::admit_task` gate, pre-spawned
+/// and attested through `dispatch_tool_for_workflow`'s real isolation
+/// wiring, and recorded as a real `Shell`-kind task with a real
+/// `IsolationAttestation` (not the `Tier::None` placeholder the
+/// `Read`/`Write`/`Edit`/`Find` kinds keep) — with the run reaching
+/// `Completed` afterward.
+#[tokio::test]
+async fn a_scheduled_runs_tool_shell_step_executes_for_real_and_attests_real_isolation() {
+    let dir = tempfile::tempdir().unwrap();
+    let workspace_root = dir.path().canonicalize().unwrap();
+
+    let program = workspace_shell_program(
+        &workspace_root,
+        "echo.sh",
+        "#!/bin/sh\necho hello-from-scheduled-shell\n",
+    );
+
+    // This session's own `SessionActor::admit_task` gate is independent of
+    // this workflow's `permissions:` block (that one governs `gate:`/hitl
+    // escalation inside `roundhouse-flow`) — same two-systems note the
+    // sibling `tool: read` test's own comment makes. A `.roundhouse/
+    // policy.toml`-file rule (`roundhouse-config`'s `PolicyRule`) can only
+    // express a `read` path, not a shell program, so the allow rule is
+    // supplied directly as a `PolicyRuleSource` closure returning a real
+    // `CompiledRule` — the same mechanism Task 1's own shell test needed
+    // (`roundhouse-engine`'s `tests/workflow_tool_dispatch.rs`) and the
+    // identical mechanism `sub_agent_host.rs`'s own `allow_agent_rules` test
+    // helper already uses in this crate.
+    let program_for_rule = program.clone();
+    let policy_rules: roundhouse_daemon::session_bootstrap::PolicyRuleSource =
+        Arc::new(move || {
+            vec![CompiledRule::test_new(
+                Scope::Builtin,
+                PolicyOutcome::Allow,
+                Predicate::program(&program_for_rule),
+            )]
+        });
+
+    let resources = common::resources_with(
+        dir.path(),
+        Arc::new(RealSpawnTestIsolate),
+        Arc::new(common::NoopProvider),
+        policy_rules,
+    )
+    .await;
+    let sessions = Arc::new(SessionRegistry::new());
+
+    let workspace = resources
+        .workspace_registry
+        .as_ref()
+        .expect("real_resources wires a real WorkspaceRegistry")
+        .resolve("default")
+        .expect("real_resources registers a \"default\" workspace");
+
+    let cwd = workspace_root.to_string_lossy().to_string();
+    let source = workspace.root.join("workflow.yaml");
+    std::fs::write(&source, shell_workflow(&program, &cwd)).unwrap();
+    let job_id = {
+        let conn = resources.store.pool.get().await.unwrap();
+        let root = workspace.root.clone();
+        conn.interact(move |connection| {
+            register_workflow_file(connection, &root, &source, template())
+                .unwrap()
+                .job
+                .id()
+        })
+        .await
+        .unwrap()
+    };
+
+    let binding_id = uuid::Uuid::new_v4().to_string();
+    seed_enabled_interval_binding(
+        &resources.store,
+        &binding_id,
+        &workspace.id.to_string(),
+        &job_id.to_string(),
+    )
+    .await;
+
+    let services = BackgroundServices {
+        scheduler: Some(scheduler_service()),
+        ..Default::default()
+    };
+    let running = services
+        .start(resources.store.clone(), sessions, Arc::clone(&resources))
+        .await
+        .expect("the scheduler driver must signal readiness so daemon boot proceeds");
+
+    let delivered = tokio::time::timeout(Duration::from_secs(45), async {
+        loop {
+            let conn = resources.store.pool.get().await.unwrap();
+            let binding_id = binding_id.clone();
+            let found = conn
+                .interact(move |connection| {
+                    let all = list_deliveries_in_states(
+                        connection,
+                        &[
+                            DeliveryState::Delivered,
+                            DeliveryState::Failed,
+                            DeliveryState::Running,
+                            DeliveryState::Reserved,
+                        ],
+                    )
+                    .expect("querying trigger delivery rows must not fail");
+                    all.into_iter()
+                        .find(|delivery| delivery.binding_id.to_string() == binding_id)
+                })
+                .await
+                .unwrap();
+            if let Some(delivery) = found {
+                if delivery.state == DeliveryState::Failed {
+                    let run_id_str = delivery.run_id.clone().unwrap();
+                    let run_id = RunId::from_uuid(uuid::Uuid::parse_str(&run_id_str).unwrap());
+                    let conn2 = resources.store.pool.get().await.unwrap();
+                    let steps = conn2
+                        .interact(move |c| recover_run(c, run_id).unwrap().steps)
+                        .await
+                        .unwrap();
+                    panic!(
+                        "delivery failed: {:?}; steps: {:#?}",
+                        delivery.last_error, steps
+                    );
+                }
+                if delivery.state == DeliveryState::Delivered {
+                    return delivery;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+    })
+    .await
+    .expect(
+        "a scheduled run whose only step is `tool: shell` must still reach a Delivered \
+         trigger_delivery within the bound — a run stuck AwaitingWork forever would time out \
+         here instead",
+    );
+
+    let run_id_str = delivered
+        .run_id
+        .clone()
+        .expect("a Delivered delivery must carry the run_id it drove");
+    let run_id = RunId::from_uuid(uuid::Uuid::parse_str(&run_id_str).unwrap());
+    let (workflow_run, step) = {
+        let conn = resources.store.pool.get().await.unwrap();
+        conn.interact(move |connection| {
+            let recovered = recover_run(connection, run_id).unwrap();
+            let step = recovered
+                .steps
+                .into_iter()
+                .find(|s| s.step_id == "run_it")
+                .expect("the run_it step must have a durable row");
+            (recovered.run, step)
+        })
+        .await
+        .unwrap()
+    };
+    assert_eq!(
+        workflow_run.state,
+        roundhouse_flow::durability::RunState::Completed,
+        "a run whose only step is a real tool: shell must reach Completed, not stay stuck or fail"
+    );
+
+    let first_task_seq = step
+        .first_task_seq
+        .expect("a dispatched-for-real tool: shell step must carry a real first_task_seq");
+    let last_task_seq = step
+        .last_task_seq
+        .expect("a dispatched-for-real tool: shell step must carry a real last_task_seq");
+    let output = step
+        .output
+        .as_ref()
+        .expect("a completed tool: shell step must have a durable output")
+        .value_unredacted_for_resume();
+    let content = output
+        .get("content")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default();
+    assert!(
+        content.contains("hello-from-scheduled-shell"),
+        "the dispatched script must have actually run: {content}"
+    );
+
+    // The isolation-attestation half of this exit criterion: the real
+    // `TaskStarted` recorded for this shell task must NOT carry the
+    // `Tier::None` placeholder `Read`/`Write`/`Edit`/`Find` steps keep.
+    let events = session_events(&resources.store, workflow_run.session_id)
+        .await
+        .unwrap();
+    let started_isolation = events
+        .iter()
+        .find(|e| {
+            e.seq >= first_task_seq
+                && e.seq <= last_task_seq
+                && matches!(&e.payload, EventPayload::TaskStarted { .. })
+        })
+        .and_then(|e| match &e.payload {
+            EventPayload::TaskStarted { isolation, .. } => Some(isolation.clone()),
+            _ => None,
+        })
+        .expect("the shell task's own TaskStarted event must exist in this session's log");
+    assert_ne!(
+        started_isolation.tier,
+        Tier::None,
+        "a dispatched-for-real tool: shell step must carry a real, non-placeholder \
+         IsolationAttestation, got {started_isolation:?}"
     );
 
     running
