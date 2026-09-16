@@ -436,6 +436,42 @@ pub async fn record_workflow_task_failed(
         .map_err(|e| format!("failed to record a dispatched workflow tool call failing: {e}"))
 }
 
+/// Records a `TaskCompleted` for `task_id` under `actor`'s session, returning
+/// the seq `EventWriter::append` assigned it.
+///
+/// `pub` for the same reason as [`record_workflow_task_failed`]: it is the
+/// daemon's own driving loop
+/// (`DeliveryExecutor::execute_pending_with_context`,
+/// `roundhouse-daemon::scheduler_driver`) that resolves a workflow `agent:`
+/// step's spawned child and drives it to a result (Phase 8 Task 25.5's Task
+/// 3) — [`dispatch_agent_for_workflow`]'s own doc comment explains why that
+/// cannot happen in this crate. `usage` is always [`Usage::default`]: the
+/// real per-turn token accounting for a driven child lives on the child's
+/// own session log (every turn `run_agent_loop` drove already recorded its
+/// own `chat`/`infer` tasks there), not on this synthetic parent-side
+/// wrapper task — mirrors `dispatch_tool_for_workflow`'s identical
+/// `Usage::default()` for a `tool:` step's own completion.
+pub async fn record_workflow_task_completed(
+    actor: &SessionActor,
+    task_id: TaskId,
+    output: serde_json::Value,
+) -> Result<u64, String> {
+    let completed = actor.runner().record_task_completed(
+        actor.session_id(),
+        0,
+        now_ts(),
+        task_id,
+        TaskOutput::Json(output),
+        Usage::default(),
+        1,
+    );
+    actor
+        .writer()
+        .append(completed)
+        .await
+        .map_err(|e| format!("failed to record a dispatched workflow agent spawn completing: {e}"))
+}
+
 /// The daemon's fallback provider id for a workflow `agent:` step's spawned
 /// child, until issue #43 (Phase 8 Task 24) gives this workspace a real,
 /// named provider registry
