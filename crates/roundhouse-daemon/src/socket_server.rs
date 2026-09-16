@@ -1615,6 +1615,12 @@ async fn run_submitted_turn(
     text: String,
 ) {
     let session_id = actor.session_id();
+    // §6.8: this is the one real "a human turn starts" point (as distinct
+    // from `chat.rs`'s `run_chat_turn`, which mints its own `Origin::User`
+    // `chat` task on every internal agent-loop iteration, not just a
+    // genuine human-submitted message) — the reset point the taint fold is
+    // defined against.
+    actor.reset_taint_for_human_turn();
     let ctx = resources.clone_request_ctx();
     let tools = actor.tool_defs().to_vec();
     let request = roundhouse_engine::assemble_context(

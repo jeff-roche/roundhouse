@@ -104,7 +104,12 @@ pub fn agent_tool_def() -> ToolDef {
 /// restrictive real tier, never the parent's (possibly higher) one. This is
 /// also the `tier_request` the parent's `agent` policy predicate judges, so
 /// the two cannot disagree about what was actually asked for.
-const CHILD_TIER: Tier = Tier::Sandbox;
+///
+/// `pub(crate)`: `crate::workflow_dispatch::dispatch_agent_for_workflow`
+/// (Phase 8 Task 25.5) admits its own spawn against the identical tier, so a
+/// workflow-issued `agent:` step's child is judged by the same predicate
+/// shape as a model-issued one.
+pub(crate) const CHILD_TIER: Tier = Tier::Sandbox;
 
 /// A [`SpawnPolicyScope`] backed by a real, already-completed admission.
 ///
@@ -167,6 +172,15 @@ pub struct ChildSessionRequest {
     pub workspace_root: PathBuf,
     /// The parent's `(device, inode)` workspace identity, when it has one.
     pub workspace_identity: Option<(i64, i64)>,
+    /// [`crate::agent_spawn::AgentSpawnOutput::child_spec`]'s own `taint`
+    /// verbatim — §6.8's "a child session's taint is seeded from its
+    /// parent's current `TaintSet` at spawn time." The implementor must
+    /// apply this to the real child `SessionActor` it constructs (via
+    /// `SessionActor::mark_tainted` when `tainted`); a child left at its
+    /// constructor default of `Taint::Trusted` regardless of this field
+    /// would silently break the seed half of the spawn-boundary rule even
+    /// though the parent's own taint was computed correctly.
+    pub taint: crate::agent_spawn::TaintSet,
 }
 
 /// A child session could not be created or durably recorded.
@@ -245,11 +259,18 @@ pub trait SubAgentHost: Send + Sync {
 /// yet because this tool does not run the child (see this module's doc
 /// comment). Validating it anyway keeps the published schema honest — an
 /// `agent` call with no prompt is a malformed call, not a prompt-less spawn.
-struct AgentArgs {
-    provider: String,
-    budget_tokens: u64,
-    model: String,
-    role: Option<String>,
+///
+/// `pub(crate)` and every field too: [`spawn_child`]'s reserve→admit→
+/// create→commit core is shared with `crate::workflow_dispatch::
+/// dispatch_agent_for_workflow` (Phase 8 Task 25.5) rather than duplicated —
+/// a workflow `agent:` step has no `provider`/`role` of its own to validate
+/// out of model-supplied JSON, so that caller constructs this directly
+/// instead of going through [`AgentArgs::parse`].
+pub(crate) struct AgentArgs {
+    pub(crate) provider: String,
+    pub(crate) budget_tokens: u64,
+    pub(crate) model: String,
+    pub(crate) role: Option<String>,
 }
 
 impl AgentArgs {
@@ -428,6 +449,12 @@ pub async fn dispatch_agent(
                 task_id,
                 TaskOutput::Text(text.clone()),
                 Usage::default(),
+                // Not itself untrusted content — it's this call's own "a
+                // child now exists" bookkeeping. §6.8's taint from the
+                // child flows through the spawn-boundary merge instead
+                // (`merge_taint_on_child_return`), applied wherever the
+                // child is later driven to completion.
+                roundhouse_core::Trust::Trusted,
                 1,
             );
             writer.append(completed).await.map_err(|e| {
@@ -466,21 +493,28 @@ pub async fn dispatch_agent(
 /// A spawn that did not happen, split into what the operator's log gets
 /// (`detail`, which may carry host paths) and what the model gets
 /// (`model_message`, built only from this module's own literals plus values
-/// the model itself supplied).
-struct SpawnRefusal {
-    category: &'static str,
-    detail: String,
-    model_message: String,
+/// the model itself supplied). `pub(crate)`/fields `pub(crate)`: shared with
+/// `crate::workflow_dispatch::dispatch_agent_for_workflow`, which records its
+/// own parent task's `TaskFailed` from the same two halves.
+pub(crate) struct SpawnRefusal {
+    pub(crate) category: &'static str,
+    pub(crate) detail: String,
+    pub(crate) model_message: String,
 }
 
-struct SpawnedChild {
-    child: SessionId,
-    handle: String,
+pub(crate) struct SpawnedChild {
+    pub(crate) child: SessionId,
+    pub(crate) handle: String,
 }
 
 /// Steps 1-6 of this module's ordering contract, with the reservation
 /// released on every edge that can fail after it is taken.
-async fn spawn_child(
+///
+/// `pub(crate)`: the one reserve→admit→create→commit core shared by
+/// [`dispatch_agent`] (the model-issued `agent` tool) and
+/// `crate::workflow_dispatch::dispatch_agent_for_workflow` (a workflow
+/// `agent:` step) — see this module's doc comment on why one copy, not two.
+pub(crate) async fn spawn_child(
     actor: &SessionActor,
     host: &Arc<dyn SubAgentHost>,
     args: &AgentArgs,
@@ -520,14 +554,10 @@ async fn spawn_child(
         role: args.role.clone(),
         provider: args.provider.clone(),
         budget_tokens: args.budget_tokens,
-        // §6.8 seeds the child's taint from the parent's CURRENT taint, and
-        // this workspace still has no live per-session taint tracker (see
-        // `agent_loop::dispatch_mcp`, which picks the same conservative value
-        // for the same reason). `Tainted` is the fail-closed of the two: a
-        // child can only ever be at least as restricted as its parent, never
-        // laundered clean by a tracker that does not exist yet. Revisit
-        // together with that call site once one does.
-        parent_taint: TaintSet { tainted: true },
+        // §6.8 seeds the child's taint from the parent's CURRENT, live,
+        // actor-local taint (Task 25.5 Task 4) — no longer a hardcoded
+        // conservative placeholder.
+        parent_taint: TaintSet::from_taint(actor.current_taint()),
     };
 
     let outcome = {
@@ -575,6 +605,7 @@ async fn spawn_child(
             spec: out.session_spec,
             workspace_root: actor.workspace_root().to_path_buf(),
             workspace_identity: actor.workspace_identity(),
+            taint: out.child_spec.taint,
         })
         .await;
     if let Err(err) = create {

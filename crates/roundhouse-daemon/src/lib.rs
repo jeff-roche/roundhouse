@@ -254,6 +254,32 @@ pub(crate) mod test_support {
             workspace_registry,
             policy_rules,
             available_isolate(),
+            Arc::new(NoopProvider),
+        )
+        .await
+    }
+
+    /// [`daemon_resources_with_rules`], but with a caller-supplied `Provider`
+    /// instead of [`NoopProvider`] — for the one class of test
+    /// [`daemon_resources_with_rules`] cannot serve: driving a workflow
+    /// `agent:` step's spawned child through the real
+    /// [`roundhouse_engine::agent_loop::run_agent_loop`] (Phase 8 Task
+    /// 25.5's Task 3), which calls `Provider::stream_chat` for real and so
+    /// panics against `NoopProvider`. Every other fixture stays on
+    /// `NoopProvider` deliberately (this function's own doc comment on why),
+    /// so this is additive, not a default change.
+    pub(crate) async fn daemon_resources_with_rules_and_provider(
+        dir: &std::path::Path,
+        workspace_registry: Option<Arc<crate::workspace_registry::WorkspaceRegistry>>,
+        policy_rules: crate::session_bootstrap::PolicyRuleSource,
+        provider: Arc<dyn roundhouse_provider::Provider>,
+    ) -> crate::session_bootstrap::DaemonResources {
+        daemon_resources_with_rules_and_isolate(
+            dir,
+            workspace_registry,
+            policy_rules,
+            available_isolate(),
+            provider,
         )
         .await
     }
@@ -272,6 +298,7 @@ pub(crate) mod test_support {
             workspace_registry,
             policy_rules,
             available_isolate_with_real_bwrap(),
+            Arc::new(NoopProvider),
         )
         .await
     }
@@ -281,6 +308,7 @@ pub(crate) mod test_support {
         workspace_registry: Option<Arc<crate::workspace_registry::WorkspaceRegistry>>,
         policy_rules: crate::session_bootstrap::PolicyRuleSource,
         isolate: Arc<dyn Isolate>,
+        provider: Arc<dyn roundhouse_provider::Provider>,
     ) -> crate::session_bootstrap::DaemonResources {
         use roundhouse_net::proxy::LoopbackProxy;
 
@@ -314,7 +342,7 @@ pub(crate) mod test_support {
             policy_rules,
             crate::session_bootstrap::BackgroundServices::default(),
             runner(),
-            Arc::new(NoopProvider),
+            provider,
             roundhouse_provider::RequestCtx {
                 trace_id: None,
                 transport: Arc::new(NoopTransport),

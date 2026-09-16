@@ -19,9 +19,15 @@ pub enum Origin {
 /// small enums (`Origin`/`PolicyDecision`): the trust model's power is in
 /// where these values flow (`PolicyInput.taint`, content-block provenance),
 /// not in more variants.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+///
+/// `Default` is `Untrusted` — fail-closed for
+/// `EventPayload::TaskCompleted::trust`'s `#[serde(default)]`: an
+/// old-schema row from before that field existed deserializes as tainted,
+/// never as silently clean.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema, Default)]
 pub enum Trust {
     Trusted,
+    #[default]
     Untrusted,
 }
 

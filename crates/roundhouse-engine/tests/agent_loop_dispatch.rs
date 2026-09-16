@@ -2171,6 +2171,68 @@ async fn an_mcp_tool_call_is_dispatched_through_the_real_executor_and_folded_bac
 }
 
 #[tokio::test]
+async fn a_completed_mcp_tool_call_leaves_the_session_tainted() {
+    // §6.8, Task 25.5 Task 4: "the moment an agent reads ... an MCP
+    // result" is this reading's own worked example of what taints a
+    // session. `dispatch_mcp` must call `actor.mark_tainted()` on a real
+    // completed dispatch through the real executor — not just carry a
+    // per-event `Trust::Untrusted` field nothing else reads.
+    let dir = tempfile::tempdir().unwrap();
+    let McpFixture {
+        actor,
+        mcp,
+        namespaced_name,
+        ..
+    } = mcp_fixture(
+        dir.path(),
+        vec![allow_mcp_tool(FAKE_SERVER, "search")],
+        "search",
+        vec![ScriptedMcpResponse::Ok {
+            content: vec![McpContentBlock::Text {
+                text: "found 3 results".to_string(),
+            }],
+            is_error: false,
+        }],
+    )
+    .await;
+
+    assert_eq!(
+        actor.current_taint(),
+        roundhouse_policy::Taint::Trusted,
+        "a fresh session must start untainted"
+    );
+
+    let tools = actor.tool_defs().to_vec();
+    let provider = ScriptedToolCallProvider::new(
+        &namespaced_name,
+        serde_json::json!({ "query": "roundhouse" }),
+    );
+    let ctx = fake_ctx();
+
+    run_agent_loop(
+        &actor,
+        &RUNNER,
+        &provider,
+        &ctx,
+        &tools,
+        Some(mcp),
+        empty_request(),
+        AgentLoopConfig {
+            max_turns: 4,
+            max_tool_calls_per_turn: 10,
+        },
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        actor.current_taint(),
+        roundhouse_policy::Taint::Tainted,
+        "a session that dispatched a completed MCP tool call must be left tainted"
+    );
+}
+
+#[tokio::test]
 async fn an_mcp_tool_call_denied_by_policy_is_recorded_and_surfaced_as_an_error() {
     let dir = tempfile::tempdir().unwrap();
     let McpFixture {

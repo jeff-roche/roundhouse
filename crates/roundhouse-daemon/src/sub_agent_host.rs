@@ -381,13 +381,22 @@ impl SubAgentHost for DaemonSubAgentHost {
         // what make §7.7's `MAX_DEPTH` and its budget conservation mean
         // anything beyond the first level.
         match self.registry.actor(req.child) {
-            Some(actor) => actor.register_sub_agent_host(Arc::new(DaemonSubAgentHost::for_child(
-                Arc::clone(&self.resources),
-                Arc::clone(&self.registry),
-                req.child,
-                req.depth,
-                req.child_budget,
-            ))),
+            Some(actor) => {
+                actor.register_sub_agent_host(Arc::new(DaemonSubAgentHost::for_child(
+                    Arc::clone(&self.resources),
+                    Arc::clone(&self.registry),
+                    req.child,
+                    req.depth,
+                    req.child_budget,
+                )));
+                // §6.8: "a child session's taint is seeded from its parent's
+                // current `TaintSet` at spawn time." A freshly constructed
+                // `SessionActor` already starts `Taint::Trusted`, so only
+                // the tainted case needs an explicit mark.
+                if req.taint.tainted {
+                    actor.mark_tainted();
+                }
+            }
             // `create_headless_session` returned `Ok`, which means it
             // registered this session — so the only way here is the child
             // being retired between that return and this line. Never silent:
@@ -468,18 +477,17 @@ fn now_ts() -> Timestamp {
 
 /// Gives `actor` — a ROOT session — the ability to spawn sub-agents.
 ///
-/// **Exactly one production caller today: `socket_server::drive_session`,
-/// after `SessionRegistry::create` succeeds.** That is the only path in this
-/// daemon that drives `run_agent_loop`, so it is the only path where an
-/// `agent` tool call can be issued at all.
-///
-/// The headless/scheduled path (`session_manager::create_headless_session`
-/// via `scheduler_driver`) deliberately does **not** call this: those sessions
-/// run workflows, not agent loops. A scheduled session therefore cannot spawn
-/// sub-agents, and would refuse an `agent` call with a recorded
-/// `sub_agent_host_unavailable` if something ever handed it one. Whichever
-/// task first drives an agent loop from a scheduled session owns adding the
-/// call there.
+/// Two production callers: `socket_server::drive_session`, after
+/// `SessionRegistry::create` succeeds (a socket client is a human, not
+/// somebody else's child), and, as of Phase 8 Task 25.5 (#62),
+/// `session_manager::build_headless_session` (the scheduler's path via
+/// `create_headless_session`) — a scheduled workflow session is equally a
+/// ROOT session in the spawn-tree sense: the scheduler mints it directly,
+/// never another session's `agent` tool call. Before #62, only the socket
+/// path called this, so a workflow `agent:` step's spawn attempt would refuse
+/// with a recorded `sub_agent_host_unavailable`; the daemon's `agent:` step
+/// dispatch (`roundhouse-engine`'s `workflow_dispatch::dispatch_agent_for_workflow`)
+/// relies on this being wired for both.
 ///
 /// Sub-agent children never come through here — they get their host from
 /// [`DaemonSubAgentHost::create_child_session`], the only caller that knows a
@@ -663,6 +671,61 @@ mod tests {
             "the live child must still be tracked"
         );
         assert!(registry.actor(child).is_none());
+    }
+
+    /// Phase 8 Task 25.5 (#62): the workflow-facing sibling of
+    /// `dispatch_agent` reuses the identical reserve→admit→create→commit
+    /// core (`agent_spawn_tool::spawn_child`) with workflow-shaped inputs —
+    /// no `provider`/`budget_tokens` JSON to parse, since an `agent:` step's
+    /// AST has neither.
+    #[tokio::test]
+    async fn dispatch_agent_for_workflow_creates_a_real_registered_child() {
+        let dir = tempfile::tempdir().unwrap();
+        let resources = resources(dir.path()).await;
+        let registry = Arc::new(SessionRegistry::new());
+        let actor = parent_actor(dir.path()).await;
+        let parent = actor.session_id();
+        wire_sub_agent_host(&actor, &resources, &registry);
+
+        let host = actor
+            .sub_agent_host()
+            .expect("the host was just registered");
+        let result = roundhouse_engine::workflow_dispatch::dispatch_agent_for_workflow(
+            &actor,
+            Some(&host),
+            serde_json::json!({"prompt": "review the diff"}),
+            None,
+            250,
+        )
+        .await
+        .expect("dispatch must not error");
+
+        assert!(
+            matches!(
+                result.result,
+                roundhouse_engine::workflow_dispatch::AgentSpawnOutcome::Spawned { .. }
+            ),
+            "the spawn must succeed, got {:?}",
+            result.result
+        );
+        assert_eq!(
+            resources.spawn_tree.direct_children(parent),
+            1,
+            "exactly one committed spawn-tree edge, no dangling reservation"
+        );
+        assert_eq!(resources.spawn_tree.reserved_children(parent), 0);
+
+        let child = resources.spawn_tree.descendants(parent)[0];
+        let child_actor = registry
+            .actor(child)
+            .expect("the spawned child must be a real, registered session");
+        assert_eq!(child_actor.state(), SessionState::Running);
+        assert_eq!(resources.sub_agents.parent_of(child), Some(parent));
+
+        resources
+            .sub_agents
+            .retire_child(child, &resources.spawn_tree, &registry, &resources.proxy)
+            .await;
     }
 
     #[tokio::test]

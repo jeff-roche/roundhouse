@@ -1093,7 +1093,12 @@ impl<'a> Executor<'a> {
                     dispatch_input,
                 })
             }
-            StepBody::Agent { prompt, .. } => {
+            StepBody::Agent {
+                model,
+                tools,
+                prompt,
+                output_schema,
+            } => {
                 let resolved_prompt =
                     match interpolate(TemplateSource::from_workflow_file(prompt), &self.ctx) {
                         Ok(s) => s,
@@ -1104,17 +1109,62 @@ impl<'a> Executor<'a> {
                             ));
                         }
                     };
+                // `model:` is optional and, per §8.9's own reference workflow
+                // (`model: "${{ vars.review_model }}"`), templated exactly
+                // like `prompt` — so it goes through the same dual-render
+                // (ruling P33) rather than being passed through raw.
+                let resolved_model = match model {
+                    Some(text) => {
+                        match interpolate(TemplateSource::from_workflow_file(text), &self.ctx) {
+                            Ok(s) => Some(s),
+                            Err(e) => {
+                                return DispatchDecision::Done(StepOutcome::failed(
+                                    &step.id,
+                                    format!("interpolating `agent.model`: {e}"),
+                                ));
+                            }
+                        }
+                    }
+                    None => None,
+                };
                 // A prompt is prose, so the redacted rendering here keeps the
                 // surrounding literal template text and replaces only the
                 // spliced-in text of each secret-derived `${{ }}` block.
+                // `model` folds into the same logged object rather than a
+                // third top-level field — `tools`/`output_schema` are not
+                // templated, so there is nothing of theirs to redact.
                 let logged_prompt = redact_with_needles(
-                    &serde_json::json!({"prompt": resolved_prompt.redacted_for_logging()}),
+                    &serde_json::json!({
+                        "prompt": resolved_prompt.redacted_for_logging(),
+                        "model": resolved_model
+                            .as_ref()
+                            .map(|m| m.redacted_for_logging().clone()),
+                    }),
                     &self.redaction_needles,
                 );
                 let dispatch_prompt = resolved_prompt.into_unredacted_for_dispatch();
+                let dispatch_model = resolved_model.map(|m| m.into_unredacted_for_dispatch());
+                // Ruling P108 §C's existing source, one field earlier: the
+                // same `map_budget` value `Loop::pending_work` reads for
+                // `PendingWork::step_timeout`, read here instead because
+                // `budget_tokens` belongs to `PendingKind::Agent` specifically
+                // (a `Tool`/`ChildRun` step has no token budget to transfer).
+                // `unwrap_or_default()` (0) only for `Executor::run_to_completion`'s
+                // in-memory sequencer, which has no run/ledger behind it and
+                // always converts this to `dispatch_step_or_stub`'s fixed
+                // stub outcome regardless of what this field holds.
+                let budget_tokens = self
+                    .map_budget
+                    .as_ref()
+                    .map(|b| b.total_remaining.max_tokens)
+                    .unwrap_or_default();
                 DispatchDecision::Pending(run_loop::PendingKind::Agent {
                     logged_prompt,
                     dispatch_prompt,
+                    model: dispatch_model,
+                    tools: tools.clone(),
+                    output_schema: output_schema.clone(),
+                    budget_tokens,
                 })
             }
             StepBody::Emit { emit } => {
@@ -1169,6 +1219,11 @@ impl<'a> Executor<'a> {
                     EventPayload::TaskCompleted {
                         output: TaskOutput::Json(logged),
                         usage: Usage::default(),
+                        // An authored `emit:` template, interpolated by this
+                        // engine against workflow context — bookkeeping,
+                        // like the sibling `Flow`/`Report` synthesis sites,
+                        // not external ingestion.
+                        trust: roundhouse_core::Trust::Trusted,
                     },
                 );
                 DispatchDecision::Done(StepOutcome {
@@ -1285,6 +1340,11 @@ impl<'a> Executor<'a> {
                             EventPayload::TaskCompleted {
                                 output: TaskOutput::Json(logged),
                                 usage: Usage::default(),
+                                // An authored `report:` document, validated
+                                // and persisted by this engine — same
+                                // bookkeeping classification as
+                                // `persist_report` (`run_loop.rs`).
+                                trust: roundhouse_core::Trust::Trusted,
                             },
                         );
                     }

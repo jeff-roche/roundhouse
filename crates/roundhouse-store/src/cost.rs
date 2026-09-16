@@ -267,7 +267,7 @@ pub async fn task_cost_view(
         .iter()
         .rev()
         .find_map(|e| match &e.payload {
-            EventPayload::TaskCompleted { output, usage } => Some((usage.clone(), output)),
+            EventPayload::TaskCompleted { output, usage, .. } => Some((usage.clone(), output)),
             // Phase 7 Task 13b (sanctioned lane-boundary exception, see the commit
             // message): a `Loss` event carries no `Usage`/`TaskOutput` of its own, so it
             // can never be the completion this search is looking for. Written down

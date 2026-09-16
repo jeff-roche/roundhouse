@@ -269,6 +269,7 @@ fn a_completed_task_of_another_kind_in_the_same_session_is_not_read_as_a_report(
             output_tokens: 0,
             cache_read_tokens: 0,
         },
+        trust: roundhouse_core::Trust::Trusted,
     })
     .expect("an EventPayload serializes");
     conn.execute(

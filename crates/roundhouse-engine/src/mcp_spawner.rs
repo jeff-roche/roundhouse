@@ -227,6 +227,11 @@ impl TaskSpawner for EngineTaskSpawner {
                 task,
                 output,
                 usage,
+                // §6.8 names MCP results (and, via this same spawner, MCP
+                // elicit/tool-discovery content) as Untrusted explicitly —
+                // this is the one production site that content actually
+                // flows through.
+                roundhouse_core::Trust::Untrusted,
                 1,
             ),
             TerminalOutcome::Failed { error, retryable } => self.runner.record_task_failed(

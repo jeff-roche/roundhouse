@@ -572,6 +572,124 @@ fn step_row(conn: &Connection, run_id: RunId, step_id: &str) -> (StepRunState, O
 }
 
 // ---------------------------------------------------------------------------
+// `agent:` step dispatch — Phase 8 Task 25.5 (#62)
+// ---------------------------------------------------------------------------
+
+/// `Executor::dispatch_step`'s `StepBody::Agent` arm used to destructure only
+/// `prompt`, silently dropping `model`/`tools`/`output_schema` via `..` — a
+/// caller answering `PendingKind::Agent` had no way to know which model, tool
+/// allowlist, or output schema the step declared. §8.9's own reference
+/// workflow's `review` step (`tests/fixtures/pr_review.yaml`) sets all four.
+#[test]
+fn an_agent_step_carries_its_model_tools_and_output_schema_into_pending_work() {
+    let mut conn = open_test_db();
+    let (run_id, _) = seed_run(&mut conn);
+    let def = parse_workflow(&workflow(
+        "steps:\n\
+         \x20 - id: review\n\
+         \x20   agent:\n\
+         \x20     model: \"claude-x\"\n\
+         \x20     tools: [read, find]\n\
+         \x20     prompt: \"hi\"\n\
+         \x20     output_schema: { type: object, properties: { findings: { type: array } } }\n",
+    ))
+    .expect("fixture parses");
+    let mut sink = RecordingSink::default();
+    let mut host = FakeHost::new();
+    let outcome = run_workflow(
+        &mut conn,
+        &def,
+        run_id,
+        &mut sink,
+        &mut host,
+        ctx(run_id),
+        at(0),
+        None,
+    )
+    .expect("dispatching an `agent:` step suspends the run rather than erroring");
+    let RunOutcome::AwaitingWork { pending } = outcome else {
+        panic!("an `agent:` step needs real dispatch and must suspend the run, got {outcome:?}");
+    };
+    assert_eq!(pending.len(), 1, "exactly one pending item for one step");
+    let roundhouse_flow::exec::run_loop::PendingKind::Agent {
+        model,
+        tools,
+        output_schema,
+        dispatch_prompt,
+        ..
+    } = &pending[0].kind
+    else {
+        panic!("expected PendingKind::Agent, got {:?}", pending[0].kind);
+    };
+    assert_eq!(
+        model.as_deref(),
+        Some("claude-x"),
+        "the step's declared model must not be dropped"
+    );
+    assert_eq!(
+        tools,
+        &vec!["read".to_string(), "find".to_string()],
+        "the step's declared tool allowlist must not be dropped"
+    );
+    assert_eq!(
+        output_schema,
+        &Some(serde_json::json!({
+            "type": "object",
+            "properties": { "findings": { "type": "array" } }
+        })),
+        "the step's declared output schema must not be dropped"
+    );
+    assert_eq!(dispatch_prompt, "hi");
+}
+
+/// A workflow `agent:` step has no authored token budget — unlike the
+/// model-issued `agent` tool, whose `budget_tokens` argument the model
+/// picks. `Loop::run_phase` already reads the run's real remaining ceiling
+/// into `executor.map_budget` before every dispatch (ruling P108 §C,
+/// `step_timeout`'s existing source); this is the same value, for the same
+/// reason: the caller that spawns the child (Phase 8 Task 25.5 #62) needs a
+/// real number to transfer, not an invented one.
+#[test]
+fn an_agent_steps_budget_tokens_comes_from_the_runs_real_remaining_ceiling() {
+    let mut conn = open_test_db();
+    let (run_id, _) = seed_run(&mut conn);
+    let def = parse_workflow(&workflow(
+        "steps:\n\
+         \x20 - id: review\n\
+         \x20   agent:\n\
+         \x20     prompt: \"hi\"\n",
+    ))
+    .expect("fixture parses");
+    let mut sink = RecordingSink::default();
+    let mut host = FakeHost::new();
+    let outcome = run_workflow(
+        &mut conn,
+        &def,
+        run_id,
+        &mut sink,
+        &mut host,
+        ctx(run_id),
+        at(0),
+        None,
+    )
+    .expect("dispatching an `agent:` step suspends the run rather than erroring");
+    let RunOutcome::AwaitingWork { pending } = outcome else {
+        panic!("an `agent:` step needs real dispatch and must suspend the run, got {outcome:?}");
+    };
+    let roundhouse_flow::exec::run_loop::PendingKind::Agent { budget_tokens, .. } =
+        &pending[0].kind
+    else {
+        panic!("expected PendingKind::Agent, got {:?}", pending[0].kind);
+    };
+    assert_eq!(
+        *budget_tokens,
+        a_grant().max_tokens,
+        "nothing has spent any tokens yet, so the real remaining ceiling equals the run's \
+         full grant"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Stop-on-failure, `continue_on_error`, and the two writers
 // ---------------------------------------------------------------------------
 

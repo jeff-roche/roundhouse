@@ -1,6 +1,6 @@
 use roundhouse_policy::engine::{CompiledRule, Outcome, PolicyEngine, Predicate, Scope};
 use roundhouse_policy::trust::{apply_project_scope_trust, record_explicit_trust, TrustStore};
-use roundhouse_policy::{ParsedCommand, TaskParams};
+use roundhouse_policy::{ParsedCommand, Taint, TaskParams};
 use std::path::PathBuf;
 use tempfile::TempDir;
 
@@ -313,7 +313,8 @@ fn rewriting_a_trusted_deny_as_ask_on_the_same_predicate_is_widening_and_is_gate
     // downgrade, because that downgrade only fires when NO rule matched at all
     // (`decide_unattended`'s `d.rule.is_none()` check) — a live, matching Ask rule left
     // in place would leave `git push --force` at Ask even unattended, never a real Deny.
-    let real_decision = PolicyEngine::from_rules(effective).decide_unattended(&force_push_params());
+    let real_decision =
+        PolicyEngine::from_rules(effective).decide_unattended(&force_push_params(), Taint::Trusted);
     assert_eq!(
         real_decision.outcome,
         Outcome::Deny,

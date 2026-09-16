@@ -29,6 +29,7 @@ fn fold_task_state_derives_each_state_from_a_realistic_event_sequence() {
         EventPayload::TaskCompleted {
             output: roundhouse_core::TaskOutput::Text("done".into()),
             usage: roundhouse_core::Usage::default(),
+            trust: roundhouse_core::Trust::Trusted,
         },
     ];
     assert_eq!(

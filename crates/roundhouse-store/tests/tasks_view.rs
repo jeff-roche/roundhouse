@@ -298,6 +298,7 @@ async fn completing_a_suspended_task_clears_suspension_fields() {
             task_id,
             roundhouse_core::TaskOutput::Text("done".into()),
             roundhouse_core::Usage::default(),
+            roundhouse_core::Trust::Trusted,
             1,
         ))
         .await

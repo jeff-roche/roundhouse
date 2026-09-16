@@ -61,7 +61,8 @@ use roundhouse_core::{
     WorkspaceId,
 };
 use roundhouse_engine::workflow_dispatch::{
-    dispatch_tool_for_workflow, record_workflow_task_failed, DispatchOutcome, WorkflowToolDispatch,
+    dispatch_agent_for_workflow, dispatch_tool_for_workflow, record_workflow_task_completed,
+    record_workflow_task_failed, AgentSpawnOutcome, DispatchOutcome, WorkflowToolDispatch,
 };
 use roundhouse_flow::caps::ResourceCaps;
 use roundhouse_flow::durability::{
@@ -136,6 +137,36 @@ const HEARTBEAT: std::time::Duration = std::time::Duration::from_secs(1);
 /// to replay* is a policy decision, and belongs to the caller that decides
 /// what baseline to hand it.
 const MAX_CATCH_UP_LOOKBACK: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
+
+/// A workflow `agent:` step's fallback model, used only when the step
+/// declares no `model:` of its own (§8.9's `agent:` shape makes it
+/// optional). Deliberately **not** `socket_server::SUBMIT_TURN_MODEL` — a
+/// chat turn's model and a workflow step's model are two independent
+/// decisions with no reason to move together, per Phase 8 Task 25.5's own
+/// plan (Task 3).
+const WORKFLOW_AGENT_DEFAULT_MODEL: &str = "claude-sonnet-5";
+
+/// A workflow `agent:` step's spawned child gets no system prompt of its
+/// own in the AST (§8.9 has no such field — only `model`/`tools`/`prompt`/
+/// `output_schema`), so this is the minimal, static framing every workflow-
+/// spawned child shares: it is a one-shot worker driven by a workflow step,
+/// not a general chat session, and its `prompt:` (rendered into the user
+/// turn, not here) is the whole of its task.
+const WORKFLOW_AGENT_SYSTEM_PROMPT: &str =
+    "You are a sub-agent spawned by one step of an automated workflow. \
+     Complete the task described in the user turn using the tools you are \
+     given, then answer with your final result and nothing else.";
+
+/// Turn/tool-call ceilings for a workflow `agent:` step's spawned child.
+/// Independent of `socket_server::SUBMIT_TURN_MAX_TURNS`/
+/// `SUBMIT_TURN_MAX_TOOL_CALLS_PER_TURN` for the same reason
+/// [`WORKFLOW_AGENT_DEFAULT_MODEL`] is: a workflow step's own `step_timeout`
+/// (already threaded through [`PendingWork`]) is the real backstop against
+/// runaway work, so these exist only to bound turn *count* — smaller than a
+/// chat turn's ceilings since a scoped, single-purpose worker needs less
+/// back-and-forth than an open-ended chat session.
+const WORKFLOW_AGENT_MAX_TURNS: u32 = 6;
+const WORKFLOW_AGENT_MAX_TOOL_CALLS_PER_TURN: u32 = 16;
 
 /// Boot-load failures that abort daemon startup.
 ///
@@ -974,13 +1005,18 @@ fn flush_task_events(
                 input,
                 EVENT_SCHEMA_V,
             ),
-            EventPayload::TaskCompleted { output, usage } => runner.record_task_completed(
+            EventPayload::TaskCompleted {
+                output,
+                usage,
+                trust,
+            } => runner.record_task_completed(
                 session_id,
                 0,
                 now,
                 task_id,
                 output,
                 usage,
+                trust,
                 EVENT_SCHEMA_V,
             ),
             EventPayload::TaskFailed { error, retryable } => runner.record_task_failed(
@@ -1029,6 +1065,115 @@ fn unanswerable_work(step_id: String, message: String) -> WorkDone {
         task_id: None,
         first_task_seq: None,
         last_task_seq: None,
+    }
+}
+
+/// The `Failed` [`WorkDone`] for one workflow-dispatched `agent:` step whose
+/// real, durably-minted `task_id` is already known — used by
+/// [`DeliveryExecutor::drive_workflow_agent_child`]'s several failure arms
+/// (missing child, loop error, timeout) once `record_workflow_task_failed`
+/// has already been attempted. `append_result` is that attempt's own
+/// return: `Ok(last_task_seq)` when the terminal `TaskFailed` really landed,
+/// `Err(append_err)` when even that append failed — in which case
+/// `last_task_seq: None` honestly reports that no terminal event was
+/// confirmed, leaving the task for the next boot's recovery pass, exactly
+/// like `execute_pending_with_context`'s `PendingKind::Tool` timeout arm's
+/// identical `Err` branch.
+/// §6.8: "taint crosses the spawn boundary monotonically, in both
+/// directions" — on a driven child's return, the parent's taint becomes the
+/// union of its own and the child's. A pure, directly testable wrapper over
+/// `SessionActor::mark_tainted`/`current_taint` so [`DeliveryExecutor::
+/// drive_workflow_agent_child`]'s own merge point has a real, unit-testable
+/// seam independent of the full daemon harness.
+fn apply_taint_boundary_merge(
+    parent_actor: &roundhouse_engine::SessionActor,
+    child_actor: &roundhouse_engine::SessionActor,
+) {
+    if child_actor.current_taint() == roundhouse_policy::Taint::Tainted {
+        parent_actor.mark_tainted();
+    }
+}
+
+fn failed_work_done_after_recording(
+    step_id: String,
+    task_id: TaskId,
+    first_task_seq: u64,
+    message: String,
+    append_result: Result<u64, String>,
+) -> WorkDone {
+    match append_result {
+        Ok(last_task_seq) => WorkDone {
+            step_id,
+            status: WorkStatus::Failed { message },
+            output: serde_json::Value::Null,
+            output_is_secret_derived: false,
+            task_id: Some(task_id),
+            first_task_seq: Some(first_task_seq),
+            last_task_seq: Some(last_task_seq),
+        },
+        Err(append_err) => WorkDone {
+            step_id,
+            status: WorkStatus::Failed {
+                message: format!(
+                    "{message}; additionally failed to record its terminal event: {append_err}"
+                ),
+            },
+            output: serde_json::Value::Null,
+            output_is_secret_derived: false,
+            task_id: Some(task_id),
+            first_task_seq: Some(first_task_seq),
+            last_task_seq: None,
+        },
+    }
+}
+
+/// Folds one driven `agent:` step child's full transcript
+/// (`run_agent_loop`'s return — every turn's assistant output, not just the
+/// final one) into the step's output `Value`.
+///
+/// Concatenates every `ContentBlock::Text` across the whole transcript, in
+/// order, one newline apart — deliberately the whole transcript rather than
+/// only the final turn's text: a workflow author reading `steps.<id>.output`
+/// has no other way to see intermediate reasoning a multi-turn child
+/// produced before its final answer, and `run_agent_loop`'s own doc comment
+/// already frames its return value as the full record for exactly this
+/// reason.
+///
+/// `expects_json` is `true` exactly when the step declared an
+/// `output_schema` — [`DeliveryExecutor::drive_workflow_agent_child`]'s own
+/// doc comment explains why this is honored via `ChatRequest::
+/// response_format.json_schema` rather than here: this function's only job
+/// once that request-side constraint exists is to parse the (expected-JSON)
+/// text into a real `Value::Object`/`Value::Array`/etc. rather than leaving
+/// it as a string the workflow's own `${{ steps.<id>.output.field }}`
+/// expressions could never index into. A provider that ignored the
+/// constraint and returned non-JSON text is reported as `Err` — a real step
+/// failure, not a silent fallback to `Value::String`.
+fn workflow_agent_output_from_blocks(
+    blocks: &[roundhouse_provider::ContentBlock],
+    expects_json: bool,
+) -> Result<serde_json::Value, String> {
+    let mut text = String::new();
+    for block in blocks {
+        if let roundhouse_provider::ContentBlock::Text {
+            text: block_text, ..
+        } = block
+        {
+            if !text.is_empty() {
+                text.push('\n');
+            }
+            text.push_str(block_text);
+        }
+    }
+    if expects_json {
+        serde_json::from_str::<serde_json::Value>(&text).map_err(|e| {
+            format!(
+                "the child's final response did not match the step's declared \
+                 output_schema (not valid JSON): {e}"
+            )
+        })
+    } else {
+        Ok(serde_json::Value::String(text))
     }
 }
 
@@ -2503,11 +2648,66 @@ impl DeliveryExecutor {
                         }
                     }
                 }
-                PendingKind::Agent { .. } => unanswerable_work(
-                    item.step_id,
-                    "workflow dispatch of `agent:` steps is not wired yet (Phase 8 Task 25.5)"
-                        .into(),
-                ),
+                PendingKind::Agent {
+                    logged_prompt,
+                    dispatch_prompt,
+                    model,
+                    tools,
+                    output_schema,
+                    budget_tokens,
+                } => {
+                    let step_timeout = item.step_timeout;
+                    if step_timeout.is_zero() {
+                        unanswerable_work(
+                            item.step_id,
+                            "step_timeout was zero, which should be unreachable — refusing \
+                             rather than treating it as either \"no timeout\" or a legitimate \
+                             instant timeout"
+                                .into(),
+                        )
+                    } else {
+                        let resolved_model =
+                            model.unwrap_or_else(|| WORKFLOW_AGENT_DEFAULT_MODEL.to_string());
+                        let host = session.actor().sub_agent_host();
+                        match dispatch_agent_for_workflow(
+                            session.actor(),
+                            host.as_ref(),
+                            logged_prompt,
+                            Some(resolved_model.clone()),
+                            budget_tokens,
+                        )
+                        .await
+                        {
+                            Err(message) => unanswerable_work(item.step_id, message),
+                            Ok(dispatched) => match dispatched.result {
+                                AgentSpawnOutcome::Failed(message) => WorkDone {
+                                    step_id: item.step_id,
+                                    status: WorkStatus::Failed { message },
+                                    output: serde_json::Value::Null,
+                                    output_is_secret_derived: false,
+                                    task_id: Some(dispatched.task_id),
+                                    first_task_seq: Some(dispatched.first_task_seq),
+                                    last_task_seq: dispatched.last_task_seq,
+                                },
+                                AgentSpawnOutcome::Spawned { child_session_id } => {
+                                    self.drive_workflow_agent_child(
+                                        session.actor(),
+                                        child_session_id,
+                                        dispatched.task_id,
+                                        dispatched.first_task_seq,
+                                        item.step_id,
+                                        dispatch_prompt,
+                                        resolved_model,
+                                        tools,
+                                        output_schema,
+                                        step_timeout,
+                                    )
+                                    .await
+                                }
+                            },
+                        }
+                    }
+                }
                 PendingKind::ChildRun {
                     child_run_id,
                     child_session_id,
@@ -2602,6 +2802,233 @@ impl DeliveryExecutor {
             });
         }
         PendingExecution::Done(done)
+    }
+
+    /// Drives one workflow `agent:` step's already-spawned child
+    /// (`dispatch_agent_for_workflow` — `execute_pending_with_context`'s own
+    /// `PendingKind::Agent` arm — minted the parent task and created the
+    /// child; this is everything after that, which only `roundhouse-daemon`
+    /// can do: resolve the child's live `SessionActor` from the real
+    /// `SessionRegistry`, drive it through `run_agent_loop`, complete the
+    /// parent task with the real result, and release the fan-out slot.
+    ///
+    /// `SubAgentSessions::retire_child` is called on **every** exit path —
+    /// missing child, loop error, timeout, and success alike — per this
+    /// method's own reason for existing (Phase 8 Task 25.5's Task 3): it is
+    /// the single "free the parent's fan-out slot + tear the child session
+    /// down" act, and skipping it on any path permanently burns one of the
+    /// parent's eight §7.7 slots.
+    ///
+    /// `tool_names` is filtered against `roundhouse_engine::tool_catalog::
+    /// builtin_tool_defs()` by name — the same scoping mechanism a chat
+    /// session's own tool list already goes through, just with the step's
+    /// declared `agent.tools:` as the allowlist instead of "everything the
+    /// session offers" (`socket_server::run_submitted_turn`'s `actor.
+    /// tool_defs()`). An empty list is not defaulted to "everything" — a
+    /// step that names no tools gets none, matching what the author wrote.
+    ///
+    /// `output_schema`, when declared, is honored by setting `ChatRequest::
+    /// response_format.json_schema` — the same IR field
+    /// `roundhouse_provider::ir::ResponseFormat` already exists to carry —
+    /// so a provider that supports structured output constrains its own
+    /// generation, rather than this function trying to validate free-form
+    /// text against the schema after the fact. The child's final transcript
+    /// text is then parsed as JSON (never merely wrapped in a string) when a
+    /// schema was declared; a provider that ignored the constraint and
+    /// returned non-JSON text is a real step failure, not a silent
+    /// downgrade to `Value::String`.
+    #[allow(clippy::too_many_arguments)]
+    async fn drive_workflow_agent_child(
+        &self,
+        parent_actor: &roundhouse_engine::SessionActor,
+        child_session_id: SessionId,
+        task_id: TaskId,
+        first_task_seq: u64,
+        step_id: String,
+        dispatch_prompt: String,
+        model: String,
+        tool_names: Vec<String>,
+        output_schema: Option<serde_json::Value>,
+        step_timeout: std::time::Duration,
+    ) -> WorkDone {
+        let Some(child_actor) = self.sessions.actor(child_session_id) else {
+            self.resources
+                .sub_agents
+                .retire_child(
+                    child_session_id,
+                    &self.resources.spawn_tree,
+                    &self.sessions,
+                    &self.resources.proxy,
+                )
+                .await;
+            let message =
+                "the spawned child session vanished before it could be driven".to_string();
+            let recorded = record_workflow_task_failed(
+                parent_actor,
+                task_id,
+                "agent_child_missing",
+                message.clone(),
+            )
+            .await;
+            return failed_work_done_after_recording(
+                step_id,
+                task_id,
+                first_task_seq,
+                message,
+                recorded,
+            );
+        };
+
+        let mcp = self.sessions.session_mcp(child_session_id);
+        let tool_defs: Vec<roundhouse_provider::ToolDef> =
+            roundhouse_engine::tool_catalog::builtin_tool_defs()
+                .into_iter()
+                .filter(|def| tool_names.iter().any(|name| name == def.name()))
+                .collect();
+        let mut request = roundhouse_engine::assemble_context(
+            &model,
+            WORKFLOW_AGENT_SYSTEM_PROMPT,
+            &tool_defs,
+            &[roundhouse_provider::Message {
+                role: roundhouse_provider::MessageRole::User,
+                content: vec![roundhouse_provider::ContentBlock::Text {
+                    text: dispatch_prompt,
+                    cache: None,
+                    citations: vec![],
+                }],
+            }],
+        );
+        let expects_json = output_schema.is_some();
+        if let Some(schema) = output_schema {
+            request.response_format = roundhouse_provider::ResponseFormat {
+                json_schema: Some(schema),
+            };
+        }
+
+        let ctx = self.resources.clone_request_ctx();
+        let outcome = tokio::time::timeout(
+            step_timeout,
+            roundhouse_engine::agent_loop::run_agent_loop(
+                &child_actor,
+                self.resources.runner,
+                self.resources.provider.as_ref(),
+                &ctx,
+                &tool_defs,
+                mcp,
+                request,
+                roundhouse_engine::agent_loop::AgentLoopConfig {
+                    max_turns: WORKFLOW_AGENT_MAX_TURNS,
+                    max_tool_calls_per_turn: WORKFLOW_AGENT_MAX_TOOL_CALLS_PER_TURN,
+                },
+            ),
+        )
+        .await;
+
+        // Read before `retire_child` (below) tears the child session down;
+        // applied regardless of how the drive itself concluded, since a
+        // child that ingested untrusted content (e.g. an MCP call) before
+        // later timing out or erroring still genuinely tainted its parent.
+        apply_taint_boundary_merge(parent_actor, &child_actor);
+
+        self.resources
+            .sub_agents
+            .retire_child(
+                child_session_id,
+                &self.resources.spawn_tree,
+                &self.sessions,
+                &self.resources.proxy,
+            )
+            .await;
+
+        match outcome {
+            Ok(Ok(blocks)) => match workflow_agent_output_from_blocks(&blocks, expects_json) {
+                Ok(output) => {
+                    match record_workflow_task_completed(parent_actor, task_id, output.clone())
+                        .await
+                    {
+                        Ok(last_task_seq) => WorkDone {
+                            step_id,
+                            status: WorkStatus::Completed,
+                            output,
+                            output_is_secret_derived: false,
+                            task_id: Some(task_id),
+                            first_task_seq: Some(first_task_seq),
+                            last_task_seq: Some(last_task_seq),
+                        },
+                        // The task is left `Running` — no terminal event was
+                        // confirmed — so the next boot's recovery pass
+                        // repairs it, exactly like every other
+                        // failed-terminal-append case in this file.
+                        Err(append_err) => WorkDone {
+                            step_id,
+                            status: WorkStatus::Failed {
+                                message: format!(
+                                    "the agent step's child completed but recording its \
+                                     result failed: {append_err}"
+                                ),
+                            },
+                            output: serde_json::Value::Null,
+                            output_is_secret_derived: false,
+                            task_id: Some(task_id),
+                            first_task_seq: Some(first_task_seq),
+                            last_task_seq: None,
+                        },
+                    }
+                }
+                Err(message) => {
+                    let recorded = record_workflow_task_failed(
+                        parent_actor,
+                        task_id,
+                        "agent_output_schema_violation",
+                        message.clone(),
+                    )
+                    .await;
+                    failed_work_done_after_recording(
+                        step_id,
+                        task_id,
+                        first_task_seq,
+                        message,
+                        recorded,
+                    )
+                }
+            },
+            Ok(Err(loop_err)) => {
+                let message = format!("the spawned child's agent loop failed: {loop_err}");
+                let recorded = record_workflow_task_failed(
+                    parent_actor,
+                    task_id,
+                    "agent_loop_error",
+                    message.clone(),
+                )
+                .await;
+                failed_work_done_after_recording(
+                    step_id,
+                    task_id,
+                    first_task_seq,
+                    message,
+                    recorded,
+                )
+            }
+            Err(_elapsed) => {
+                let message = format!(
+                    "the agent step's spawned child exceeded its {step_timeout:?} step_timeout"
+                );
+                let recorded = record_workflow_task_failed(
+                    parent_actor,
+                    task_id,
+                    "step_timeout",
+                    message.clone(),
+                )
+                .await;
+                failed_work_done_after_recording(
+                    step_id,
+                    task_id,
+                    first_task_seq,
+                    message,
+                    recorded,
+                )
+            }
+        }
     }
 
     #[cfg(test)]
@@ -2722,6 +3149,13 @@ impl DeliveryExecutor {
                                     call.parent_task_id,
                                     TaskOutput::Json(report_json),
                                     Usage::default(),
+                                    // The parent-side synthesis of a joined
+                                    // child run's report — mirrors
+                                    // `record_workflow_task_completed`'s own
+                                    // `Trusted` wrapper classification for
+                                    // the same reason (Task 25.5's Task 4
+                                    // doc comment on that function).
+                                    roundhouse_core::Trust::Trusted,
                                     EVENT_SCHEMA_V,
                                 ),
                                 RunState::Failed => runner.record_task_failed(
@@ -4894,7 +5328,9 @@ mod tests {
 mod child_run_tests {
     use super::*;
     use crate::session_registry::SessionRegistry;
-    use crate::test_support::{daemon_resources, daemon_resources_with_rules};
+    use crate::test_support::{
+        daemon_resources, daemon_resources_with_rules, daemon_resources_with_rules_and_provider,
+    };
     use crate::workspace_registry::{WorkspaceRegistration, WorkspaceRegistry};
     use roundhouse_core::Tier;
     use roundhouse_flow::durability::recover_run;
@@ -5482,6 +5918,27 @@ mod child_run_tests {
         overlap: OverlapPolicy,
         policy_rules: crate::session_bootstrap::PolicyRuleSource,
     ) -> Harness {
+        harness_with_overlap_and_rules_and_provider(
+            workflow_yaml,
+            overlap,
+            policy_rules,
+            Arc::new(crate::test_support::NoopProvider),
+        )
+        .await
+    }
+
+    /// [`harness_with_overlap_and_rules`], but with a caller-supplied
+    /// `Provider` — needed only by a workflow `agent:` step's own tests
+    /// (Phase 8 Task 25.5's Task 3), since driving a spawned child through
+    /// the real `run_agent_loop` calls `Provider::stream_chat` for real and
+    /// so panics against `NoopProvider`. Every other fixture stays on the
+    /// four-argument form above, unchanged.
+    async fn harness_with_overlap_and_rules_and_provider(
+        workflow_yaml: String,
+        overlap: OverlapPolicy,
+        policy_rules: crate::session_bootstrap::PolicyRuleSource,
+        provider: Arc<dyn roundhouse_provider::Provider>,
+    ) -> Harness {
         let dir = tempfile::tempdir().unwrap();
         let workspace_root = dir.path().join("workspace");
         std::fs::create_dir(&workspace_root).unwrap();
@@ -5575,10 +6032,11 @@ mod child_run_tests {
 
         let sessions = Arc::new(SessionRegistry::new());
         let resources = Arc::new(
-            daemon_resources_with_rules(
+            daemon_resources_with_rules_and_provider(
                 dir.path(),
                 Some(Arc::clone(&workspaces)),
                 Arc::clone(&policy_rules),
+                provider,
             )
             .await,
         );
@@ -6469,6 +6927,347 @@ mod child_run_tests {
             child_step_bounds,
             (Some(task_event_bounds[0]), Some(task_event_bounds[1])),
             "the parent step records the original task creation through its terminal child join"
+        );
+    }
+
+    // --- `agent:` step dispatch, driven to completion — Phase 8 Task 25.5
+    // (#62) Task 3 ---
+
+    fn agent_step_workflow() -> String {
+        "name: scheduled-agent\nversion: 1\npermissions:\n  default: deny\n  unattended:\n    \
+         escalate: fail\nsteps:\n  - id: review\n    agent: { model: claude-sonnet-5, prompt: \"say hi\" }\n"
+            .to_string()
+    }
+
+    fn allow_agent_rules() -> crate::session_bootstrap::PolicyRuleSource {
+        Arc::new(|| {
+            vec![CompiledRule::test_new(
+                Scope::Project,
+                Outcome::Allow,
+                Predicate::agent(None, None, Tier::None),
+            )]
+        })
+    }
+
+    /// A single-turn scripted `Provider`: always answers with one final text
+    /// block and never asks for a tool call. Mirrors
+    /// `submit_turn_e2e.rs`'s `ScriptedToolCallProvider` (its no-tool-call
+    /// branch) — proving Task 3 drives a workflow `agent:` step's spawned
+    /// child through the real `run_agent_loop` needs a provider that can
+    /// answer for real, since `NoopProvider` panics the instant anything
+    /// calls it.
+    struct ScriptedTextProvider {
+        text: String,
+        requests: Mutex<Vec<roundhouse_provider::ChatRequest>>,
+    }
+
+    impl ScriptedTextProvider {
+        fn new(text: &str) -> Self {
+            ScriptedTextProvider {
+                text: text.to_string(),
+                requests: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn requests(&self) -> Vec<roundhouse_provider::ChatRequest> {
+            self.requests.lock().unwrap().clone()
+        }
+    }
+
+    impl roundhouse_provider::Provider for ScriptedTextProvider {
+        fn capabilities(
+            &self,
+            _model: &roundhouse_provider::ModelId,
+        ) -> roundhouse_provider::Capabilities {
+            roundhouse_provider::Capabilities::default()
+        }
+        fn resolve(
+            &self,
+            _req: &roundhouse_provider::ChatRequest,
+        ) -> Result<roundhouse_provider::Plan, roundhouse_provider::ProviderError> {
+            Ok(roundhouse_provider::Plan {
+                endpoint: "fake".into(),
+            })
+        }
+        fn stream_chat<'a>(
+            &'a self,
+            req: &'a roundhouse_provider::ChatRequest,
+            _ctx: &'a roundhouse_provider::RequestCtx,
+        ) -> roundhouse_provider::BoxFut<
+            'a,
+            Result<roundhouse_provider::ChatStream, roundhouse_provider::ProviderError>,
+        > {
+            self.requests.lock().unwrap().push(req.clone());
+            let text = self.text.clone();
+            Box::pin(async move {
+                let events = vec![
+                    roundhouse_provider::StreamEvent::BlockStart {
+                        index: 0,
+                        kind: roundhouse_provider::BlockKind::Text,
+                    },
+                    roundhouse_provider::StreamEvent::BlockDelta {
+                        index: 0,
+                        delta: roundhouse_provider::BlockDelta::Text(text),
+                    },
+                    roundhouse_provider::StreamEvent::BlockStop { index: 0 },
+                    roundhouse_provider::StreamEvent::MessageStop,
+                ];
+                Ok(roundhouse_provider::ChatStream(Box::pin(
+                    futures::stream::iter(events),
+                )))
+            })
+        }
+        fn count_tokens<'a>(
+            &'a self,
+            _req: &'a roundhouse_provider::ChatRequest,
+            _ctx: &'a roundhouse_provider::RequestCtx,
+        ) -> roundhouse_provider::BoxFut<
+            'a,
+            Result<roundhouse_provider::TokenCount, roundhouse_provider::ProviderError>,
+        > {
+            Box::pin(async { Ok(roundhouse_provider::TokenCount::default()) })
+        }
+        fn list_models<'a>(
+            &'a self,
+            _ctx: &'a roundhouse_provider::RequestCtx,
+        ) -> roundhouse_provider::BoxFut<
+            'a,
+            Result<Vec<roundhouse_provider::ModelInfo>, roundhouse_provider::ProviderError>,
+        > {
+            Box::pin(async { Ok(Vec::new()) })
+        }
+    }
+
+    #[tokio::test]
+    async fn an_agent_step_spawns_a_child_drives_it_and_completes_the_parent_task_with_its_result()
+    {
+        let provider = Arc::new(ScriptedTextProvider::new("hi there"));
+        let harness = harness_with_overlap_and_rules_and_provider(
+            agent_step_workflow(),
+            OverlapPolicy::Skip,
+            allow_agent_rules(),
+            Arc::clone(&provider) as Arc<dyn roundhouse_provider::Provider>,
+        )
+        .await;
+
+        harness
+            .executor
+            .claim_and_run(harness.delivery.clone(), harness.stored.clone())
+            .await;
+
+        let row = harness.delivery_row().await;
+        assert_eq!(
+            row.state,
+            DeliveryState::Delivered,
+            "a driven agent: step must let the run — and so the delivery — reach a terminal state"
+        );
+
+        let session_id = row.session_id.expect("reserve stamps a session id");
+        let conn = harness.store.pool.get().await.unwrap();
+        let events = conn
+            .interact(move |connection| {
+                connection
+                    .prepare(
+                        "SELECT task_id, payload FROM events WHERE session_id = ?1 ORDER BY seq",
+                    )
+                    .unwrap()
+                    .query_map([session_id.to_string()], |row| {
+                        Ok((row.get::<_, Option<String>>(0)?, row.get::<_, String>(1)?))
+                    })
+                    .unwrap()
+                    .map(Result::unwrap)
+                    .collect::<Vec<_>>()
+            })
+            .await
+            .unwrap();
+
+        let agent_task_id = events
+            .iter()
+            .find_map(|(task_id, payload)| {
+                matches!(
+                    serde_json::from_str::<EventPayload>(payload).unwrap(),
+                    EventPayload::TaskCreated {
+                        kind: TaskKind::Agent,
+                        ..
+                    }
+                )
+                .then(|| task_id.clone())
+                .flatten()
+            })
+            .expect("the agent: step creates one parent agent task");
+
+        let output = events
+            .iter()
+            .find_map(|(task_id, payload)| {
+                if task_id.as_deref() != Some(agent_task_id.as_str()) {
+                    return None;
+                }
+                match serde_json::from_str::<EventPayload>(payload).unwrap() {
+                    EventPayload::TaskCompleted { output, .. } => Some(output),
+                    _ => None,
+                }
+            })
+            .expect("a driven agent: step must complete its own parent task with a real result");
+        assert!(
+            matches!(
+                &output,
+                TaskOutput::Json(serde_json::Value::String(text)) if text == "hi there"
+            ),
+            "the child's real transcript text must become the step's output, got {output:?}"
+        );
+
+        assert_eq!(
+            harness.resources.sub_agents.len(),
+            0,
+            "the spawned child's fan-out slot must be released once it is driven to completion"
+        );
+
+        let requests = provider.requests();
+        assert_eq!(
+            requests.len(),
+            1,
+            "the child's session must actually be driven through the real provider"
+        );
+    }
+
+    /// A single-turn scripted `Provider` that always asks for more tool
+    /// calls in one turn than `WORKFLOW_AGENT_MAX_TOOL_CALLS_PER_TURN`
+    /// allows — a cheap, deterministic way to force `run_agent_loop` into
+    /// its own `AgentLoopError::TooManyToolCallsInOneTurn`, without needing
+    /// a real slow/hanging provider to prove the driving-failure path (a
+    /// real `step_timeout` test needs a configurable run-level budget this
+    /// harness does not yet expose; this is the tractable half of "the
+    /// fan-out slot is released on failure too", not the timeout half).
+    struct ScriptedTooManyToolCallsProvider;
+
+    impl roundhouse_provider::Provider for ScriptedTooManyToolCallsProvider {
+        fn capabilities(
+            &self,
+            _model: &roundhouse_provider::ModelId,
+        ) -> roundhouse_provider::Capabilities {
+            roundhouse_provider::Capabilities::default()
+        }
+        fn resolve(
+            &self,
+            _req: &roundhouse_provider::ChatRequest,
+        ) -> Result<roundhouse_provider::Plan, roundhouse_provider::ProviderError> {
+            Ok(roundhouse_provider::Plan {
+                endpoint: "fake".into(),
+            })
+        }
+        fn stream_chat<'a>(
+            &'a self,
+            _req: &'a roundhouse_provider::ChatRequest,
+            _ctx: &'a roundhouse_provider::RequestCtx,
+        ) -> roundhouse_provider::BoxFut<
+            'a,
+            Result<roundhouse_provider::ChatStream, roundhouse_provider::ProviderError>,
+        > {
+            Box::pin(async move {
+                let too_many = WORKFLOW_AGENT_MAX_TOOL_CALLS_PER_TURN + 1;
+                let mut events = Vec::with_capacity(too_many as usize * 3 + 1);
+                for i in 0..too_many {
+                    events.push(roundhouse_provider::StreamEvent::BlockStart {
+                        index: i,
+                        kind: roundhouse_provider::BlockKind::ToolUse {
+                            name: "read".into(),
+                            provider_id: Some(format!("call_{i}")),
+                        },
+                    });
+                    events.push(roundhouse_provider::StreamEvent::BlockDelta {
+                        index: i,
+                        delta: roundhouse_provider::BlockDelta::ToolArgsFragment("{}".to_string()),
+                    });
+                    events.push(roundhouse_provider::StreamEvent::BlockStop { index: i });
+                }
+                events.push(roundhouse_provider::StreamEvent::MessageStop);
+                Ok(roundhouse_provider::ChatStream(Box::pin(
+                    futures::stream::iter(events),
+                )))
+            })
+        }
+        fn count_tokens<'a>(
+            &'a self,
+            _req: &'a roundhouse_provider::ChatRequest,
+            _ctx: &'a roundhouse_provider::RequestCtx,
+        ) -> roundhouse_provider::BoxFut<
+            'a,
+            Result<roundhouse_provider::TokenCount, roundhouse_provider::ProviderError>,
+        > {
+            Box::pin(async { Ok(roundhouse_provider::TokenCount::default()) })
+        }
+        fn list_models<'a>(
+            &'a self,
+            _ctx: &'a roundhouse_provider::RequestCtx,
+        ) -> roundhouse_provider::BoxFut<
+            'a,
+            Result<Vec<roundhouse_provider::ModelInfo>, roundhouse_provider::ProviderError>,
+        > {
+            Box::pin(async { Ok(Vec::new()) })
+        }
+    }
+
+    #[tokio::test]
+    async fn an_agent_steps_driving_failure_still_releases_the_childs_fan_out_slot() {
+        let harness = harness_with_overlap_and_rules_and_provider(
+            agent_step_workflow(),
+            OverlapPolicy::Skip,
+            allow_agent_rules(),
+            Arc::new(ScriptedTooManyToolCallsProvider) as Arc<dyn roundhouse_provider::Provider>,
+        )
+        .await;
+
+        harness
+            .executor
+            .claim_and_run(harness.delivery.clone(), harness.stored.clone())
+            .await;
+
+        let row = harness.delivery_row().await;
+        assert_eq!(
+            row.state,
+            DeliveryState::Failed,
+            "a run loop failure in the spawned child must fail the step, and so the run"
+        );
+        assert_eq!(
+            harness.resources.sub_agents.len(),
+            0,
+            "a driving FAILURE must still release the spawned child's fan-out slot, not just success"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_taint_boundary_merge_carries_a_tainted_childs_taint_onto_its_parent() {
+        let parent_dir = tempfile::tempdir().unwrap();
+        let child_dir = tempfile::tempdir().unwrap();
+        let parent = crate::test_support::real_actor(parent_dir.path()).await;
+        let child = crate::test_support::real_actor(child_dir.path()).await;
+
+        child.mark_tainted();
+        assert_eq!(parent.current_taint(), roundhouse_policy::Taint::Trusted);
+
+        apply_taint_boundary_merge(&parent, &child);
+
+        assert_eq!(
+            parent.current_taint(),
+            roundhouse_policy::Taint::Tainted,
+            "a tainted child's return must taint its parent, per §6.8's monotonic \
+             spawn-boundary union"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_taint_boundary_merge_leaves_a_clean_parent_untainted_by_a_clean_child() {
+        let parent_dir = tempfile::tempdir().unwrap();
+        let child_dir = tempfile::tempdir().unwrap();
+        let parent = crate::test_support::real_actor(parent_dir.path()).await;
+        let child = crate::test_support::real_actor(child_dir.path()).await;
+
+        apply_taint_boundary_merge(&parent, &child);
+
+        assert_eq!(
+            parent.current_taint(),
+            roundhouse_policy::Taint::Trusted,
+            "a clean child's return must not taint an already-clean parent"
         );
     }
 

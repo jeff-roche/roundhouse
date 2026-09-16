@@ -91,6 +91,7 @@ fn task_with_completed_event_is_completed() {
                 // TaskOutput has no Default either (audit finding X4) — same fix.
                 output: TaskOutput::Text("ok".into()),
                 usage: Default::default(), // Usage does derive Default (Phase 0 confirmed)
+                trust: roundhouse_core::Trust::Trusted,
             },
             schema_v: 1,
         },

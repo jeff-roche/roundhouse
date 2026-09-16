@@ -1,6 +1,6 @@
 use roundhouse_core::Tier;
 use roundhouse_policy::engine::{CompiledRule, Outcome, PolicyEngine, Predicate, Scope};
-use roundhouse_policy::{FsOp, Method, PathErr, ProviderId, ServerId, TaskParams};
+use roundhouse_policy::{FsOp, Method, PathErr, ProviderId, ServerId, Taint, TaskParams};
 use std::path::PathBuf;
 
 #[test]
@@ -39,7 +39,7 @@ fn no_matching_rule_denies_in_unattended_mode() {
         canonical: Ok(PathBuf::from("/workspace/unmentioned.txt")),
     };
     let policy = PolicyEngine::from_rules(vec![]);
-    let decision = policy.decide_unattended(&params);
+    let decision = policy.decide_unattended(&params, Taint::Trusted);
     assert_eq!(
         decision.outcome,
         Outcome::Deny,

@@ -19,7 +19,7 @@ use crate::engine::{Decision, Outcome, PolicyEngine, RuleId};
 use crate::sealed::SealedContext;
 use crate::shell::classify::{with_parse_stack, ParsedShellAst, SessionEnv};
 use crate::shell::opaque::{classify_shell, ShellClassification};
-use crate::{FsOp, ParsedCommand, PathErr, TaskParams};
+use crate::{FsOp, ParsedCommand, PathErr, Taint, TaskParams};
 
 /// A single filesystem target produced by a shell redirection (`<`, `>`,
 /// `>>`, `&>`, `>&file`, ...) — evaluated as its own synthetic `Fs` task,
@@ -447,6 +447,7 @@ pub fn decide_pipeline(
     policy: &PolicyEngine,
     ctx: &SealedContext,
     cmd: &ParsedShellAst,
+    taint: Taint,
 ) -> Decision {
     let nodes = resolve_nodes(&cmd.program_ast);
     let mut worst: Option<Decision> = None;
@@ -456,7 +457,7 @@ pub fn decide_pipeline(
             program: node.resolved_program.clone(),
             argv: node.argv.clone(),
         });
-        let d = policy.decide_sealed(&params, ctx);
+        let d = policy.decide_sealed(&params, ctx, taint);
         let is_deny = d.outcome == Outcome::Deny;
         worst = combine(worst, d);
         if is_deny {
@@ -475,7 +476,7 @@ pub fn decide_pipeline(
                 path: redir.path.clone(),
                 canonical,
             };
-            let d = policy.decide_sealed(&fs_params, ctx);
+            let d = policy.decide_sealed(&fs_params, ctx, taint);
             let is_deny = d.outcome == Outcome::Deny;
             worst = combine(worst, d);
             if is_deny {
@@ -514,13 +515,14 @@ pub fn decide_shell_command(
     ctx: &SealedContext,
     raw: &str,
     env: &SessionEnv,
+    taint: Taint,
 ) -> Decision {
     match classify_shell(raw, env) {
         ShellClassification::HardDeny(hint) => Decision {
             outcome: Outcome::Deny,
             rule: Some(RuleId(hint.rule.to_string())),
         },
-        ShellClassification::Program(cmd) => decide_pipeline(policy, ctx, &cmd),
+        ShellClassification::Program(cmd) => decide_pipeline(policy, ctx, &cmd, taint),
     }
 }
 
