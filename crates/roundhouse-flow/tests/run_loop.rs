@@ -7740,6 +7740,216 @@ fn a_nested_gate_answer_does_not_also_release_a_second_maps_gate_of_the_same_id(
     );
 }
 
+/// **Routing an answer by inner step id alone is not enough, and getting it
+/// wrong is a loop rather than a wrong value** (fix round 1).
+///
+/// Two sequential `map` steps declaring inner gates under the same id. When
+/// the *second* one parks, an answer routed by the first textual match names
+/// the **first** map — which is finished and is not being re-driven — so the
+/// second map is not recognised as mid-fan-out, its own `Indeterminate` row
+/// takes §8.10 tier 2's branch, and the run parks again on a crash-recovery
+/// prompt about a `map` that never crashed. Answering *that* with `rerun`
+/// re-drives the map, whose gate parks again: the operator is asked the wrong
+/// question forever, with the real one never surfacing.
+///
+/// Every park here is therefore answered as the `gate:` answer it should be,
+/// and the run must reach a terminal state having asked exactly the two
+/// questions the workflow actually contains.
+#[test]
+fn answering_the_second_of_two_same_named_nested_gates_resumes_it_rather_than_re_parking() {
+    let inner_gate = |label: &str| {
+        format!(
+            "\x20   steps:\n\
+             \x20     - id: approve\n\
+             \x20       gate:\n\
+             \x20         title: \"{label}: ship ${{{{ item.name }}}}?\"\n\
+             \x20         form: {{ approve: {{ type: boolean }} }}\n\
+             \x20         timeout: 1h\n\
+             \x20         on_timeout: deny\n"
+        )
+    };
+    let body = format!(
+        "steps:\n\
+         \x20 - id: first\n\
+         \x20   map:\n\
+         \x20     over: \"${{{{ inputs.items }}}}\"\n\
+         \x20     as: item\n\
+         \x20     on_item_error: continue\n\
+         {}\
+         \x20 - id: second\n\
+         \x20   needs: [first]\n\
+         \x20   map:\n\
+         \x20     over: \"${{{{ inputs.items }}}}\"\n\
+         \x20     as: item\n\
+         \x20     on_item_error: continue\n\
+         {}",
+        inner_gate("first"),
+        inner_gate("second")
+    );
+    let mut conn = open_test_db();
+    let (run_id, _) = seed_run(&mut conn);
+    let def = parse_workflow(&workflow(&body)).expect("fixture parses");
+    let mut sink = RecordingSink::default();
+    let mut host = FakeHost::new();
+    let mut run_ctx = ctx(run_id);
+    run_ctx.inputs = serde_json::json!({ "items": gated_items(&[true]) });
+
+    let mut resume: Option<Resume> = None;
+    let mut segments = 0usize;
+    let terminal = loop {
+        segments += 1;
+        assert!(
+            segments <= MAX_SEGMENTS,
+            "the run has been re-entered {segments} times without reaching a terminal state — \
+             the answer is releasing a park that immediately re-parks. Questions asked: {:?}",
+            awaiting_human_forms(&sink)
+        );
+        let outcome = run_workflow(
+            &mut conn,
+            &def,
+            run_id,
+            &mut sink,
+            &mut host,
+            run_ctx.clone(),
+            at(100 * segments as i64),
+            resume.take(),
+        )
+        .expect("the run drives");
+        match outcome {
+            RunOutcome::Parked(parked) => {
+                resume = Some(Resume::Gate(GateAnswer {
+                    step_id: "approve".into(),
+                    item_index: parked.item_index,
+                    output: serde_json::json!({ "approve": true }),
+                }))
+            }
+            other => break other,
+        }
+    };
+
+    let RunOutcome::Terminal { state, .. } = &terminal else {
+        panic!("both maps' gates are answered, so the run ends, got {terminal:?}");
+    };
+    assert_eq!(*state, RunState::Completed);
+    let asked: Vec<(String, String)> = awaiting_human_forms(&sink)
+        .iter()
+        .map(|f| {
+            (
+                f["source"].as_str().unwrap_or("?").to_string(),
+                f["form_schema"]["title"]
+                    .as_str()
+                    .unwrap_or("?")
+                    .to_string(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        asked,
+        vec![
+            ("gate".to_string(), "first: ship item-0?".to_string()),
+            ("gate".to_string(), "second: ship item-0?".to_string()),
+        ],
+        "exactly the two questions the workflow declares, each asked once, and neither of them \
+         §8.10's crash-recovery prompt: {asked:?}"
+    );
+}
+
+/// **A nested `gate:` that declares `on_crash:` still parks and is still
+/// answerable** (fix round 1).
+///
+/// The park writes the gate's own row `Running`, and the resume segment
+/// re-reads it. `decided_map_item_step` used to answer that row with
+/// `crash_policy(step)`, which is the step's **declared** `on_crash:` when
+/// there is one — so a gate declaring `ask` or `fail` was refused as an
+/// interrupted effectful step, the human's answer was dropped, and the item
+/// failed with a crash message about a step that had only parked.
+///
+/// The top-level path never had this: `run_phase`'s tier-2 branch keys on
+/// `indeterminate_before`, and an `Idempotent` gate's row is never
+/// reclassified into it. Only the per-item path reads raw row state.
+#[test]
+fn a_nested_gate_declaring_on_crash_still_parks_and_its_answer_still_resolves_it() {
+    for declared in ["ask", "fail"] {
+        let body = format!(
+            "steps:\n\
+             \x20 - id: fan\n\
+             \x20   map:\n\
+             \x20     over: \"${{{{ inputs.items }}}}\"\n\
+             \x20     as: item\n\
+             \x20     on_item_error: continue\n\
+             \x20   steps:\n\
+             \x20     - id: approve\n\
+             \x20       on_crash: {declared}\n\
+             \x20       gate:\n\
+             \x20         title: \"ship ${{{{ item.name }}}}?\"\n\
+             \x20         form: {{ approve: {{ type: boolean }} }}\n\
+             \x20         timeout: 1h\n\
+             \x20         on_timeout: deny\n\
+             \x20     - id: done\n\
+             \x20       emit: {{ shipped: \"${{{{ item.name }}}}\" }}\n"
+        );
+        let mut conn = open_test_db();
+        let (run_id, _) = seed_run(&mut conn);
+        let def = parse_workflow(&workflow(&body)).expect("fixture parses");
+        let mut sink = RecordingSink::default();
+        let mut host = FakeHost::new();
+        let mut run_ctx = ctx(run_id);
+        run_ctx.inputs = serde_json::json!({ "items": gated_items(&[true]) });
+
+        let parked = run_workflow(
+            &mut conn,
+            &def,
+            run_id,
+            &mut sink,
+            &mut host,
+            run_ctx.clone(),
+            at(10),
+            None,
+        )
+        .expect("the run drives");
+        let RunOutcome::Parked(parked) = parked else {
+            panic!("`on_crash: {declared}` does not stop a gate parking, got {parked:?}");
+        };
+        assert_eq!(parked.item_index, Some(0));
+
+        let resumed = run_workflow(
+            &mut conn,
+            &def,
+            run_id,
+            &mut sink,
+            &mut host,
+            run_ctx,
+            at(20),
+            Some(Resume::Gate(GateAnswer {
+                step_id: "approve".into(),
+                item_index: Some(0),
+                output: serde_json::json!({ "approve": true }),
+            })),
+        )
+        .expect("the answer releases the park");
+
+        let RunOutcome::Terminal { state, .. } = &resumed else {
+            panic!("the answered gate finishes the map, got {resumed:?}");
+        };
+        assert_eq!(*state, RunState::Completed);
+        let output = map_output(&resumed, "fan");
+        let entries = output["items"].as_array().expect("one entry per item");
+        assert_eq!(
+            entries[0]["status"], "completed",
+            "`on_crash: {declared}` is about an interrupted effect, and a park is not one — \
+             the human's answer must decide this step, not a crash policy: {entries:?}"
+        );
+        assert_eq!(
+            entries[0]["output"]["shipped"], "item-0",
+            "and the item carried on past its gate: {entries:?}"
+        );
+        assert_eq!(
+            item_step_row(&conn, run_id, "approve", 0).map(|r| r.0),
+            Some(StepRunState::Completed)
+        );
+    }
+}
+
 /// A gate answer's `item_index` decides **which list** it is validated
 /// against, so an answer filed at the wrong nesting level is refused rather
 /// than silently resolving a same-named gate at the other one.

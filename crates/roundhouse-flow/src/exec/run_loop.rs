@@ -840,6 +840,11 @@ pub fn run_workflow<H: WorkflowHost>(
     let recovered = recover_run(conn, run_id)?;
     let session_id = recovered.run.session_id;
     let started_state = recovered.run.state;
+    // Computed here rather than at the `Loop` below, because routing a gate
+    // answer needs it first: a nested answer names an inner step id that two
+    // `map` steps may share, and the `map` whose own row says it is
+    // mid-fan-out is the one that parked. See `ensure_gate_step`.
+    let unfinished_before = unfinished_step_rows(&recovered.steps);
 
     match (started_state, &gate_answer, &crash_answer) {
         (RunState::Running, _, _) => {}
@@ -851,7 +856,7 @@ pub fn run_workflow<H: WorkflowHost>(
         // is observed), so what actually runs is the cleanup §8.13 requires.
         (RunState::Cancelling, _, _) => {}
         (RunState::AwaitingHuman, Some(answer), _) => {
-            release_park(conn, run_id, &main, answer, now)?;
+            release_park(conn, run_id, &main, answer, &unfinished_before, now)?;
         }
         // The two answers cannot both be present: `Resume` is one enum and
         // carries exactly one of them, which is §8.11's "a run has at most
@@ -871,7 +876,7 @@ pub fn run_workflow<H: WorkflowHost>(
     // records (see `failed_step_rows`). `Loop::nested_gate_map` is where that
     // fact is read back.
     let nested_gate_map = match &gate_answer {
-        Some(answer) => match ensure_gate_step(&main, answer)? {
+        Some(answer) => match ensure_gate_step(&main, answer, &unfinished_before)? {
             GateAnswerTarget::TopLevel => None,
             GateAnswerTarget::MapItem { map_step_id } => Some(map_step_id),
         },
@@ -944,7 +949,7 @@ pub fn run_workflow<H: WorkflowHost>(
         work_results,
         resuming_work,
         item_steps_before: item_step_rows(&recovered.steps),
-        unfinished_before: unfinished_step_rows(&recovered.steps),
+        unfinished_before,
     };
     run.seed_context_from_checkpoints(&recovered.steps);
 
@@ -1175,9 +1180,10 @@ fn release_park(
     run_id: RunId,
     main: &[StepDef],
     answer: &GateAnswer,
+    unfinished: &std::collections::HashSet<String>,
     now: Timestamp,
 ) -> Result<(), RunLoopError> {
-    ensure_gate_step(main, answer)?;
+    ensure_gate_step(main, answer, unfinished)?;
     // `transition` clears `awaiting_until`/`hold_until` and banks the parked
     // stretch into `parked_nanos` on this edge, which is what makes §8.4's
     // `run_active_timeout` exclude the wait.
@@ -1226,24 +1232,40 @@ enum GateAnswerTarget {
 /// failing this check: the parse failure is the `map` step's own outcome
 /// ([`parse_map_inner_steps`]), reported where the step runs.
 ///
-/// # The residual: two `map` steps whose inner gates share an id
+/// # Two `map` steps whose inner gates share an id: the row decides, not the text (fix round 1)
 ///
-/// **The first such `map` in `steps:` order wins**, and nothing here can do
-/// better: a [`GateAnswer`] names a step id and an item index, and that pair
-/// does not distinguish them. This is the same ambiguity
-/// [`Loop::item_steps_before`] already has — its `(step_id, item_index)` key
-/// cannot tell two maps' same-named inner steps apart either, as
-/// [`Loop::map_dispatches_so_far`]'s own doc records — so the answer is
-/// consistent with how the rows are keyed rather than a new disagreement.
+/// A [`GateAnswer`] names an inner step id and an item index, and that pair
+/// does **not** identify a `map` — a workflow may declare two of them whose
+/// inner gates are both called `approve`. Matching on the YAML alone and
+/// taking the first is wrong in a way that does not merely mis-attribute: if
+/// the *second* such map is the one that parked, the answer names the first,
+/// so the second is not recognised as mid-fan-out, its own row takes §8.10
+/// tier 2's branch, and the run parks again on a crash-recovery prompt about
+/// a `map` that never crashed. Answering *that* with `rerun` re-drives the
+/// map, whose gate parks again — the operator is asked the wrong question
+/// indefinitely and the real one never surfaces.
 ///
-/// What it costs, stated rather than implied: if the *second* such map is the
-/// one that parked, its answer is attributed to the first, the second map is
-/// not recognised as mid-fan-out, and §8.10 tier 2 parks it on a crash
-/// question instead of resolving the gate. That is visible and fails safe —
-/// no human's answer is applied to a question they were not shown, which is
-/// what the scoping in [`Loop::advance_map_item`] guarantees — but the run
-/// cannot be resumed past it. Giving [`GateAnswer`] the `map` step's id would
-/// close it, and is a wire-shape change beyond Phase 8 Task 25.7 Task 6.
+/// So `unfinished` — the top-level step ids whose rows say started-but-not-
+/// finished, [`unfinished_step_rows`] — breaks the tie: **a candidate `map`
+/// whose own row says it is mid-fan-out wins over one that merely contains a
+/// gate of that name.** That is the only durable signal that can. The *inner
+/// gate's* row cannot: `workflow_step_run`'s key is
+/// `(run_id, step_id, attempt, item_index)` and [`Loop::item_steps_before`]
+/// is keyed `(step_id, item_index)`, so two maps' same-named inner steps
+/// share one row outright — the second map's park overwrites the first's,
+/// the ambiguity [`Loop::map_dispatches_so_far`]'s own doc already records. A
+/// `map`'s own step id, by contrast, is unique within its phase
+/// ([`topological_order`] rejects duplicates) and its own row already says
+/// whether it is suspended, so no new field on [`GateAnswer`] is needed to
+/// route an answer correctly.
+///
+/// With no unfinished candidate, the first textual match is still taken: no
+/// park is live for either, so there is nothing to disambiguate and the
+/// answer is a caller mistake or an early answer either way. Two unfinished
+/// candidates cannot arise from one drive — [`Loop::run_phase`] returns at
+/// the first step that suspends — so the remaining case is a `map` left
+/// `Running` by a drive that died beside one that is live now, where the
+/// first in phase order is taken.
 ///
 /// The item index itself is deliberately **not** bounds-checked. `over:` is
 /// an expression evaluated per entry, so the item count is not known here,
@@ -1254,6 +1276,7 @@ enum GateAnswerTarget {
 fn ensure_gate_step(
     main: &[StepDef],
     answer: &GateAnswer,
+    unfinished: &std::collections::HashSet<String>,
 ) -> Result<GateAnswerTarget, RunLoopError> {
     let unknown = || RunLoopError::UnknownGateStep {
         step_id: answer.step_id.clone(),
@@ -1265,27 +1288,41 @@ fn ensure_gate_step(
             .then_some(GateAnswerTarget::TopLevel)
             .ok_or_else(unknown);
     }
-    for step in main {
-        let StepBody::Map {
-            steps: inner_step_yaml,
-            ..
-        } = &step.body
-        else {
-            continue;
-        };
-        let Ok(inner_steps) = parse_map_inner_steps(&step.id, inner_step_yaml) else {
-            continue;
-        };
-        if inner_steps
-            .iter()
-            .any(|inner| inner.id == answer.step_id && matches!(inner.body, StepBody::Gate { .. }))
-        {
+    let mut first_match: Option<&str> = None;
+    for step in main.iter().filter(|step| map_declares_gate(step, answer)) {
+        if unfinished.contains(&step.id) {
             return Ok(GateAnswerTarget::MapItem {
                 map_step_id: step.id.clone(),
             });
         }
+        first_match.get_or_insert(step.id.as_str());
     }
-    Err(unknown())
+    first_match
+        .map(|map_step_id| GateAnswerTarget::MapItem {
+            map_step_id: map_step_id.to_string(),
+        })
+        .ok_or_else(unknown)
+}
+
+/// Whether `step` is a `map:` whose own `steps:` declare a `gate:` under the
+/// id this answer names — [`ensure_gate_step`]'s candidate test, which says
+/// only that the answer *could* belong to this map. Which candidate it does
+/// belong to is that function's tie-break, not this one's.
+fn map_declares_gate(step: &StepDef, answer: &GateAnswer) -> bool {
+    let StepBody::Map {
+        steps: inner_step_yaml,
+        ..
+    } = &step.body
+    else {
+        return false;
+    };
+    // A `map` whose inner steps do not parse is not a candidate, rather than
+    // a failure of the check — see this function's caller.
+    parse_map_inner_steps(&step.id, inner_step_yaml).is_ok_and(|inner_steps| {
+        inner_steps
+            .iter()
+            .any(|inner| inner.id == answer.step_id && matches!(inner.body, StepBody::Gate { .. }))
+    })
 }
 
 /// [`release_park`]'s counterpart for §8.10's crash-recovery wait: check the
@@ -3864,11 +3901,17 @@ impl<H: WorkflowHost> Loop<'_, H> {
     /// `gate:` the run is about to park on. For the gate this row is more
     /// than bookkeeping — it is the durable *"which item, at which inner
     /// step"* a park needs, since `workflow_run` has one park slot and no
-    /// item dimension (see [`crate::parking::ParkResult::item_index`]). It
-    /// does not decide the resume: a gate is `Idempotent`
-    /// ([`derive_disposition`]), so [`Self::decided_map_item_step`] re-derives
-    /// this row as undecided and the gate is simply reached again — which is
-    /// exactly what makes re-presenting it to a human safe.
+    /// item dimension (see [`crate::parking::ParkResult::item_index`]).
+    ///
+    /// It does not decide the resume:
+    /// [`Self::decided_map_item_step`] re-derives a `gate:`'s row as
+    /// undecided and the gate is simply reached again, which is what makes
+    /// re-presenting it to a human safe. **That holds because that method
+    /// excludes a `gate:` body outright, not because a gate is `Idempotent`**
+    /// — the disposition derives the right default, but [`crash_policy`]
+    /// honours a *declared* `on_crash:` over it, so a gate written
+    /// `on_crash: ask` would otherwise have had this very row read as an
+    /// interrupted effect and the human's answer discarded (fix round 1).
     ///
     /// It is also the **only** place this item's `when:` gate taint can wait
     /// for its answer: [`WorkDone`] carries no such field, and the segment
@@ -3926,6 +3969,33 @@ impl<H: WorkflowHost> Loop<'_, H> {
     /// [`crash_policy`]: `Rerun` re-runs it, and `Ask`/`Fail` refuse the item
     /// closed. See [`map_item_crash_refusal`] for why `Ask` cannot be honoured
     /// literally here and what that costs.
+    ///
+    /// # A `gate:` is excluded from that question outright (fix round 1)
+    ///
+    /// **Not because of its disposition.** A gate is `Idempotent`
+    /// ([`derive_disposition`]), so [`crash_policy`] derives `Rerun` for
+    /// it — but [`crash_policy`] is `step.on_crash.unwrap_or_else(..)`, and a
+    /// *declared* `on_crash:` wins outright, by design (§8.10 lets an author
+    /// override in both directions). So a gate declaring `ask` or `fail` used
+    /// to be answered here as an interrupted effectful step: the item failed
+    /// with a crash message about a step that had only parked, and the
+    /// human's [`GateAnswer`] — the whole point of the park — was never
+    /// reached, because this method runs before
+    /// [`Self::advance_map_item`]'s gate arm and there was no second chance
+    /// to park.
+    ///
+    /// The exclusion is not a special case for one body, it is the premise
+    /// [`map_item_crash_refusal`] exists for: that refusal protects an effect
+    /// that may already have half-landed, and a gate's `Running` row records
+    /// a *question put to a human*, not an effect. There is nothing to
+    /// protect, and re-presenting the gate is exactly what a resume must do.
+    ///
+    /// This hazard is specific to the per-item path. The top-level one never
+    /// had it: [`Self::run_phase`]'s tier-2 branch keys on
+    /// [`Self::indeterminate_before`], and [`recover_run`] only reclassifies
+    /// an `Effectful` row, so an `Idempotent` gate's `Running` row never
+    /// enters that branch however it declares `on_crash:`. Only this method
+    /// reads raw row state.
     fn decided_map_item_step(
         &self,
         map_step_id: &str,
@@ -3956,6 +4026,15 @@ impl<H: WorkflowHost> Loop<'_, H> {
             // then died, so the step runs again.
             StepRunState::Failed => return None,
             StepRunState::Running | StepRunState::Indeterminate | StepRunState::Pending => {
+                // A parked `gate:`, left undecided so that
+                // `Self::advance_map_item`'s gate arm reaches it and the
+                // human's answer decides it — see this method's own
+                // "A `gate:` is excluded from that question outright".
+                // Checked *before* `crash_policy`, because that is the call
+                // a declared `on_crash:` would otherwise answer.
+                if matches!(step.body, StepBody::Gate { .. }) {
+                    return None;
+                }
                 match crash_policy(step) {
                     // The policy asks for exactly this — declared
                     // `on_crash: rerun`, or derived for a `Pure`/`Idempotent`
