@@ -662,7 +662,7 @@ fn production_host_pins_called_job_and_rejects_the_ninth_direct_child() {
         None,
     )
     .expect("run parent");
-    assert!(matches!(first, RunOutcome::Terminal { .. }));
+    assert!(matches!(first, RunOutcome::AwaitingWork { .. }));
     let child_row: (String, i64, String) = conn
         .query_row(
             "SELECT job_id, job_version, content_hash FROM workflow_run WHERE parent_run_id = ?1",
