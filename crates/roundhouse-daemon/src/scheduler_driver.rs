@@ -4826,6 +4826,12 @@ mod delivery_tests {
                 "released delivery {delivery_id} must reach a terminal state, got {state:?}"
             );
         }
+        for _ in 0..100_000 {
+            if harness.executor.slots.available_permits() == initial_permits {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
         assert_eq!(
             harness.executor.slots.available_permits(),
             initial_permits,
