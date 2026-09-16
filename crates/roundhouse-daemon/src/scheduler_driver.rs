@@ -3999,6 +3999,19 @@ mod delivery_tests {
             .to_string()
     }
 
+    fn child_undrivable_workflow() -> String {
+        "name: child-undrivable\nversion: 1\npermissions:\n  default: deny\n  unattended:\n    \
+         escalate: fail\nsteps:\n  - id: a\n    needs: [b]\n    emit: { x: 1 }\n  - id: b\n    \
+         needs: [a]\n    emit: { y: 2 }\n"
+            .to_string()
+    }
+
+    fn parent_calling_undrivable_child_workflow() -> String {
+        "name: parent-call-undrivable\nversion: 1\npermissions:\n  default: deny\n  unattended:\n    \
+         escalate: fail\nsteps:\n  - id: child\n    call: child-undrivable\n    with: {}\n"
+            .to_string()
+    }
+
     fn allow_read_rules() -> crate::session_bootstrap::PolicyRuleSource {
         Arc::new(|| {
             vec![CompiledRule::test_new(
@@ -4064,49 +4077,6 @@ mod delivery_tests {
         fn make_writer(&'a self) -> Self::Writer {
             self.clone()
         }
-    }
-
-    #[test]
-    fn child_dispatch_failures_log_only_static_categories() {
-        let captured = CapturingWriter::default();
-        let subscriber = tracing_subscriber::fmt()
-            .with_writer(captured.clone())
-            .with_ansi(false)
-            .finish();
-
-        tracing::subscriber::with_default(subscriber, || {
-            for failure in [
-                ChildDispatchFailure::WorkspaceRegistryUnavailable,
-                ChildDispatchFailure::WorkspaceUnresolvable,
-                ChildDispatchFailure::SessionConstruction,
-                ChildDispatchFailure::RunLoop,
-                ChildDispatchFailure::Driver,
-            ] {
-                assert!(matches!(
-                    park_child_after_failure(failure),
-                    PendingExecution::ChildParked
-                ));
-            }
-        });
-
-        let rendered = String::from_utf8(captured.0.lock().unwrap().clone())
-            .expect("the tracing subscriber emits UTF-8");
-        for kind in [
-            "child_workspace_registry_unavailable",
-            "child_workspace_unresolvable",
-            "child_session_construction",
-            "child_run_loop",
-            "child_driver",
-        ] {
-            assert!(
-                rendered.contains(kind),
-                "missing child failure category {kind}: {rendered}"
-            );
-        }
-        assert!(
-            !rendered.contains("sk-child-secret"),
-            "child failure logs must not contain raw dispatched input: {rendered}"
-        );
     }
 
     struct Harness {
@@ -4198,6 +4168,38 @@ mod delivery_tests {
             conn.interact(move |connection| recover_run(connection, run_id).unwrap().run.state)
                 .await
                 .unwrap()
+        }
+
+        async fn headless_parent(
+            &self,
+            sessions: &Arc<SessionRegistry>,
+        ) -> (HeadlessSession, SessionSpec) {
+            let workspace = self
+                .resources
+                .workspace_registry
+                .as_ref()
+                .unwrap()
+                .resolve_by_id(self.stored.workspace)
+                .unwrap();
+            let spec = SessionSpec {
+                workspace: self.stored.workspace,
+                name: Some(workspace.name.clone()),
+                requested_tier: Tier::Sandbox,
+                on_degrade: OnDegrade::Refuse,
+                parent: None,
+            };
+            let parent = create_headless_session(
+                &self.resources,
+                sessions,
+                SessionId::new(),
+                spec.clone(),
+                workspace.root.clone(),
+                workspace.root_device,
+                workspace.root_inode,
+            )
+            .await
+            .unwrap();
+            (parent, spec)
         }
 
         /// A second [`DeliveryExecutor`], sharing this harness's on-disk
@@ -4534,6 +4536,74 @@ mod delivery_tests {
         }
     }
 
+    fn secret_derived_child_pending(parent_session_id: SessionId) -> PendingWork {
+        PendingWork {
+            run_id: RunId::new(),
+            session_id: parent_session_id,
+            step_id: "child".into(),
+            attempt: 1,
+            item_index: None,
+            disposition: roundhouse_flow::durability::StepDisposition::Effectful,
+            step_timeout: Duration::from_secs(60),
+            kind: PendingKind::ChildRun {
+                child_run_id: RunId::new(),
+                child_session_id: SessionId::new(),
+                parent_task_id: TaskId::new(),
+                dispatch_input: serde_json::json!({ "token": "sk-child-secret" }),
+                inputs_secret_derived: true,
+            },
+        }
+    }
+
+    fn test_run_context(run_id: RunId) -> RunContext {
+        RunContext {
+            inputs: serde_json::Value::Null,
+            inputs_secret_derived: false,
+            vars: serde_json::Value::Null,
+            secrets: HashMap::new(),
+            run_id,
+            previous_report: None,
+            env_allowlist: EnvAllowlist::deny_all(),
+            worktree_provider: None,
+        }
+    }
+
+    fn captured_logs() -> (CapturingWriter, tracing::Dispatch) {
+        let captured = CapturingWriter::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(captured.clone())
+            .with_ansi(false)
+            .finish();
+        (captured, tracing::Dispatch::new(subscriber))
+    }
+
+    fn assert_static_child_failure_log(
+        captured: CapturingWriter,
+        kind: &str,
+        forbidden_values: &[&str],
+    ) {
+        let rendered = String::from_utf8(captured.0.lock().unwrap().clone())
+            .expect("the tracing subscriber emits UTF-8");
+        assert!(
+            rendered.contains(kind),
+            "missing child failure category {kind}: {rendered}"
+        );
+        assert!(
+            !rendered.contains("sk-child-secret"),
+            "child failure logs must not contain raw dispatched input: {rendered}"
+        );
+        assert!(
+            !rendered.contains("error="),
+            "child failure logs must carry only the static kind field: {rendered}"
+        );
+        for value in forbidden_values {
+            assert!(
+                !rendered.contains(value),
+                "child failure logs must not contain dynamic failure detail: {rendered}"
+            );
+        }
+    }
+
     /// Task 1 of the sub-agent spawn-tracking plan: `DaemonResources` is now
     /// the single, daemon-wide owner of the `SpawnTree`, and
     /// `DeliveryExecutor::new` takes it as a parameter instead of minting its
@@ -4795,8 +4865,9 @@ mod delivery_tests {
         let parent_run_id = RunId::from_uuid(
             Uuid::parse_str(row.run_id.as_deref().expect("reserve stamps a run id")).unwrap(),
         );
+        let parent_session_id = row.session_id.expect("reserve stamps a session id");
         let conn = harness.store.pool.get().await.unwrap();
-        let (parent_call_state, child_run_id, child_session_id) = conn
+        let (parent_call_state, parent_task_completions, child_run_id, child_session_id) = conn
             .interact(move |connection| {
                 let parent_call_state: String = connection
                     .query_row(
@@ -4805,6 +4876,21 @@ mod delivery_tests {
                         |row| row.get(0),
                     )
                     .unwrap();
+                let parent_task_completions = connection
+                    .prepare("SELECT payload FROM events WHERE session_id = ?1 ORDER BY seq")
+                    .unwrap()
+                    .query_map([parent_session_id.to_string()], |row| {
+                        row.get::<_, String>(0)
+                    })
+                    .unwrap()
+                    .map(Result::unwrap)
+                    .filter(|payload| {
+                        matches!(
+                            serde_json::from_str::<EventPayload>(payload).unwrap(),
+                            EventPayload::TaskCompleted { .. }
+                        )
+                    })
+                    .count();
                 let (child_run_id, child_session_id) = connection
                     .query_row(
                         "SELECT id, session_id FROM workflow_run WHERE parent_run_id = ?1",
@@ -4814,6 +4900,7 @@ mod delivery_tests {
                     .unwrap();
                 (
                     parent_call_state,
+                    parent_task_completions,
                     RunId::from_uuid(Uuid::parse_str(&child_run_id).unwrap()),
                     SessionId::from_uuid(Uuid::parse_str(&child_session_id).unwrap()),
                 )
@@ -4822,6 +4909,11 @@ mod delivery_tests {
             .unwrap();
 
         assert_eq!(row.state, DeliveryState::Running);
+        assert_eq!(
+            harness.run_state(parent_run_id).await,
+            RunState::Running,
+            "a child gate must not terminalize the parent run"
+        );
         assert_eq!(
             harness.active(),
             1,
@@ -4832,6 +4924,14 @@ mod delivery_tests {
             "the parent must not fabricate a terminal child result"
         );
         assert_eq!(
+            parent_task_completions, 0,
+            "the parent agent task must not complete before Task 3 joins a child result"
+        );
+        assert!(
+            harness.sessions.actor(parent_session_id).is_some(),
+            "the parent session must remain live while its child waits on a gate"
+        );
+        assert_eq!(
             harness.run_state(child_run_id).await,
             RunState::AwaitingHuman,
             "the child gate must remain in its explicit nonterminal state"
@@ -4840,6 +4940,136 @@ mod delivery_tests {
             harness.sessions.actor(child_session_id).is_some(),
             "the parked child session must remain live for a later gate answer"
         );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn child_dispatch_without_a_workspace_registry_logs_only_its_static_category() {
+        let harness = harness(completing_workflow()).await;
+        let (parent, spec) = harness.headless_parent(&harness.sessions).await;
+        let resources = Arc::new(daemon_resources(harness._dir.path(), None).await);
+        let executor = DeliveryExecutor::new(
+            harness.store.clone(),
+            resources,
+            Arc::clone(&harness.sessions),
+            Arc::new(InMemoryRunRegistry::new()),
+            Arc::new(SpawnTree::new()),
+            Arc::new(FixedClock(instant())),
+        );
+        let run_id = RunId::new();
+        let (captured, dispatch) = captured_logs();
+        let outcome = {
+            let _guard = tracing::dispatcher::set_default(&dispatch);
+            executor
+                .execute_pending(
+                    &parent,
+                    parent.session_id(),
+                    &spec,
+                    &harness.workspace_root,
+                    &test_run_context(run_id),
+                    vec![secret_derived_child_pending(parent.session_id())],
+                )
+                .await
+        };
+
+        assert!(matches!(outcome, PendingExecution::ChildParked));
+        assert_static_child_failure_log(captured, "child_workspace_registry_unavailable", &[]);
+        parent
+            .teardown(&harness.sessions, &harness.resources.proxy)
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn child_dispatch_with_an_unresolvable_workspace_logs_only_its_static_category() {
+        let harness = harness(completing_workflow()).await;
+        let (parent, mut spec) = harness.headless_parent(&harness.sessions).await;
+        let unresolvable_workspace = WorkspaceId::new();
+        spec.workspace = unresolvable_workspace;
+        let run_id = RunId::new();
+        let (captured, dispatch) = captured_logs();
+        let outcome = {
+            let _guard = tracing::dispatcher::set_default(&dispatch);
+            harness
+                .executor
+                .execute_pending(
+                    &parent,
+                    parent.session_id(),
+                    &spec,
+                    &harness.workspace_root,
+                    &test_run_context(run_id),
+                    vec![secret_derived_child_pending(parent.session_id())],
+                )
+                .await
+        };
+
+        assert!(matches!(outcome, PendingExecution::ChildParked));
+        assert_static_child_failure_log(
+            captured,
+            "child_workspace_unresolvable",
+            &[&unresolvable_workspace.to_string()],
+        );
+        parent
+            .teardown(&harness.sessions, &harness.resources.proxy)
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn child_session_construction_failure_logs_only_its_static_category() {
+        let harness = harness(completing_workflow()).await;
+        let sessions = Arc::new(SessionRegistry::with_limits(1, 1));
+        let (parent, spec) = harness.headless_parent(&sessions).await;
+        let executor = DeliveryExecutor::new(
+            harness.store.clone(),
+            Arc::clone(&harness.resources),
+            Arc::clone(&sessions),
+            Arc::new(InMemoryRunRegistry::new()),
+            Arc::clone(&harness.resources.spawn_tree),
+            Arc::new(FixedClock(instant())),
+        );
+        let run_id = RunId::new();
+        let (captured, dispatch) = captured_logs();
+        let outcome = {
+            let _guard = tracing::dispatcher::set_default(&dispatch);
+            executor
+                .execute_pending(
+                    &parent,
+                    parent.session_id(),
+                    &spec,
+                    &harness.workspace_root,
+                    &test_run_context(run_id),
+                    vec![secret_derived_child_pending(parent.session_id())],
+                )
+                .await
+        };
+
+        assert!(matches!(outcome, PendingExecution::ChildParked));
+        assert_static_child_failure_log(captured, "child_session_construction", &[]);
+        parent.teardown(&sessions, &harness.resources.proxy).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_undrivable_child_logs_only_the_run_loop_category() {
+        let harness = harness(parent_calling_undrivable_child_workflow()).await;
+        let child_source = harness.workspace_root.join("child.yaml");
+        std::fs::write(&child_source, child_undrivable_workflow()).unwrap();
+        let root = harness.workspace_root.clone();
+        let conn = harness.store.pool.get().await.unwrap();
+        conn.interact(move |connection| {
+            register_workflow_file(connection, &root, &child_source, template()).unwrap();
+        })
+        .await
+        .unwrap();
+
+        let (captured, dispatch) = captured_logs();
+        {
+            let _guard = tracing::dispatcher::set_default(&dispatch);
+            harness
+                .executor
+                .claim_and_run(harness.delivery.clone(), harness.stored.clone())
+                .await;
+        }
+
+        assert_eq!(harness.delivery_row().await.state, DeliveryState::Running);
+        assert_static_child_failure_log(captured, "child_run_loop", &[]);
     }
 
     #[tokio::test]
