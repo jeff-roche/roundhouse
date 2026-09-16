@@ -2595,7 +2595,7 @@ impl DeliveryExecutor {
             env_allowlist: EnvAllowlist::deny_all(),
             worktree_provider: Some(Arc::new(SandboxWorktreeProvider::new(root.clone()))),
         };
-        let result = self
+        let result = match self
             .drive_run_to_completion(
                 parent_run.id,
                 parent_run.session_id,
@@ -2606,11 +2606,21 @@ impl DeliveryExecutor {
                 self.now(),
                 Some(Resume::Work(vec![done])),
             )
-            .await?
-            .map_err(|_| DeliveryError::ChildParentResume)?;
+            .await
+        {
+            Ok(Ok(result)) => result,
+            Ok(Err(_)) => {
+                self.park_session(session);
+                return Err(DeliveryError::ChildParentResume);
+            }
+            Err(error) => {
+                self.park_session(session);
+                return Err(error);
+            }
+        };
         if parent_run.parent_run_id.is_none() {
             let run_id = parent_run.id.as_uuid().to_string();
-            let delivery = self
+            let delivery = match self
                 .with_connection(move |conn| {
                     list_deliveries_in_states(conn, &[DeliveryState::Running])
                         .map(|deliveries| {
@@ -2620,8 +2630,18 @@ impl DeliveryExecutor {
                         })
                         .map_err(|error| error.to_string())
                 })
-                .await?
-                .map_err(DeliveryError::Transition)?;
+                .await
+            {
+                Ok(Ok(delivery)) => delivery,
+                Ok(Err(error)) => {
+                    self.park_session(session);
+                    return Err(DeliveryError::Transition(error));
+                }
+                Err(error) => {
+                    self.park_session(session);
+                    return Err(error);
+                }
+            };
             if let Some(delivery) = delivery {
                 return self
                     .handle_run_outcome(
@@ -6418,6 +6438,101 @@ mod delivery_tests {
             harness.accept_another_occurrence(1).await.state,
             DeliveryState::Ready,
             "the released binding must admit its next firing"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_driver_failure_during_same_process_continuation_keeps_the_parent_for_retry() {
+        let harness = harness(parent_calling_child_gate_workflow()).await;
+        let child_source = harness.workspace_root.join("child.yaml");
+        std::fs::write(&child_source, child_parking_workflow()).unwrap();
+        let root = harness.workspace_root.clone();
+        let conn = harness.store.pool.get().await.unwrap();
+        conn.interact(move |connection| {
+            register_workflow_file(connection, &root, &child_source, template()).unwrap();
+        })
+        .await
+        .unwrap();
+        harness
+            .executor
+            .claim_and_run(harness.delivery.clone(), harness.stored.clone())
+            .await;
+
+        let parent = harness.delivery_row().await;
+        let parent_run_id = RunId::from_uuid(
+            Uuid::parse_str(parent.run_id.as_deref().expect("reserve stamps a run id")).unwrap(),
+        );
+        let parent_session_id = parent
+            .session_id
+            .expect("reserve stamps a parent session id");
+        let conn = harness.store.pool.get().await.unwrap();
+        let (child_run_id, child_session_id) = conn
+            .interact(move |connection| {
+                let (child_run_id, child_session_id): (String, String) = connection
+                    .query_row(
+                        "SELECT id, session_id FROM workflow_run WHERE parent_run_id = ?1",
+                        [parent_run_id.to_string()],
+                        |row| Ok((row.get(0)?, row.get(1)?)),
+                    )
+                    .unwrap();
+                (
+                    RunId::from_uuid(Uuid::parse_str(&child_run_id).unwrap()),
+                    SessionId::from_uuid(Uuid::parse_str(&child_session_id).unwrap()),
+                )
+            })
+            .await
+            .unwrap();
+
+        answer_child_gate_after_restart(
+            &harness.executor,
+            &harness,
+            child_run_id,
+            child_session_id,
+            parent_session_id,
+        )
+        .await;
+
+        let parent_run = parent_run_id.to_string();
+        let conn = harness.store.pool.get().await.unwrap();
+        conn.interact(move |connection| {
+            connection
+                .execute_batch(&format!(
+                    "CREATE TRIGGER reject_parent_continuation_driver
+                     BEFORE UPDATE ON workflow_run
+                     WHEN NEW.id = '{parent_run}'
+                     BEGIN SELECT RAISE(ABORT, 'parent continuation driver refused'); END;"
+                ))
+                .unwrap();
+        })
+        .await
+        .unwrap();
+        assert!(harness
+            .executor
+            .continue_after_child_terminal(child_run_id)
+            .await
+            .is_err());
+        assert!(
+            harness.sessions.actor(parent_session_id).is_some(),
+            "a failed continuation keeps its live parent session available for retry"
+        );
+
+        let conn = harness.store.pool.get().await.unwrap();
+        conn.interact(move |connection| {
+            connection
+                .execute_batch("DROP TRIGGER reject_parent_continuation_driver;")
+                .unwrap();
+        })
+        .await
+        .unwrap();
+        assert!(harness
+            .executor
+            .continue_after_child_terminal(child_run_id)
+            .await
+            .unwrap());
+        assert_eq!(harness.delivery_row().await.state, DeliveryState::Delivered);
+        assert!(
+            harness.sessions.actor(parent_session_id).is_none(),
+            "the successful retry retires the retained parent session"
         );
     }
 
