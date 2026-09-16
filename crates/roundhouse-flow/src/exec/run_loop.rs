@@ -94,9 +94,9 @@ use super::{
 use crate::caps::ResourceCaps;
 use crate::compose::draw_child_budget;
 use crate::durability::{
-    checkpoint_step, crash_policy, derive_disposition, recover_run, transition_run, CrashPolicy,
-    DurabilityError, RunState, StepDisposition, StepOutput, StepRunState, WorkflowRun,
-    WorkflowStepRun,
+    checkpoint_step, crash_policy, derive_disposition, recover_run, transition_run, ChildCallJoin,
+    CrashPolicy, DurabilityError, RunState, StepDisposition, StepOutput, StepRunState,
+    WorkflowChildCall, WorkflowRun, WorkflowStepRun,
 };
 use crate::hitl::{AwaitingHuman, HitlError};
 use crate::ledger::{
@@ -269,6 +269,7 @@ pub trait WorkflowHost: Checkpointer {
         child: &WorkflowRun,
         called: &CalledWorkflow,
         parent_step: &WorkflowStepRun,
+        parent_call: &WorkflowChildCall,
     ) -> Result<(), WorkflowHostError>;
 
     /// Drops the runtime edge [`Self::create_child_run`] registered, because
@@ -2000,16 +2001,29 @@ impl<H: WorkflowHost> Loop<'_, H> {
         let inputs_secret_derived = resolved_with.is_secret_derived();
         let dispatch_input = resolved_with.into_unredacted_for_dispatch();
         let parent_step = self.step_run(step, StepRunState::Running, None, None, None, None);
-        if let Err(e) =
-            self.host
-                .create_child_run(self.conn, self.session_id, &child, &called, &parent_step)
-        {
+        let task_id = TaskId::new();
+        let parent_call = WorkflowChildCall {
+            child_run_id,
+            parent_run_id: self.run_id,
+            parent_step_id: step.id.clone(),
+            parent_attempt: 1,
+            parent_item_index: None,
+            parent_task_id: task_id,
+            join: ChildCallJoin::Pending,
+        };
+        if let Err(e) = self.host.create_child_run(
+            self.conn,
+            self.session_id,
+            &child,
+            &called,
+            &parent_step,
+            &parent_call,
+        ) {
             return CallStep::Completed(StepOutcome::failed(
                 &step.id,
                 format!("`call:` could not be funded: {e}"),
             ));
         }
-        let task_id = TaskId::new();
         executor.sink.emit(
             task_id,
             None,
@@ -2463,6 +2477,7 @@ mod tests {
             _child: &WorkflowRun,
             _called: &CalledWorkflow,
             _parent_step: &WorkflowStepRun,
+            _parent_call: &WorkflowChildCall,
         ) -> Result<(), WorkflowHostError> {
             unreachable!("these tests run no `call:` step")
         }

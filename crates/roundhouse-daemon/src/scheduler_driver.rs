@@ -61,7 +61,10 @@ use roundhouse_core::{
 };
 use roundhouse_engine::workflow_dispatch::dispatch_tool_for_workflow;
 use roundhouse_flow::caps::ResourceCaps;
-use roundhouse_flow::durability::{insert_workflow_run, RunState, WorkflowRun};
+use roundhouse_flow::durability::{
+    insert_workflow_run, mark_workflow_child_call_joined_in_transaction, recover_run,
+    workflow_child_call_for_child_run, ChildCallJoin, RunState, WorkflowChildCall, WorkflowRun,
+};
 use roundhouse_flow::exec::run_loop::{
     PendingKind, PendingWork, Resume, RunOutcome, WorkDone, WorkStatus,
 };
@@ -721,7 +724,7 @@ const EVENT_SCHEMA_V: u16 = 1;
 /// [`Self::kind`] instead — the same split `CreateRealSessionError::kind`
 /// already established.
 #[derive(Debug, thiserror::Error)]
-enum DeliveryError {
+pub(crate) enum DeliveryError {
     #[error("the store connection pool refused a connection")]
     StoreConnection,
     #[error("a store operation failed on the pool's blocking thread")]
@@ -753,6 +756,12 @@ enum DeliveryError {
     LostClaim,
     #[error("a terminal child workflow could not be joined to its parent task")]
     ChildJoin,
+    #[error("the terminal child join could not recover its parent run")]
+    ChildParentRun,
+    #[error("the terminal child join could not recover its parent session")]
+    ChildParentSession,
+    #[error("the terminal child join could not resume its parent workflow")]
+    ChildParentResume,
 }
 
 impl DeliveryError {
@@ -772,6 +781,9 @@ impl DeliveryError {
             Self::SessionTimeout => "session_construction_timeout",
             Self::LostClaim => "lost_claim",
             Self::ChildJoin => "child_join",
+            Self::ChildParentRun => "child_parent_run",
+            Self::ChildParentSession => "child_parent_session",
+            Self::ChildParentResume => "child_parent_resume",
         }
     }
 }
@@ -2046,7 +2058,7 @@ impl DeliveryExecutor {
                 PendingKind::ChildRun {
                     child_run_id,
                     child_session_id,
-                    parent_task_id,
+                    parent_task_id: _,
                     dispatch_input,
                     inputs_secret_derived,
                     ..
@@ -2119,21 +2131,14 @@ impl DeliveryExecutor {
                         }
                     };
                     let joined = self
-                        .join_terminal_child(
-                            item.step_id,
-                            session_id,
-                            parent_task_id,
-                            child_session_id,
-                            child_run_id,
-                            state,
-                            self.now(),
-                        )
+                        .join_terminal_child(child_run_id, state, self.now())
                         .await;
                     child_session
                         .teardown(&self.sessions, &self.resources.proxy)
                         .await;
                     match joined {
-                        Ok(joined) => joined,
+                        Ok(Some((_, joined))) => joined,
+                        Ok(None) => return PendingExecution::ChildParked,
                         Err(_) => return park_child_after_failure(ChildDispatchFailure::Driver),
                     }
                 }
@@ -2143,21 +2148,24 @@ impl DeliveryExecutor {
     }
 
     /// Converts one terminal child run into the terminal event for the parent
-    /// `agent` task that created it. The child report is read through flow's
-    /// single report-loading API; this driver never reads report SQL directly.
+    /// `agent` task recorded by its durable call association. The association's
+    /// state and event append share one transaction, so a retry reuses the
+    /// original terminal sequence instead of appending another event.
     async fn join_terminal_child(
         &self,
-        step_id: String,
-        parent_session_id: SessionId,
-        parent_task_id: TaskId,
-        child_session_id: SessionId,
         child_run_id: RunId,
         state: RunState,
         now: Timestamp,
-    ) -> Result<WorkDone, DeliveryError> {
+    ) -> Result<Option<(WorkflowChildCall, WorkDone)>, DeliveryError> {
         if !state.is_terminal() {
-            return Err(DeliveryError::ChildJoin);
+            return Ok(None);
         }
+        let child_session_id = self
+            .with_connection(move |conn| {
+                recover_run(conn, child_run_id).map(|recovered| recovered.run.session_id)
+            })
+            .await?
+            .map_err(|_| DeliveryError::ChildJoin)?;
         let report = self
             .with_connection(move |conn| {
                 roundhouse_flow::runs::load_report(conn, child_session_id, child_run_id)
@@ -2175,14 +2183,24 @@ impl DeliveryExecutor {
             | RunState::AwaitingHuman => return Err(DeliveryError::ChildJoin),
         };
         let runner = self.resources.runner;
-        let (first_task_seq, last_task_seq) = self
+        let joined = self
             .with_connection(
-                move |conn| -> Result<(u64, u64), roundhouse_store::StoreError> {
+                move |conn| -> Result<Option<(WorkflowChildCall, u64, u64)>, roundhouse_store::StoreError> {
                     let txn = roundhouse_store::begin_immediate(conn)?;
+                    let Some(call) = workflow_child_call_for_child_run(&txn, child_run_id)
+                        .map_err(|error| roundhouse_store::StoreError::Interact(error.to_string()))?
+                    else {
+                        txn.commit()?;
+                        return Ok(None);
+                    };
+                    let parent_session_id = recover_run(&txn, call.parent_run_id)
+                        .map_err(|error| roundhouse_store::StoreError::Interact(error.to_string()))?
+                        .run
+                        .session_id;
                     let first_task_seq: i64 = txn.query_row(
                         "SELECT created_seq FROM tasks WHERE task_id = ?1 AND session_id = ?2",
                         rusqlite::params![
-                            parent_task_id.to_string(),
+                            call.parent_task_id.to_string(),
                             parent_session_id.to_string()
                         ],
                         |row| row.get(0),
@@ -2192,57 +2210,82 @@ impl DeliveryExecutor {
                             "a task projection held a negative creation sequence".into(),
                         )
                     })?;
-                    let event = match state {
-                        RunState::Completed => runner.record_task_completed(
-                            parent_session_id,
-                            0,
-                            now,
-                            parent_task_id,
-                            TaskOutput::Json(report_json),
-                            Usage::default(),
-                            EVENT_SCHEMA_V,
-                        ),
-                        RunState::Failed => runner.record_task_failed(
-                            parent_session_id,
-                            0,
-                            now,
-                            parent_task_id,
-                            TaskError {
-                                message: "the child workflow run ended in state `failed`".into(),
-                                category: "child_workflow_failed".into(),
-                            },
-                            false,
-                            EVENT_SCHEMA_V,
-                        ),
-                        RunState::Cancelled => runner.record_task_cancelled(
-                            parent_session_id,
-                            0,
-                            now,
-                            parent_task_id,
-                            Origin::System,
-                            CancelReason::User,
-                            EVENT_SCHEMA_V,
-                        ),
-                        RunState::Running
-                        | RunState::Paused
-                        | RunState::Cancelling
-                        | RunState::AwaitingHuman => {
-                            return Err(roundhouse_store::StoreError::Interact(
-                                "a nonterminal child entered terminal joining".into(),
-                            ))
+                    let last_task_seq = match call.join {
+                        ChildCallJoin::Joined {
+                            terminal_task_seq,
+                            ..
+                        } => terminal_task_seq,
+                        ChildCallJoin::Pending => {
+                            let event = match state {
+                                RunState::Completed => runner.record_task_completed(
+                                    parent_session_id,
+                                    0,
+                                    now,
+                                    call.parent_task_id,
+                                    TaskOutput::Json(report_json),
+                                    Usage::default(),
+                                    EVENT_SCHEMA_V,
+                                ),
+                                RunState::Failed => runner.record_task_failed(
+                                    parent_session_id,
+                                    0,
+                                    now,
+                                    call.parent_task_id,
+                                    TaskError {
+                                        message: "the child workflow run ended in state `failed`".into(),
+                                        category: "child_workflow_failed".into(),
+                                    },
+                                    false,
+                                    EVENT_SCHEMA_V,
+                                ),
+                                RunState::Cancelled => runner.record_task_cancelled(
+                                    parent_session_id,
+                                    0,
+                                    now,
+                                    call.parent_task_id,
+                                    Origin::System,
+                                    CancelReason::User,
+                                    EVENT_SCHEMA_V,
+                                ),
+                                RunState::Running
+                                | RunState::Paused
+                                | RunState::Cancelling
+                                | RunState::AwaitingHuman => {
+                                    return Err(roundhouse_store::StoreError::Interact(
+                                        "a nonterminal child entered terminal joining".into(),
+                                    ))
+                                }
+                            };
+                            let terminal_task_seq = roundhouse_store::append_event_in_transaction(
+                                &txn,
+                                &event,
+                                &roundhouse_store::redact::Redactor::build(&[]),
+                            )?;
+                            if !mark_workflow_child_call_joined_in_transaction(
+                                &txn,
+                                child_run_id,
+                                terminal_task_seq,
+                                now,
+                            )
+                            .map_err(|error| roundhouse_store::StoreError::Interact(error.to_string()))?
+                            {
+                                return Err(roundhouse_store::StoreError::Interact(
+                                    "child call join state changed while its transaction held the writer lock"
+                                        .into(),
+                                ));
+                            }
+                            terminal_task_seq
                         }
                     };
-                    let last_task_seq = roundhouse_store::append_event_in_transaction(
-                        &txn,
-                        &event,
-                        &roundhouse_store::redact::Redactor::build(&[]),
-                    )?;
                     txn.commit()?;
-                    Ok((first_task_seq, last_task_seq))
+                    Ok(Some((call, first_task_seq, last_task_seq)))
                 },
             )
             .await?
             .map_err(|_| DeliveryError::ChildJoin)?;
+        let Some((call, first_task_seq, last_task_seq)) = joined else {
+            return Ok(None);
+        };
 
         let status = match state {
             RunState::Completed => WorkStatus::Completed,
@@ -2257,15 +2300,149 @@ impl DeliveryExecutor {
             | RunState::Cancelling
             | RunState::AwaitingHuman => return Err(DeliveryError::ChildJoin),
         };
-        Ok(WorkDone {
-            step_id,
-            status,
-            output,
-            output_is_secret_derived: false,
-            task_id: Some(parent_task_id),
-            first_task_seq: Some(first_task_seq),
-            last_task_seq: Some(last_task_seq),
+        Ok(Some((
+            call.clone(),
+            WorkDone {
+                step_id: call.parent_step_id,
+                status,
+                output,
+                output_is_secret_derived: false,
+                task_id: Some(call.parent_task_id),
+                first_task_seq: Some(first_task_seq),
+                last_task_seq: Some(last_task_seq),
+            },
+        )))
+    }
+
+    /// #42 calls this after it has authenticated a gate answer and resumed the
+    /// actual child. It is safe to call after every such resume: a nonterminal
+    /// child stays outstanding, and a joined call reuses its one task terminal.
+    #[allow(
+        dead_code,
+        reason = "issue #42 owns the authenticated gate-answer path that invokes this continuation"
+    )]
+    pub(crate) async fn continue_after_child_terminal(
+        &self,
+        child_run_id: RunId,
+    ) -> Result<bool, DeliveryError> {
+        let mut child_run_id = child_run_id;
+        let mut continued = false;
+        loop {
+            let state = self
+                .with_connection(move |conn| {
+                    recover_run(conn, child_run_id).map(|run| run.run.state)
+                })
+                .await?
+                .map_err(|_| DeliveryError::ChildJoin)?;
+            let Some((call, done)) = self
+                .join_terminal_child(child_run_id, state, self.now())
+                .await?
+            else {
+                return Ok(continued);
+            };
+            let parent_state = self
+                .with_connection(move |conn| {
+                    recover_run(conn, call.parent_run_id).map(|run| run.run.state)
+                })
+                .await?
+                .map_err(|_| DeliveryError::ChildJoin)?;
+            if parent_state.is_terminal() {
+                child_run_id = call.parent_run_id;
+                continue;
+            }
+            continued = true;
+            let parent_run_id = call.parent_run_id;
+            match self.resume_parent_after_child_call(call, done).await? {
+                RunOutcome::Terminal { .. } => child_run_id = parent_run_id,
+                RunOutcome::Parked(_) | RunOutcome::AwaitingWork { .. } => return Ok(continued),
+            }
+        }
+    }
+
+    #[allow(
+        dead_code,
+        reason = "called by the issue #42 continuation once its public entry point is wired"
+    )]
+    async fn resume_parent_after_child_call(
+        &self,
+        call: WorkflowChildCall,
+        done: WorkDone,
+    ) -> Result<RunOutcome, DeliveryError> {
+        let parent_run = self
+            .with_connection(move |conn| recover_run(conn, call.parent_run_id).map(|run| run.run))
+            .await?
+            .map_err(|_| DeliveryError::ChildParentRun)?;
+        let child_session_id = self
+            .with_connection(move |conn| {
+                recover_run(conn, call.child_run_id).map(|run| run.run.session_id)
+            })
+            .await?
+            .map_err(|_| DeliveryError::ChildParentRun)?;
+        let parent_spec = self
+            .with_connection(move |conn| {
+                let mut statement = conn
+                    .prepare("SELECT payload FROM events WHERE session_id = ?1 ORDER BY seq ASC")?;
+                let payloads = statement.query_map([child_session_id.to_string()], |row| {
+                    row.get::<_, String>(0)
+                })?;
+                let spec = payloads
+                    .filter_map(Result::ok)
+                    .find_map(|payload| match serde_json::from_str(&payload).ok()? {
+                        EventPayload::SessionCreated { spec } => Some(*spec),
+                        _ => None,
+                    })
+                    .ok_or(rusqlite::Error::QueryReturnedNoRows)?;
+                Ok::<_, rusqlite::Error>(spec)
+            })
+            .await?
+            .map_err(|_| DeliveryError::ChildParentSession)?;
+        let registry = self
+            .resources
+            .workspace_registry
+            .as_ref()
+            .ok_or(DeliveryError::NoWorkspaceRegistry)?;
+        let workspace = registry
+            .resolve_by_id(parent_spec.workspace)
+            .map_err(|error| DeliveryError::Workspace(error.to_string()))?;
+        let root = workspace.root.clone();
+        let runner = self.resources.runner;
+        let tree = Arc::clone(&self.spawn_tree);
+        let now = self.now();
+        self.with_connection(move |conn| {
+            let mut sink = BufferedTaskSink::default();
+            let mut host = SqliteWorkflowHost::with_session_tree(
+                root.clone(),
+                Box::new(WorkflowSessionTree::new(tree, runner, parent_spec.clone())),
+            );
+            let run_ctx = RunContext {
+                inputs: serde_json::Value::Null,
+                inputs_secret_derived: false,
+                vars: serde_json::Value::Null,
+                secrets: HashMap::new(),
+                run_id: parent_run.id,
+                previous_report: None,
+                env_allowlist: EnvAllowlist::deny_all(),
+                worktree_provider: Some(Arc::new(SandboxWorktreeProvider::new(root))),
+            };
+            let outcome = run_workflow_from_definition(
+                conn,
+                &host.resolve_run_definition(conn, parent_run.id)?,
+                parent_run.id,
+                &mut sink,
+                &mut host,
+                run_ctx,
+                now,
+                Some(Resume::Work(vec![done])),
+            );
+            flush_task_events(conn, runner, parent_run.session_id, now, sink).map_err(|error| {
+                roundhouse_flow::exec::run_loop::RunLoopError::from(
+                    roundhouse_flow::exec::run_loop::WorkflowHostError::from(error),
+                )
+            })?;
+            outcome
         })
+        .await?
+        .map_err(|_| DeliveryError::ChildParentResume)
     }
 }
 
@@ -4721,6 +4898,66 @@ mod delivery_tests {
         }
     }
 
+    async fn answer_child_gate_after_restart(
+        harness: &Harness,
+        child_run_id: RunId,
+        child_session_id: SessionId,
+        parent_session_id: SessionId,
+    ) {
+        let root = harness.workspace_root.clone();
+        let tree = Arc::clone(&harness.resources.spawn_tree);
+        let runner = harness.resources.runner;
+        let workspace = harness.stored.workspace;
+        let conn = harness.store.pool.get().await.unwrap();
+        conn.interact(move |connection| {
+            let mut sink = BufferedTaskSink::default();
+            let mut host = SqliteWorkflowHost::with_session_tree(
+                root,
+                Box::new(WorkflowSessionTree::new(
+                    tree,
+                    runner,
+                    SessionSpec {
+                        workspace,
+                        name: None,
+                        requested_tier: Tier::Sandbox,
+                        on_degrade: OnDegrade::Refuse,
+                        parent: Some(parent_session_id),
+                    },
+                )),
+            );
+            let outcome = roundhouse_flow::production::run_workflow_from_storage(
+                connection,
+                child_run_id,
+                &mut sink,
+                &mut host,
+                test_run_context(child_run_id),
+                Timestamp::from_unix_nanos(1_700_000_000_000_000_001),
+                Some(Resume::Gate(roundhouse_flow::exec::run_loop::GateAnswer {
+                    step_id: "approve".into(),
+                    output: serde_json::json!({ "approved": true }),
+                })),
+            )
+            .unwrap();
+            assert!(matches!(
+                outcome,
+                RunOutcome::Terminal {
+                    state: RunState::Completed,
+                    ..
+                }
+            ));
+            flush_task_events(
+                connection,
+                runner,
+                child_session_id,
+                Timestamp::from_unix_nanos(1_700_000_000_000_000_001),
+                sink,
+            )
+            .unwrap();
+        })
+        .await
+        .unwrap();
+    }
+
     fn captured_logs() -> (CapturingWriter, tracing::Dispatch) {
         let captured = CapturingWriter::default();
         let subscriber = tracing_subscriber::fmt()
@@ -5594,6 +5831,234 @@ mod delivery_tests {
         assert!(
             harness.sessions.actor(child_session_id).is_some(),
             "the parked child session must remain live for a later gate answer"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_parked_child_keeps_its_parent_call_running_after_restart() {
+        let harness = harness(parent_calling_child_gate_workflow()).await;
+        let child_source = harness.workspace_root.join("child.yaml");
+        std::fs::write(&child_source, child_parking_workflow()).unwrap();
+        let root = harness.workspace_root.clone();
+        let conn = harness.store.pool.get().await.unwrap();
+        conn.interact(move |connection| {
+            register_workflow_file(connection, &root, &child_source, template()).unwrap();
+        })
+        .await
+        .unwrap();
+
+        harness
+            .executor
+            .claim_and_run(harness.delivery.clone(), harness.stored.clone())
+            .await;
+
+        let parent_run_id = RunId::from_uuid(
+            Uuid::parse_str(
+                harness
+                    .delivery_row()
+                    .await
+                    .run_id
+                    .as_deref()
+                    .expect("reserve stamps a run id"),
+            )
+            .unwrap(),
+        );
+        let conn = harness.store.pool.get().await.unwrap();
+        let (child_run_id, _child_session_id) = conn
+            .interact(move |connection| {
+                let (child_run_id, child_session_id): (String, String) = connection
+                    .query_row(
+                        "SELECT id, session_id FROM workflow_run WHERE parent_run_id = ?1",
+                        [parent_run_id.to_string()],
+                        |row| Ok((row.get(0)?, row.get(1)?)),
+                    )
+                    .unwrap();
+                (
+                    RunId::from_uuid(Uuid::parse_str(&child_run_id).unwrap()),
+                    SessionId::from_uuid(Uuid::parse_str(&child_session_id).unwrap()),
+                )
+            })
+            .await
+            .unwrap();
+
+        let (fresh, _registry, _sessions) = harness.fresh_executor_after_restart();
+        assert!(
+            !fresh
+                .continue_after_child_terminal(child_run_id)
+                .await
+                .unwrap(),
+            "a parked child is still outstanding, not a parent result"
+        );
+
+        let conn = harness.store.pool.get().await.unwrap();
+        let (parent_state, child_drawn_at, parent_task_terminals) = conn
+            .interact(move |connection| {
+                let parent_state = recover_run(connection, parent_run_id).unwrap().run.state;
+                let child_drawn_at = roundhouse_flow::ledger::run_ledger(connection, child_run_id)
+                    .unwrap()
+                    .drawn_at;
+                let parent_task_terminals: i64 = connection
+                    .query_row(
+                        "SELECT COUNT(*) FROM events
+                          WHERE session_id = (SELECT session_id FROM workflow_run WHERE id = ?1)
+                            AND task_id IN (
+                                SELECT parent_task_id FROM workflow_child_call WHERE child_run_id = ?2
+                            )
+                            AND (payload LIKE '%TaskCompleted%' OR payload LIKE '%TaskFailed%' OR payload LIKE '%TaskCancelled%')",
+                        rusqlite::params![parent_run_id.to_string(), child_run_id.to_string()],
+                        |row| row.get(0),
+                    )
+                    .unwrap();
+                (parent_state, child_drawn_at, parent_task_terminals)
+            })
+            .await
+            .unwrap();
+        assert_eq!(parent_state, RunState::Running);
+        assert!(child_drawn_at.is_some(), "the child grant remains drawn");
+        assert_eq!(
+            parent_task_terminals, 0,
+            "the parent task remains unfinished"
+        );
+        assert_eq!(
+            harness.resources.spawn_tree.direct_children(
+                harness
+                    .delivery_row()
+                    .await
+                    .session_id
+                    .expect("reserve stamps a parent session id"),
+            ),
+            1,
+            "the live child keeps its spawn-tree edge"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_terminal_child_wakes_its_parent_once() {
+        let harness = harness(parent_calling_child_gate_workflow()).await;
+        let child_source = harness.workspace_root.join("child.yaml");
+        std::fs::write(&child_source, child_parking_workflow()).unwrap();
+        let root = harness.workspace_root.clone();
+        let conn = harness.store.pool.get().await.unwrap();
+        conn.interact(move |connection| {
+            register_workflow_file(connection, &root, &child_source, template()).unwrap();
+        })
+        .await
+        .unwrap();
+
+        harness
+            .executor
+            .claim_and_run(harness.delivery.clone(), harness.stored.clone())
+            .await;
+
+        let parent = harness.delivery_row().await;
+        let parent_run_id = RunId::from_uuid(
+            Uuid::parse_str(parent.run_id.as_deref().expect("reserve stamps a run id")).unwrap(),
+        );
+        let parent_session_id = parent
+            .session_id
+            .expect("reserve stamps a parent session id");
+        let conn = harness.store.pool.get().await.unwrap();
+        let (child_run_id, child_session_id) = conn
+            .interact(move |connection| {
+                let (child_run_id, child_session_id): (String, String) = connection
+                    .query_row(
+                        "SELECT id, session_id FROM workflow_run WHERE parent_run_id = ?1",
+                        [parent_run_id.to_string()],
+                        |row| Ok((row.get(0)?, row.get(1)?)),
+                    )
+                    .unwrap();
+                (
+                    RunId::from_uuid(Uuid::parse_str(&child_run_id).unwrap()),
+                    SessionId::from_uuid(Uuid::parse_str(&child_session_id).unwrap()),
+                )
+            })
+            .await
+            .unwrap();
+
+        answer_child_gate_after_restart(
+            &harness,
+            child_run_id,
+            child_session_id,
+            parent_session_id,
+        )
+        .await;
+
+        let conn = harness.store.pool.get().await.unwrap();
+        let (child_report, child_call) = conn
+            .interact(move |connection| {
+                (
+                    roundhouse_flow::runs::load_report(connection, child_session_id, child_run_id)
+                        .unwrap(),
+                    workflow_child_call_for_child_run(connection, child_run_id).unwrap(),
+                )
+            })
+            .await
+            .unwrap();
+        assert!(
+            child_report.is_some(),
+            "the resumed child has its durable report"
+        );
+        assert!(
+            child_call.is_some(),
+            "the call hand-off is durable before restart"
+        );
+
+        let (fresh, _registry, _sessions) = harness.fresh_executor_after_restart();
+        assert!(fresh
+            .continue_after_child_terminal(child_run_id)
+            .await
+            .unwrap());
+        assert!(
+            !fresh
+                .continue_after_child_terminal(child_run_id)
+                .await
+                .unwrap(),
+            "a duplicate continuation must not append a second parent terminal"
+        );
+
+        let conn = harness.store.pool.get().await.unwrap();
+        let (parent_state, child_count, parent_task_terminals, child_refunds) = conn
+            .interact(move |connection| {
+                let parent_state = recover_run(connection, parent_run_id).unwrap().run.state;
+                let child_count: i64 = connection
+                    .query_row(
+                        "SELECT COUNT(*) FROM workflow_run WHERE parent_run_id = ?1",
+                        [parent_run_id.to_string()],
+                        |row| row.get(0),
+                    )
+                    .unwrap();
+                let parent_task_terminals: i64 = connection
+                    .query_row(
+                        "SELECT COUNT(*) FROM events
+                          WHERE session_id = ?1
+                            AND task_id IN (
+                                SELECT parent_task_id FROM workflow_child_call WHERE child_run_id = ?2
+                            )
+                            AND (payload LIKE '%TaskCompleted%' OR payload LIKE '%TaskFailed%' OR payload LIKE '%TaskCancelled%')",
+                        rusqlite::params![parent_session_id.to_string(), child_run_id.to_string()],
+                        |row| row.get(0),
+                    )
+                    .unwrap();
+                let child_refunds: i64 = connection
+                    .query_row(
+                        "SELECT COUNT(*) FROM workflow_run WHERE id = ?1 AND refunded_at IS NOT NULL",
+                        [child_run_id.to_string()],
+                        |row| row.get(0),
+                    )
+                    .unwrap();
+                (parent_state, child_count, parent_task_terminals, child_refunds)
+            })
+            .await
+            .unwrap();
+        assert_eq!(parent_state, RunState::Completed);
+        assert_eq!(
+            child_count, 1,
+            "waking a parent never creates another child run"
+        );
+        assert_eq!(parent_task_terminals, 1);
+        assert_eq!(
+            child_refunds, 1,
+            "finish_run retains ownership of one refund"
         );
     }
 

@@ -7,11 +7,14 @@
 //! neither a `.take(1)`-shaped truncation nor a `.skip(1)`-shaped one is
 //! invisible to the suite.
 
-use roundhouse_core::{JobId, SessionId, Timestamp};
+use roundhouse_core::{JobId, SessionId, TaskId, Timestamp};
 use roundhouse_flow::caps::{is_usable_cost_usd, ResourceCaps};
 use roundhouse_flow::compose::{MAX_CALL_DEPTH, MAX_DIRECT_CHILD_CALLS};
 use roundhouse_flow::durability::{
-    insert_workflow_run, open_test_db, transition_run, DurabilityError, RunState, WorkflowRun,
+    insert_workflow_child_call_in_transaction, insert_workflow_run,
+    mark_workflow_child_call_joined_in_transaction, open_test_db, transition_run,
+    workflow_child_call_for_child_run, ChildCallJoin, DurabilityError, RunState, WorkflowChildCall,
+    WorkflowRun,
 };
 use roundhouse_flow::exec::map_step::MapBudget;
 use roundhouse_flow::exec::RunId;
@@ -78,6 +81,58 @@ fn seed(conn: &mut Connection, run: &WorkflowRun) -> RunId {
 
 fn a_seeded_run(conn: &mut Connection) -> RunId {
     seed(conn, &a_run(RunId::new(), Some(0), Some(a_grant())))
+}
+
+#[test]
+fn child_call_identity_round_trips_and_joins_once() {
+    let mut conn = open_test_db();
+    let parent_run_id = a_seeded_run(&mut conn);
+    let child_run_id = a_seeded_run(&mut conn);
+    let call = WorkflowChildCall {
+        child_run_id,
+        parent_run_id,
+        parent_step_id: "delegate".into(),
+        parent_attempt: 2,
+        parent_item_index: Some(7),
+        parent_task_id: TaskId::new(),
+        join: ChildCallJoin::Pending,
+    };
+
+    let txn = roundhouse_store::begin_immediate(&mut conn).unwrap();
+    insert_workflow_child_call_in_transaction(&txn, &call).unwrap();
+    txn.commit().unwrap();
+
+    assert_eq!(
+        workflow_child_call_for_child_run(&conn, child_run_id).unwrap(),
+        Some(call.clone()),
+        "the durable association retains only the call identity while the child is parked"
+    );
+
+    let joined_at = at_secs(42);
+    let txn = roundhouse_store::begin_immediate(&mut conn).unwrap();
+    assert!(
+        mark_workflow_child_call_joined_in_transaction(&txn, child_run_id, 19, joined_at).unwrap()
+    );
+    txn.commit().unwrap();
+
+    let txn = roundhouse_store::begin_immediate(&mut conn).unwrap();
+    assert!(
+        !mark_workflow_child_call_joined_in_transaction(&txn, child_run_id, 20, at_secs(43))
+            .unwrap(),
+        "a duplicate continuation cannot replace the terminal event it did not append"
+    );
+    txn.commit().unwrap();
+
+    assert_eq!(
+        workflow_child_call_for_child_run(&conn, child_run_id).unwrap(),
+        Some(WorkflowChildCall {
+            join: ChildCallJoin::Joined {
+                terminal_task_seq: 19,
+                joined_at,
+            },
+            ..call
+        })
+    );
 }
 
 fn a_spend_of(tokens: u64, cost_usd: f64) -> Spend {

@@ -748,6 +748,35 @@ ALTER TABLE trigger_event ADD COLUMN outcome TEXT CHECK (outcome IS NULL OR outc
 ));
 "#;
 
+/// Phase 8, Task 4: the durable identity of one outstanding `call:`
+/// invocation. `workflow_run.parent_run_id` says only that a run has a parent;
+/// it cannot distinguish a retry fork or identify the parent task that must be
+/// terminalized. This row is written with child creation and the parent step's
+/// `Running` checkpoint, then its `join_state` is advanced in the same
+/// transaction as the parent task terminal event.
+const MIGRATION_0014_WORKFLOW_CHILD_CALLS: &str = r#"
+CREATE TABLE workflow_child_call (
+    child_run_id      TEXT NOT NULL PRIMARY KEY,
+    parent_run_id     TEXT NOT NULL,
+    parent_step_id    TEXT NOT NULL,
+    parent_attempt    INTEGER NOT NULL CHECK (parent_attempt > 0),
+    parent_item_index INTEGER NOT NULL CHECK (parent_item_index BETWEEN -1 AND 4294967295),
+    parent_task_id    TEXT NOT NULL UNIQUE,
+    join_state        TEXT NOT NULL CHECK (join_state IN ('pending', 'joined')),
+    terminal_task_seq INTEGER CHECK (terminal_task_seq IS NULL OR terminal_task_seq >= 0),
+    joined_at         INTEGER,
+    CHECK (
+        (join_state = 'pending' AND terminal_task_seq IS NULL AND joined_at IS NULL)
+        OR (join_state = 'joined' AND terminal_task_seq IS NOT NULL AND joined_at IS NOT NULL)
+    ),
+    UNIQUE (parent_run_id, parent_step_id, parent_attempt, parent_item_index)
+) STRICT;
+
+CREATE INDEX workflow_child_call_parent_idx
+    ON workflow_child_call (parent_run_id)
+    WHERE join_state = 'pending';
+"#;
+
 pub fn migrations() -> Migrations<'static> {
     Migrations::new(vec![
         M::up(MIGRATION_0001_INITIAL_SCHEMA),
@@ -763,5 +792,6 @@ pub fn migrations() -> Migrations<'static> {
         M::up("ALTER TABLE workflow_run ADD COLUMN checkpoint_ref TEXT;"),
         M::up("ALTER TABLE workflow_run ADD COLUMN checkpoint_blob_ref TEXT;"),
         M::up(MIGRATION_0013_TRIGGER_BINDINGS_AND_DELIVERIES),
+        M::up(MIGRATION_0014_WORKFLOW_CHILD_CALLS),
     ])
 }

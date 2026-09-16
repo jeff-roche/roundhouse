@@ -222,6 +222,7 @@ impl WorkflowHost for FakeHost {
         child: &WorkflowRun,
         called: &CalledWorkflow,
         parent_step: &roundhouse_flow::durability::WorkflowStepRun,
+        parent_call: &roundhouse_flow::durability::WorkflowChildCall,
     ) -> Result<(), WorkflowHostError> {
         let txn = roundhouse_store::begin_immediate(conn)?;
         if let Err(error) =
@@ -233,6 +234,13 @@ impl WorkflowHost for FakeHost {
         if let Err(error) =
             roundhouse_flow::durability::checkpoint_step_in_transaction(&txn, parent_step)
         {
+            self.release_child_session(_parent, called);
+            return Err(error.into());
+        }
+        if let Err(error) = roundhouse_flow::durability::insert_workflow_child_call_in_transaction(
+            &txn,
+            parent_call,
+        ) {
             self.release_child_session(_parent, called);
             return Err(error.into());
         }
