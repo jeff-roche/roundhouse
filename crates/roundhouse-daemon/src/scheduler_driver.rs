@@ -63,7 +63,7 @@ use roundhouse_engine::workflow_dispatch::dispatch_tool_for_workflow;
 use roundhouse_flow::caps::ResourceCaps;
 use roundhouse_flow::durability::{
     claim_workflow_child_continuation_in_transaction,
-    complete_workflow_child_continuation_in_transaction, insert_workflow_run,
+    complete_workflow_child_continuation_in_transaction,
     mark_workflow_child_call_joined_in_transaction, recover_run,
     release_workflow_child_continuation_in_transaction, workflow_child_call_for_child_run,
     ChildCallJoin, ChildContinuationClaim, RunState, WorkflowChildCall, WorkflowRun,
@@ -717,7 +717,6 @@ const DELIVERY_LEASE: std::time::Duration = std::time::Duration::from_secs(300);
 /// `workflow_host::WorkflowSessionTree::persist_child_session`, the other
 /// daemon-side minter of workflow-related events.
 const EVENT_SCHEMA_V: u16 = 1;
-const CHILD_CONTINUATION_LEASE_NANOS: i64 = 30_000_000_000;
 
 /// Why one delivery could not be carried through to a completed run.
 ///
@@ -1600,6 +1599,23 @@ impl DeliveryExecutor {
             .map_err(DeliveryError::JobUnresolvable)?
             .ok_or(DeliveryError::JobNotRegistered)?;
         let version = resolved.job.latest();
+        let spec = SessionSpec {
+            workspace: stored.workspace,
+            name: Some(workspace.name.clone()),
+            // Ruling W1-R95's reasoning, applied to an *unattended* session:
+            // `Tier::Sandbox` is the same tier the socket path requests, but
+            // `OnDegrade::Refuse` is used unconditionally rather than
+            // `resources.default_on_degrade`. The operator's
+            // `--allow-degraded-to` flag is a human decision made for
+            // sessions a human is present for; a scheduled run has nobody
+            // watching it degrade, and §6.5 requires a downgrade be an
+            // explicit human decision at creation. Refusing to run
+            // unattended work unsandboxed is the conservative reading, and
+            // the one this driver takes.
+            requested_tier: Tier::Sandbox,
+            on_degrade: OnDegrade::Refuse,
+            parent: None,
+        };
 
         // The row's existence IS the reservation: `run_workflow` fails
         // `RunNotFound` without it, and flow has no separate reserve API.
@@ -1630,33 +1646,12 @@ impl DeliveryExecutor {
             session_depth: Some(0),
             caps: Some(ResourceCaps::default()),
         };
-        self.with_connection(move |conn| {
-            insert_workflow_run(conn, &run).map_err(|error| error.to_string())
-        })
-        .await?
-        .map_err(DeliveryError::RunRow)?;
-
-        let spec = SessionSpec {
-            workspace: stored.workspace,
-            name: Some(workspace.name.clone()),
-            // Ruling W1-R95's reasoning, applied to an *unattended* session:
-            // `Tier::Sandbox` is the same tier the socket path requests, but
-            // `OnDegrade::Refuse` is used unconditionally rather than
-            // `resources.default_on_degrade`. The operator's
-            // `--allow-degraded-to` flag is a human decision made for
-            // sessions a human is present for; a scheduled run has nobody
-            // watching it degrade, and §6.5 requires a downgrade be an
-            // explicit human decision at creation. Refusing to run
-            // unattended work unsandboxed is the conservative reading, and
-            // the one this driver takes.
-            requested_tier: Tier::Sandbox,
-            on_degrade: OnDegrade::Refuse,
-            parent: None,
-        };
         let session_spec = spec.clone();
         let runner = self.resources.runner;
         self.with_connection(move |conn| {
             let txn = roundhouse_store::begin_immediate(conn)?;
+            roundhouse_flow::durability::insert_workflow_run_in_transaction(&txn, &run)
+                .map_err(|error| roundhouse_store::StoreError::Interact(error.to_string()))?;
             let event = runner.record_session_created(
                 session_id,
                 0,
@@ -1673,7 +1668,7 @@ impl DeliveryExecutor {
             Ok::<_, roundhouse_store::StoreError>(())
         })
         .await?
-        .map_err(|_| DeliveryError::Session("record"))?;
+        .map_err(|error| DeliveryError::RunRow(error.to_string()))?;
         // Fix round 3: `create_headless_session` bounds its OWN construction
         // now (against the identical wedged-MCP-server / hung-isolation-probe
         // risk an unattended, repeating caller cannot afford to park a
@@ -2381,20 +2376,14 @@ impl DeliveryExecutor {
                 return Ok(continued);
             }
             let now = self.now();
-            let lease_expires_at = Timestamp::from_unix_nanos(
-                now.as_unix_nanos()
-                    .saturating_add(CHILD_CONTINUATION_LEASE_NANOS),
-            );
             let claimed = self
                 .with_connection(move |conn| {
                     let txn = roundhouse_store::begin_immediate(conn)?;
-                    let claim = claim_workflow_child_continuation_in_transaction(
-                        &txn,
-                        child_run_id,
-                        now,
-                        lease_expires_at,
-                    )
-                    .map_err(|error| roundhouse_store::StoreError::Interact(error.to_string()))?;
+                    let claim =
+                        claim_workflow_child_continuation_in_transaction(&txn, child_run_id)
+                            .map_err(|error| {
+                                roundhouse_store::StoreError::Interact(error.to_string())
+                            })?;
                     txn.commit()?;
                     Ok::<_, roundhouse_store::StoreError>(claim)
                 })
@@ -4388,6 +4377,25 @@ mod delivery_tests {
         DateTime::from_timestamp_nanos(1_700_000_000_000_000_000)
     }
 
+    #[derive(Clone)]
+    struct TestClock(Arc<Mutex<DateTime<Utc>>>);
+
+    impl TestClock {
+        fn new(now: DateTime<Utc>) -> Self {
+            Self(Arc::new(Mutex::new(now)))
+        }
+
+        fn set(&self, now: DateTime<Utc>) {
+            *self.0.lock().unwrap() = now;
+        }
+    }
+
+    impl ClockSource for TestClock {
+        fn wall_now(&self) -> DateTime<Utc> {
+            *self.0.lock().unwrap()
+        }
+    }
+
     fn template() -> SessionTemplate {
         SessionTemplate {
             provider: "test".into(),
@@ -4838,7 +4846,7 @@ mod delivery_tests {
                     session_depth: Some(0),
                     caps: Some(ResourceCaps::default()),
                 };
-                insert_workflow_run(connection, &run).unwrap();
+                roundhouse_flow::durability::insert_workflow_run(connection, &run).unwrap();
                 assert!(mark_delivery_running(
                     connection,
                     &delivery_id,
@@ -6312,7 +6320,41 @@ mod delivery_tests {
     }
 
     #[tokio::test]
-    async fn concurrent_child_continuations_drive_the_following_effect_once() {
+    async fn root_run_creation_rolls_back_when_its_session_lifecycle_is_rejected() {
+        let harness = harness(completing_workflow()).await;
+        let conn = harness.store.pool.get().await.unwrap();
+        conn.interact(move |connection| {
+            connection
+                .execute_batch(
+                    "CREATE TRIGGER reject_root_session_created
+                     BEFORE INSERT ON events
+                     WHEN NEW.payload LIKE '%SessionCreated%'
+                     BEGIN SELECT RAISE(ABORT, 'session creation refused'); END;",
+                )
+                .unwrap();
+        })
+        .await
+        .unwrap();
+
+        harness
+            .executor
+            .claim_and_run(harness.delivery.clone(), harness.stored.clone())
+            .await;
+
+        let conn = harness.store.pool.get().await.unwrap();
+        let root_runs: i64 = conn
+            .interact(move |connection| {
+                connection
+                    .query_row("SELECT COUNT(*) FROM workflow_run", [], |row| row.get(0))
+                    .unwrap()
+            })
+            .await
+            .unwrap();
+        assert_eq!(root_runs, 0);
+    }
+
+    #[tokio::test]
+    async fn a_long_held_continuation_claim_cannot_be_stolen() {
         let harness = harness_with_overlap_and_rules(
             parent_calling_child_gate_then_read_workflow(),
             OverlapPolicy::Skip,
@@ -6404,6 +6446,8 @@ mod delivery_tests {
         assert_eq!(child_spec.parent, Some(parent_session_id));
         let (mut fresh, _registry, _sessions) =
             harness.restart_executor_with_reconciled_resources().await;
+        let clock = Arc::new(TestClock::new(instant()));
+        fresh.clock = clock.clone();
         answer_child_gate_after_restart(
             &fresh,
             &harness,
@@ -6433,11 +6477,26 @@ mod delivery_tests {
             "the first continuation reaches its following effect"
         );
 
-        assert!(
-            !fresh
+        clock.set(instant() + chrono::Duration::seconds(31));
+        let second_executor = fresh.clone();
+        let second = tokio::spawn(async move {
+            second_executor
                 .continue_after_child_terminal(child_run_id)
                 .await
-                .unwrap(),
+        });
+        for _ in 0..100_000 {
+            if gate.entrants() > 1 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            gate.entrants(),
+            1,
+            "an in-process continuation remains exclusive after a long drive"
+        );
+        assert!(
+            !second.await.unwrap().unwrap(),
             "a concurrent continuation must not resume the same parent"
         );
         gate.release(1);
@@ -6463,7 +6522,7 @@ mod delivery_tests {
     }
 
     #[tokio::test]
-    async fn an_expired_continuation_claim_retries_after_a_crash_between_join_and_resume() {
+    async fn an_incomplete_continuation_claim_retries_only_after_boot_reconciliation() {
         let harness = harness_with_overlap_and_rules(
             parent_calling_child_gate_then_read_workflow(),
             OverlapPolicy::Skip,
@@ -6547,18 +6606,8 @@ mod delivery_tests {
         stalled.abort();
         assert!(stalled.await.is_err());
 
-        let conn = harness.store.pool.get().await.unwrap();
-        conn.interact(move |connection| {
-            connection
-                .execute(
-                    "UPDATE workflow_child_call SET continuation_lease_expires_at = 0 WHERE child_run_id = ?1",
-                    [child_run_id.to_string()],
-                )
-                .unwrap();
-        })
-        .await
-        .unwrap();
-        fresh.continuation_gap_gate = None;
+        let (fresh, _registry, _sessions) =
+            harness.restart_executor_with_reconciled_resources().await;
         assert!(fresh
             .continue_after_child_terminal(child_run_id)
             .await

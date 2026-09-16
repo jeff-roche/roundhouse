@@ -106,3 +106,42 @@ TDD evidence:
   scheduler_driver::delivery_tests::concurrent_child_continuations_drive_the_following_effect_once
   -- --exact` passes after persisting the root event and loading the parent
   session's event stream.
+
+## Fix Round 2 Ruling And TDD Evidence
+
+An active continuation claim is now non-expiring. `claimed` rows can become
+`available` only when the claim holder returns an ordinary error, or during
+`boot::reconcile_spawn_tree_at_boot`; boot is the only point at which an old
+holder is known unable to execute parent effects. Migration 0016 removes the
+lease-expiry column. Claim tokens still fence release and completion, and a
+completed continuation remains permanently ineligible.
+
+Root `workflow_run` insertion and its root `SessionCreated` event are now one
+transaction in `DeliveryExecutor::run_claimed_delivery`. A rejected lifecycle
+write therefore leaves no durable run that continuation could not reconstruct.
+
+RED, before the Round 2 implementation:
+
+- `a_long_held_continuation_claim_cannot_be_stolen` advanced its test clock by
+  31 seconds while the first continuation was blocked. A second continuation
+  reached the same parent-effect gate (`left: 2`, `right: 1`), proving the old
+  lease could steal live execution.
+- `root_run_creation_rolls_back_when_its_session_lifecycle_is_rejected` failed
+  with `left: 1`, `right: 0`: the standalone root-run commit survived a trigger
+  rejecting `SessionCreated`.
+- `an_incomplete_continuation_claim_retries_only_after_boot_reconciliation`
+  failed after it aborted the claimant, rebuilt resources, and invoked real
+  boot reconciliation: the old claim remained unavailable because boot did not
+  reclaim it.
+
+GREEN after the Round 2 implementation:
+
+- `cargo test -p roundhouse-daemon --lib
+  scheduler_driver::delivery_tests::a_long_held_continuation_claim_cannot_be_stolen
+  -- --exact`
+- `cargo test -p roundhouse-daemon --lib
+  scheduler_driver::delivery_tests::root_run_creation_rolls_back_when_its_session_lifecycle_is_rejected
+  -- --exact`
+- `cargo test -p roundhouse-daemon --lib
+  scheduler_driver::delivery_tests::an_incomplete_continuation_claim_retries_only_after_boot_reconciliation
+  -- --exact`

@@ -123,7 +123,10 @@ pub enum SpawnTreeRecoveryError {
 ///
 /// Separate from [`run_boot_sequence`] rather than folded into it: that pass
 /// belongs to the task log and needs an [`EventWriter`] to append its
-/// reclassifications, while this one is read-only and writes only to memory.
+/// reclassifications, while this pass also returns incomplete child
+/// continuations to `available` before reconstructing in-memory state. An old
+/// process cannot execute after this point, so boot is the only safe place to
+/// reclaim an unfinished continuation.
 ///
 /// **A single unreadable lifecycle row is skipped, loudly, rather than
 /// refusing the boot.** [`reconcile_spawn_tree`] logs a `tracing::error!` for
@@ -155,6 +158,15 @@ pub async fn reconcile_spawn_tree_at_boot(
     // `StoreError::Pool` for the checkout and `StoreError::Interact` only for
     // the blocking closure, per that enum's own documented convention.
     let conn = store.pool.get().await.map_err(StoreError::Pool)?;
+    conn.interact(|conn| {
+        let txn = roundhouse_store::begin_immediate(conn)?;
+        roundhouse_flow::durability::release_incomplete_workflow_child_continuations_at_boot_in_transaction(&txn)
+            .map_err(|error| StoreError::Interact(error.to_string()))?;
+        txn.commit()?;
+        Ok::<_, StoreError>(())
+    })
+    .await
+    .map_err(|error| StoreError::Interact(error.to_string()))??;
     Ok(conn
         .interact(move |conn| reconcile_spawn_tree(conn, &tree))
         .await

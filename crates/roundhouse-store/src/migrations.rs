@@ -789,6 +789,13 @@ ALTER TABLE workflow_child_call ADD COLUMN continuation_lease_expires_at INTEGER
 ALTER TABLE workflow_child_call ADD COLUMN continuation_completed_at INTEGER;
 "#;
 
+/// Phase 8, Task 4 fix round 2: an in-process continuation claim must never
+/// expire while its owner can still drive parent effects. Only boot may recover
+/// an incomplete claim, after the former process is known to be gone.
+const MIGRATION_0016_WORKFLOW_CHILD_CALL_NON_EXPIRING_CLAIMS: &str = r#"
+ALTER TABLE workflow_child_call DROP COLUMN continuation_lease_expires_at;
+"#;
+
 pub fn migrations() -> Migrations<'static> {
     Migrations::new(vec![
         M::up(MIGRATION_0001_INITIAL_SCHEMA),
@@ -806,5 +813,6 @@ pub fn migrations() -> Migrations<'static> {
         M::up(MIGRATION_0013_TRIGGER_BINDINGS_AND_DELIVERIES),
         M::up(MIGRATION_0014_WORKFLOW_CHILD_CALLS),
         M::up(MIGRATION_0015_WORKFLOW_CHILD_CALL_CONTINUATIONS),
+        M::up(MIGRATION_0016_WORKFLOW_CHILD_CALL_NON_EXPIRING_CLAIMS),
     ])
 }
