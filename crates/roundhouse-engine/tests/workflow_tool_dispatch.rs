@@ -251,6 +251,7 @@ async fn write_tool_dispatches_through() {
         json!({ "path": &target_str, "contents": "hello" }),
         json!({ "path": &target_str, "contents": "hello" }),
         AMPLE_STEP_TIMEOUT,
+        None,
     )
     .await;
 
@@ -299,6 +300,7 @@ async fn edit_tool_dispatches_through() {
         json!({ "path": &target_str, "find": "a", "replace": "b" }),
         json!({ "path": &target_str, "find": "a", "replace": "b" }),
         AMPLE_STEP_TIMEOUT,
+        None,
     )
     .await;
 
@@ -345,6 +347,7 @@ async fn find_tool_dispatches_through() {
         json!({ "root": &root_str, "pattern": "*.txt" }),
         json!({ "root": &root_str, "pattern": "*.txt" }),
         AMPLE_STEP_TIMEOUT,
+        None,
     )
     .await;
 
@@ -408,6 +411,7 @@ async fn shell_tool_dispatches_through() {
         json!({ "program": &program, "argv": [], "cwd": &cwd }),
         json!({ "program": &program, "argv": [], "cwd": &cwd }),
         AMPLE_STEP_TIMEOUT,
+        None,
     )
     .await
     .expect("dispatch should succeed");
@@ -506,6 +510,7 @@ async fn shell_tool_step_timeout_elapsing_kills_the_process_and_fails_the_step()
             json!({ "program": &program, "argv": [], "cwd": &cwd }),
             json!({ "program": &program, "argv": [], "cwd": &cwd }),
             Duration::from_millis(300),
+            None,
         ),
     )
     .await
@@ -581,6 +586,7 @@ async fn unsupported_tools_rejected() {
         json!({}),
         json!({}),
         AMPLE_STEP_TIMEOUT,
+        None,
     )
     .await;
 
@@ -724,6 +730,7 @@ async fn shell_task_started_append_failure_cancels_the_pre_spawned_child() {
         json!({ "program": &program, "argv": [], "cwd": &cwd }),
         json!({ "program": &program, "argv": [], "cwd": &cwd }),
         AMPLE_STEP_TIMEOUT,
+        None,
     )
     .await;
 

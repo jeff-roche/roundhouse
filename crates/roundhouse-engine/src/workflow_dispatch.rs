@@ -91,12 +91,26 @@ pub struct WorkflowToolDispatch {
 /// orphan; the four filesystem kinds ignore it (they have no internal bound
 /// of their own — `execute_pending`'s outer `tokio::time::timeout` is their
 /// safety net, not this parameter).
+///
+/// `identity_sink`, when given, is sent `(task_id, first_task_seq)` the
+/// instant `TaskCreated` is durably appended below — before admission,
+/// execution, or any further `.await`. It exists purely so a caller that
+/// races this whole future against an outer timeout (`execute_pending`'s
+/// filesystem-kind branch) can still learn the real task identity if that
+/// race is lost and this future gets dropped before ever returning: the
+/// send and the `TaskCreated` append it follows both happen inside the same
+/// poll, with no intervening `.await`, so by the time any outer combinator
+/// could observe its own deadline and drop this future, the send has either
+/// already landed in the channel (durably, `oneshot` buffers one value past
+/// the sender's own drop) or `TaskCreated` was never appended at all — there
+/// is no window in between. See issue #69 for the failure this closes.
 pub async fn dispatch_tool_for_workflow(
     actor: &SessionActor,
     task_kind: TaskKind,
     logged_input: serde_json::Value,
     dispatch_input: serde_json::Value,
     step_timeout: std::time::Duration,
+    identity_sink: Option<tokio::sync::oneshot::Sender<(TaskId, u64)>>,
 ) -> Result<WorkflowToolDispatch, String> {
     let writer = actor.writer();
     let runner = actor.runner();
@@ -117,6 +131,12 @@ pub async fn dispatch_tool_for_workflow(
         .append(created)
         .await
         .map_err(|e| format!("failed to record a dispatched workflow tool call: {e}"))?;
+    if let Some(sink) = identity_sink {
+        // The receiver may already be gone (a caller that doesn't need this,
+        // e.g. `execute_pending`'s `Shell` branch, never constructs one) —
+        // that is not this function's problem to report.
+        let _ = sink.send((task_id, first_task_seq));
+    }
 
     // Explicit allowlist over the five kinds this function actually dispatches.
     // Everything else is refused with `unsupported_workflow_tool`.
@@ -379,7 +399,15 @@ pub async fn dispatch_tool_for_workflow(
 
 /// Records a `TaskFailed` for `task_id` under `actor`'s session, returning
 /// the seq `EventWriter::append` assigned it.
-async fn record_workflow_task_failed(
+///
+/// `pub` (rather than private to this module) so `DeliveryExecutor::
+/// execute_pending`'s outer-timeout arm can call it directly: when the
+/// timeout wins the race against [`dispatch_tool_for_workflow`] but that
+/// function's `identity_sink` still reports a real `task_id`, this is what
+/// lets the caller append the terminal event itself instead of leaving a
+/// non-terminal task behind for `roundhouse_store::recover_interrupted_tasks`
+/// to repair at the next daemon boot.
+pub async fn record_workflow_task_failed(
     actor: &SessionActor,
     task_id: TaskId,
     category: &str,
