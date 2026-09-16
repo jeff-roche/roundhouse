@@ -406,6 +406,21 @@ pub enum RunLoopError {
 #[derive(Debug, Clone, PartialEq)]
 pub struct GateAnswer {
     pub step_id: String,
+    /// Which `map` item's gate this answers — `Some(i)` for a `gate:` nested
+    /// in a `map`'s own `steps:` (Phase 8 Task 25.7 Task 6), `None` for a
+    /// top-level one.
+    ///
+    /// **Paired with `step_id` it is what identifies the gate**, exactly as
+    /// it is for [`WorkDone`]: a `map`'s items share their inner steps' ids,
+    /// so `step_id` alone names a gate per item rather than one gate. It also
+    /// decides *which list* [`ensure_gate_step`] validates the answer
+    /// against, so an answer filed under the wrong one is refused rather than
+    /// resolving a same-named gate at the other nesting level.
+    ///
+    /// The run still has at most one live park ([`Loop::gate_answer`] is one
+    /// `Option`, not a collection); this says which item that one park is
+    /// about, not that several are outstanding.
+    pub item_index: Option<u32>,
     pub output: Value,
 }
 
@@ -444,7 +459,9 @@ pub struct CrashRecoveryAnswer {
 /// the caller's to know, not this crate's to infer.
 #[derive(Debug, Clone)]
 pub enum Resume {
-    /// Resolves an [`RunOutcome::Parked`] gate.
+    /// Resolves an [`RunOutcome::Parked`] gate — a top-level `gate:` step, or
+    /// (Phase 8 Task 25.7 Task 6) one nested in a `map`'s own `steps:`, which
+    /// the answer's [`GateAnswer::item_index`] distinguishes.
     Gate(GateAnswer),
     /// Resolves an [`RunOutcome::Parked`] **crash-recovery** wait — §8.10's
     /// `on_crash: ask`, which is the default for every `Effectful` step. See
@@ -847,9 +864,19 @@ pub fn run_workflow<H: WorkflowHost>(
     // Checked even when the run was already `Running`, so an answer naming a
     // step that is not a gate is refused on every path rather than only on the
     // resume path — see `release_park`.
-    if let Some(answer) = &gate_answer {
-        ensure_gate_step(&main, answer)?;
-    }
+    //
+    // The target is kept, not just the verdict: an answer naming a `map`'s
+    // inner gate says that `map` is mid-fan-out, which is the same thing
+    // `Resume::Work` says about the step it answers and which nothing durable
+    // records (see `failed_step_rows`). `Loop::nested_gate_map` is where that
+    // fact is read back.
+    let nested_gate_map = match &gate_answer {
+        Some(answer) => match ensure_gate_step(&main, answer)? {
+            GateAnswerTarget::TopLevel => None,
+            GateAnswerTarget::MapItem { map_step_id } => Some(map_step_id),
+        },
+        None => None,
+    };
     if let Some(answer) = &crash_answer {
         ensure_crash_recovery_step(&main, answer)?;
     }
@@ -912,6 +939,7 @@ pub fn run_workflow<H: WorkflowHost>(
             HashMap::new()
         },
         gate_answer,
+        nested_gate_map,
         crash_answer,
         work_results,
         resuming_work,
@@ -1157,18 +1185,107 @@ fn release_park(
     Ok(())
 }
 
+/// Where a [`GateAnswer`] lands — what [`ensure_gate_step`] found when it
+/// checked the answer names a real `gate:` step.
+///
+/// Carried rather than discarded because the two cases resume differently:
+/// a nested answer means the `map` naming it is **mid-fan-out**, which is a
+/// fact nothing else on that entry records (see [`Loop::nested_gate_map`]).
+enum GateAnswerTarget {
+    /// A `gate:` step of the `steps:` phase itself.
+    TopLevel,
+    /// A `gate:` nested in this `map` step's own `steps:`.
+    MapItem { map_step_id: String },
+}
+
 /// The check [`release_park`] exists for, split out so it runs on every entry
 /// carrying an answer and not only on the parked one.
-fn ensure_gate_step(main: &[StepDef], answer: &GateAnswer) -> Result<(), RunLoopError> {
-    if main
-        .iter()
-        .any(|s| s.id == answer.step_id && matches!(s.body, StepBody::Gate { .. }))
-    {
-        return Ok(());
-    }
-    Err(RunLoopError::UnknownGateStep {
+///
+/// # Which list is searched is decided by the answer's own `item_index`
+///
+/// An answer carrying `None` is validated against the top-level `steps:`
+/// list and an answer carrying `Some(_)` against the nested `steps:` of the
+/// `map` steps in it — never both. That is not tidiness: a workflow may
+/// legitimately declare a top-level `gate:` and a nested one under the same
+/// id, and the two resolve *different* steps. Searching both lists would let
+/// an answer meant for one release the other, which is the very overwrite
+/// this check exists to stop (see [`GateAnswer`]'s own doc).
+///
+/// **`steps:` only, and that is the whole set** — the same argument
+/// [`ensure_crash_recovery_step`] makes for itself. Both of the sites where a
+/// gate can park refuse to do so from `catch:`/`finally:`
+/// ([`Loop::dispatch_gate`], and [`Loop::advance_map_item`] for a nested
+/// one), so no gate outside `steps:` can ever be the subject of a park.
+///
+/// **One level of nesting**, matching what can actually park: a `map` nested
+/// inside a `map` runs through [`Executor::dispatch_map_step`]'s in-memory
+/// loop, which has no `Connection` and refuses a `gate:` outright, so a gate
+/// two levels down never parks and an answer naming one is refused here.
+///
+/// A `map` whose inner steps do not parse contributes nothing rather than
+/// failing this check: the parse failure is the `map` step's own outcome
+/// ([`parse_map_inner_steps`]), reported where the step runs.
+///
+/// # The residual: two `map` steps whose inner gates share an id
+///
+/// **The first such `map` in `steps:` order wins**, and nothing here can do
+/// better: a [`GateAnswer`] names a step id and an item index, and that pair
+/// does not distinguish them. This is the same ambiguity
+/// [`Loop::item_steps_before`] already has — its `(step_id, item_index)` key
+/// cannot tell two maps' same-named inner steps apart either, as
+/// [`Loop::map_dispatches_so_far`]'s own doc records — so the answer is
+/// consistent with how the rows are keyed rather than a new disagreement.
+///
+/// What it costs, stated rather than implied: if the *second* such map is the
+/// one that parked, its answer is attributed to the first, the second map is
+/// not recognised as mid-fan-out, and §8.10 tier 2 parks it on a crash
+/// question instead of resolving the gate. That is visible and fails safe —
+/// no human's answer is applied to a question they were not shown, which is
+/// what the scoping in [`Loop::advance_map_item`] guarantees — but the run
+/// cannot be resumed past it. Giving [`GateAnswer`] the `map` step's id would
+/// close it, and is a wire-shape change beyond Phase 8 Task 25.7 Task 6.
+///
+/// The item index itself is deliberately **not** bounds-checked. `over:` is
+/// an expression evaluated per entry, so the item count is not known here,
+/// and an index naming no item behaves exactly as a top-level answer naming
+/// the wrong one of two gates already does: the run is released, the gate
+/// that is really waiting is reached again, and it re-parks — visibly, with
+/// the question put to a human a second time rather than lost.
+fn ensure_gate_step(
+    main: &[StepDef],
+    answer: &GateAnswer,
+) -> Result<GateAnswerTarget, RunLoopError> {
+    let unknown = || RunLoopError::UnknownGateStep {
         step_id: answer.step_id.clone(),
-    })
+    };
+    if answer.item_index.is_none() {
+        return main
+            .iter()
+            .any(|s| s.id == answer.step_id && matches!(s.body, StepBody::Gate { .. }))
+            .then_some(GateAnswerTarget::TopLevel)
+            .ok_or_else(unknown);
+    }
+    for step in main {
+        let StepBody::Map {
+            steps: inner_step_yaml,
+            ..
+        } = &step.body
+        else {
+            continue;
+        };
+        let Ok(inner_steps) = parse_map_inner_steps(&step.id, inner_step_yaml) else {
+            continue;
+        };
+        if inner_steps
+            .iter()
+            .any(|inner| inner.id == answer.step_id && matches!(inner.body, StepBody::Gate { .. }))
+        {
+            return Ok(GateAnswerTarget::MapItem {
+                map_step_id: step.id.clone(),
+            });
+        }
+    }
+    Err(unknown())
 }
 
 /// [`release_park`]'s counterpart for §8.10's crash-recovery wait: check the
@@ -1323,9 +1440,12 @@ enum PhaseEnd {
     /// recovery — parked the run. The whole loop unwinds; nothing after this
     /// step runs, and no report is written, because the run has not ended.
     ///
-    /// Only [`Phase::Main`] ever produces this: both park sites refuse to
-    /// suspend a run from `catch:`/`finally:` (see [`Loop::dispatch_gate`]
-    /// and [`Loop::crash_recovery_park`]), because §8.13's cancel must
+    /// Only [`Phase::Main`] ever produces this: all three sites that can park
+    /// refuse to suspend a run from `catch:`/`finally:` — a top-level `gate:`
+    /// ([`Loop::dispatch_gate`]), §8.10's crash recovery
+    /// ([`Loop::crash_recovery_park`]), and a `gate:` nested in a `map`
+    /// ([`Loop::advance_map_item`], whose refusal is
+    /// [`nested_gate_cannot_park_from`]) — because §8.13's cancel must
     /// converge.
     Parked(ParkResult),
     /// A `tool:`/`agent:`/`call:` step needs real work. The whole loop unwinds
@@ -1376,6 +1496,26 @@ struct Loop<'c, H: WorkflowHost> {
     /// argument. Drained as each is inherited.
     failed_before: HashMap<String, WorkflowStepRun>,
     gate_answer: Option<GateAnswer>,
+    /// The id of the `map` step whose own nested `gate:` this entry's
+    /// [`Self::gate_answer`] names — `None` when there is no answer, or when
+    /// it names a top-level gate. Computed once, by [`ensure_gate_step`],
+    /// which has to search for it anyway to validate the answer.
+    ///
+    /// **This is "that `map` is mid-fan-out", which is otherwise unrecorded.**
+    /// A park is a durable suspension *inside* a `map`'s wave loop, so the
+    /// entry that answers it is a continuation of the drive that took it —
+    /// exactly what [`Resume::Work`] means for a dispatch, and equally
+    /// invisible on the rows (see [`failed_step_rows`] for why a row cannot
+    /// say it). Two decisions read it, both scoped to the named `map` so that
+    /// a *different* `map` left `Running` by a drive that then died still
+    /// gets §8.10 tier 2's treatment:
+    ///
+    /// - [`Self::run_phase`]'s `resuming_map` guard, so the `map` is neither
+    ///   charged a second time nor crash-policy'd on a question this answer
+    ///   already settles; and
+    /// - [`Self::decided_map_item_step`], so a sibling item this same drive
+    ///   already failed is inherited rather than re-decided and re-dispatched.
+    nested_gate_map: Option<String>,
     /// A human's answer to the §8.10 crash-recovery park this run took, if
     /// this entry carries one. Read (not drained) by [`Self::run_phase`]'s
     /// crash-policy branch for the one step it names; every other step falls
@@ -1638,6 +1778,16 @@ impl<H: WorkflowHost> Loop<'_, H> {
             // `Indeterminate` row is a genuine crash re-drive, and still gets
             // §8.10's `on_crash` treatment.
             //
+            // **A nested `gate:`'s answer is the second such continuation**
+            // (Phase 8 Task 25.7 Task 6), and it has to be: a `map` that
+            // parked on one of its items' gates left its own row `Running`,
+            // which the next load reclassifies `Indeterminate`, so without
+            // this the entry carrying the answer would park the run *again*
+            // — on §8.10's crash question, about a `map` that did not crash.
+            // Scoped to the `map` the answer actually names (see
+            // `Self::nested_gate_map`), so a different `map` left behind by a
+            // drive that died is untouched.
+            //
             // Keyed on the step's own **unfinished** row rather than on
             // `indeterminate_before`: a `map` declaring an `idempotency_key:`
             // is `Idempotent` (`derive_disposition`), so `recover_run` leaves
@@ -1647,7 +1797,7 @@ impl<H: WorkflowHost> Loop<'_, H> {
             // separate half: it is what stops §8.10 tier 2's crash-policy
             // branch parking a run on a `map` this drive is simply mid-way
             // through.
-            let resuming_map = self.resuming_work
+            let resuming_map = (self.resuming_work || self.answers_this_maps_gate(&step.id))
                 && matches!(step.body, StepBody::Map { .. })
                 && self.unfinished_before.remove(&step.id);
             if resuming_map {
@@ -1949,6 +2099,7 @@ impl<H: WorkflowHost> Loop<'_, H> {
                         *on_item_error,
                         isolation.as_ref(),
                         inner_step_yaml,
+                        phase,
                     )? {
                         MapStep::Completed(outcome) => outcome,
                         MapStep::AwaitingWork(pending) => {
@@ -1959,6 +2110,26 @@ impl<H: WorkflowHost> Loop<'_, H> {
                             // `run_phase`'s `resuming_map` guard above.
                             self.checkpoint(step, StepRunState::Running, None, None)?;
                             return Ok(PhaseEnd::AwaitingWork(pending));
+                        }
+                        // One of this `map`'s items reached a nested `gate:`
+                        // and, with its wave drained, parked the whole run on
+                        // it (Phase 8 Task 25.7 Task 6). The `map`'s own row
+                        // records that it is mid-fan-out for exactly the
+                        // reason the `AwaitingWork` arm above writes one — and
+                        // the entry that resumes it is the one carrying that
+                        // gate's answer, which is what `resuming_map` above
+                        // now also recognises.
+                        //
+                        // Written *after* the park rather than before, unlike
+                        // the item's own gate row (see `Self::dispatch_map`'s
+                        // park site): a crash in the gap leaves a run parked
+                        // with the item's record intact and the `map` looking
+                        // unstarted, which costs one re-admission on resume
+                        // and loses nothing. The reverse order would leave a
+                        // `map` looking mid-flight with no park to explain it.
+                        MapStep::Parked(parked) => {
+                            self.checkpoint(step, StepRunState::Running, None, None)?;
+                            return Ok(PhaseEnd::Parked(parked));
                         }
                     },
                     _ => match executor.dispatch_step(step) {
@@ -2223,6 +2394,37 @@ fn step_row_fields(outcome: &StepOutcome) -> (StepRunState, Option<StepOutput>, 
     }
 }
 
+/// A `gate:` step's `title:`, interpolated and rendered for logging — the
+/// text that reaches the form a human is actually shown.
+///
+/// The gate's own `title:` is interpolated workflow source, so a `${{ }}` in
+/// it resolves here, and the *redacted* rendering is what goes on, for the
+/// reason every other dispatch arm redacts: the form is rendered and
+/// persisted, and a resolved secret in it would be unrecoverable.
+///
+/// One function rather than two copies because a nested `gate:` is the case
+/// that makes the interpolation load-bearing: its title is evaluated with the
+/// item's own `as:` binding live, so `title: "ship ${{ item.name }}?"`
+/// names the item a human is being asked about. A second, hand-copied
+/// rendering is exactly where the needle backstop would go missing from one
+/// of them.
+///
+/// Returns the failure *message* rather than an outcome, so each caller wraps
+/// it in what it owns — a failed step, or a failed `map` item — instead of
+/// this function deciding which, or failing the run.
+fn gate_title_text(executor: &Executor<'_>, title: &str) -> Result<String, String> {
+    let resolved = crate::expr::interpolate(
+        crate::expr::TemplateSource::from_workflow_file(title),
+        &executor.ctx,
+    )
+    .map_err(|e| format!("interpolating `gate.title`: {e}"))?;
+    let logged = redact_with_needles(
+        &Value::String(resolved.redacted_for_logging().to_string()),
+        &executor.redaction_needles,
+    );
+    Ok(logged.as_str().unwrap_or_default().to_string())
+}
+
 /// What a `gate:` step did.
 enum GateStep {
     /// A human's answer was supplied at entry, so the gate resolves rather
@@ -2273,10 +2475,14 @@ impl<H: WorkflowHost> Loop<'_, H> {
         hold_workspace: bool,
         phase: Phase,
     ) -> Result<GateStep, RunLoopError> {
+        // `item_index.is_none()` is half of the identity, not a formality: a
+        // workflow may declare a top-level `gate:` and a `map`'s inner one
+        // under the same id, and an answer for the nested one must not
+        // resolve this step. See [`GateAnswer::item_index`].
         if let Some(answer) = self
             .gate_answer
             .as_ref()
-            .filter(|a| a.step_id == step.id)
+            .filter(|a| a.step_id == step.id && a.item_index.is_none())
             .cloned()
         {
             return Ok(GateStep::Answered(StepOutcome {
@@ -2310,28 +2516,10 @@ impl<H: WorkflowHost> Loop<'_, H> {
             )));
         }
 
-        // The gate's own `title:`/`form:` are interpolated workflow source, so
-        // a `${{ }}` in either resolves here — and the *redacted* rendering is
-        // what reaches the form a human sees, for the reason every other
-        // dispatch arm redacts: the form is rendered and persisted, and a
-        // resolved secret in it would be unrecoverable.
-        let resolved_title = match crate::expr::interpolate(
-            crate::expr::TemplateSource::from_workflow_file(title),
-            &executor.ctx,
-        ) {
-            Ok(t) => t,
-            Err(e) => {
-                return Ok(GateStep::Answered(StepOutcome::failed(
-                    &step.id,
-                    format!("interpolating `gate.title`: {e}"),
-                )))
-            }
+        let title_text = match gate_title_text(executor, title) {
+            Ok(text) => text,
+            Err(why) => return Ok(GateStep::Answered(StepOutcome::failed(&step.id, why))),
         };
-        let logged_title = redact_with_needles(
-            &Value::String(resolved_title.redacted_for_logging().to_string()),
-            &executor.redaction_needles,
-        );
-        let title_text = logged_title.as_str().unwrap_or_default().to_string();
 
         let awaiting =
             AwaitingHuman::from_gate(TaskId::new(), &title_text, form, timeout, on_timeout)?;
@@ -2723,6 +2911,16 @@ impl<H: WorkflowHost> Loop<'_, H> {
 enum MapStep {
     Completed(StepOutcome),
     AwaitingWork(Vec<PendingWork>),
+    /// One item's nested `gate:` parked the whole run (Phase 8 Task 25.7
+    /// Task 6). Mutually exclusive with `AwaitingWork` by construction, and
+    /// that is the mechanism rather than a coincidence: a park is taken only
+    /// once the wave has nothing left to dispatch — see [`Loop::dispatch_map`]'s
+    /// own "A park waits for the wave" section.
+    ///
+    /// [`Loop::run_phase`] turns this into [`PhaseEnd::Parked`], unwinding the
+    /// whole loop exactly as a top-level [`GateStep::Parked`] does. The run is
+    /// `AwaitingHuman` by the time this is returned.
+    Parked(ParkResult),
 }
 
 /// How far one `map` item got on one segment of a drive.
@@ -2734,6 +2932,37 @@ enum ItemAdvance {
     /// The item's next inner step needs real work, so the item's cursor stops
     /// here until that answer comes back.
     Pending(Box<PendingWork>),
+    /// The item's next inner step is a `gate:` with no answer yet: it asks
+    /// for the run to be parked on it (Phase 8 Task 25.7 Task 6).
+    ///
+    /// A **request**, not a park — the item's cursor stops here either way,
+    /// but whether the run actually suspends is [`Loop::dispatch_map`]'s
+    /// decision, because only the wave as a whole knows whether anything else
+    /// still needs dispatching. Nothing has been written or emitted by the
+    /// time this is returned, so a request the wave declines costs nothing
+    /// and is simply re-derived on the next segment.
+    WantsPark(Box<PendingPark>),
+}
+
+/// One `map` item's request to park the run on its own nested `gate:`.
+///
+/// Everything here is computed **while the item's own `as:` binding is
+/// live**, because that binding is gone by the time the wave decides: the
+/// title is interpolated against this item (`"ship ${{ item.name }}?"`), and
+/// [`Loop::dispatch_map`] restores the `as:` root before it parks.
+struct PendingPark {
+    item_index: u32,
+    /// The gate step itself, so the park can write the durable per-item row
+    /// that records *which item, at which inner step* — the record §8.11's
+    /// resume needs and the one thing `workflow_run` has no column for (see
+    /// [`ParkResult::item_index`]).
+    step: StepDef,
+    awaiting: AwaitingHuman,
+    hold_workspace: bool,
+    /// This gate's own `when:` taint, parked on its row exactly as a
+    /// suspending `tool:` step's is — see
+    /// [`Loop::checkpoint_map_item_step_waiting`].
+    gate_condition_was_secret_derived: bool,
 }
 
 impl<H: WorkflowHost> Loop<'_, H> {
@@ -2803,14 +3032,42 @@ impl<H: WorkflowHost> Loop<'_, H> {
     /// round-trip, and an item this fan-out has not begun is recorded
     /// [`skipped_by_run_budget_exhausted`] rather than dropped or failed.
     ///
+    /// # A park waits for the wave (Task 6), which is what makes it cooperative
+    ///
+    /// An item whose next inner step is a nested `gate:` cannot suspend just
+    /// itself: §8.11's park is a transition of the **run** — it releases the
+    /// worker slot, the provider connection and the worktree, all run-wide —
+    /// and `workflow_run` has exactly one park slot to say so. So such an item
+    /// returns [`ItemAdvance::WantsPark`], a *request*, and the loop below
+    /// collects requests beside `pending` without acting on either until every
+    /// item has been walked. Then, in order:
+    ///
+    /// 1. **`pending` first.** If any item decided it needs real work, this
+    ///    segment returns [`MapStep::AwaitingWork`] and the park does not
+    ///    happen — §8.13's cooperative shape applied to a park, rather than
+    ///    abandoning dispatches siblings already have out. The request costs
+    ///    nothing to defer: it is re-derived from the item's own rows on the
+    ///    next segment, exactly as every other cursor position here is.
+    /// 2. **Then the first request, and only the first.** One park can be live
+    ///    at a time, so several items reaching their gates in one wave resolve
+    ///    *in sequence*: this one parks, its answer releases the run, and the
+    ///    next item's request is re-derived and parks on the following
+    ///    segment. Nothing batches them, and nothing waits for the others.
+    ///
+    /// Termination does not depend on the order: every segment either
+    /// dispatches work, parks, finishes the map or fails it, and an answered
+    /// gate is a `Completed` row the next segment inherits
+    /// ([`Self::decided_map_item_step`]) rather than asks again — so each
+    /// park settles one inner step of one item for good.
+    ///
     /// # What this task deliberately does not do
     ///
-    /// - **Nested `gate:`/`call:`.** An inner step of either kind still takes
+    /// - **Nested `call:`.** An inner `call:` still takes
     ///   [`Executor::dispatch_step`]'s catch-all refusal, unchanged — it comes
     ///   back `Done(failed)` from the generic arm below rather than needing an
-    ///   arm of its own. Tasks 6 and 7 own making them real, and the match
-    ///   below is shaped (special cases first, generic dispatch last) so they
-    ///   can be added without restructuring this loop.
+    ///   arm of its own. Task 7 owns making it real, and the match below is
+    ///   shaped (special cases first, generic dispatch last) so it can be
+    ///   added without restructuring this loop.
     #[allow(clippy::too_many_arguments)]
     fn dispatch_map(
         &mut self,
@@ -2822,6 +3079,7 @@ impl<H: WorkflowHost> Loop<'_, H> {
         on_item_error: OnItemError,
         isolation: Option<&MapIsolationDef>,
         inner_step_yaml: &[serde_yaml::Value],
+        phase: Phase,
     ) -> Result<MapStep, RunLoopError> {
         let (over_evaluated, items) = match resolve_map_items(&executor.ctx, &step.id, over) {
             Ok(resolved) => resolved,
@@ -2876,6 +3134,10 @@ impl<H: WorkflowHost> Loop<'_, H> {
         let mut policy = ItemErrorPolicy::new(on_item_error);
         let mut outcomes: Vec<Option<ItemOutcome>> = vec![None; items.len()];
         let mut pending: Vec<PendingWork> = Vec::new();
+        // Every item that reached a nested `gate:` with no answer, in item
+        // order. Collected rather than acted on — see this method's own
+        // "A park waits for the wave".
+        let mut park_requests: Vec<PendingPark> = Vec::new();
         // `map.max_parallel: 0` parses — `parse/steps.rs`'s own module doc
         // says so ("an unbounded `u32`; `0` and `u32::MAX` both parse") — and
         // a ceiling of zero would mean "never dispatch anything", a livelock
@@ -2972,6 +3234,7 @@ impl<H: WorkflowHost> Loop<'_, H> {
                 isolation,
                 &per_item_caps,
                 &mut any_item_secret_derived,
+                phase,
             ) {
                 Ok(ItemAdvance::Finished(outcome)) => {
                     // `|=`, not `=`: an in-flight item that completes *after*
@@ -2981,6 +3244,7 @@ impl<H: WorkflowHost> Loop<'_, H> {
                     outcomes[index] = Some(outcome);
                 }
                 Ok(ItemAdvance::Pending(work)) => pending.push(*work),
+                Ok(ItemAdvance::WantsPark(request)) => park_requests.push(*request),
                 Err(e) => {
                     failure = Some(e);
                     break;
@@ -2998,6 +3262,42 @@ impl<H: WorkflowHost> Loop<'_, H> {
         }
         if !pending.is_empty() {
             return Ok(MapStep::AwaitingWork(pending));
+        }
+        // The wave has drained, so a park requested during it can finally
+        // take effect — the first request, and only it, because one run can
+        // hold one park (see "A park waits for the wave" above).
+        //
+        // The item's own gate row is written **before** the park rather than
+        // after it, which is the opposite order to `Self::dispatch_gate`'s.
+        // A top-level park needs no such record — the phase list is walked
+        // from the start on resume and the gate is reached again — while a
+        // park inside a fan-out is the one case where *which item* is a fact
+        // nothing else holds. Writing it first means a crash in the gap
+        // leaves a row saying an item's gate is waiting on a run that is
+        // merely `Running`, which the next segment re-derives as undecided
+        // and re-presents; the reverse order would leave a parked run with no
+        // record of what it is parked on.
+        if let Some(request) = park_requests.into_iter().next() {
+            self.checkpoint_map_item_step_waiting(
+                &request.step,
+                request.item_index,
+                request.gate_condition_was_secret_derived,
+            )?;
+            let parked = park(
+                self.conn,
+                self.run_id,
+                &request.awaiting,
+                request.hold_workspace,
+                self.now,
+                self.host,
+            )?;
+            // Without this nobody is ever asked — see `emit_awaiting_human`,
+            // whose own doc records that `park` itself reads only the
+            // deadline. The inner step's id, not the `map`'s: the form is
+            // about the gate, and which item it belongs to travels in the
+            // `AwaitingHuman` itself.
+            self.emit_awaiting_human(executor, &request.step.id, &request.awaiting, &parked);
+            return Ok(MapStep::Parked(parked));
         }
 
         let result = MapRunResult {
@@ -3051,7 +3351,11 @@ impl<H: WorkflowHost> Loop<'_, H> {
     ///
     /// **A started item stays "in flight" for the rest of the fan-out.** There
     /// is no narrower state here: the predicate is "has any inner step of this
-    /// item a row or an answer", and a row is never removed. Both callers want
+    /// item a row or an answer", and a row is never removed. That includes an
+    /// item parked on its own nested `gate:` (Phase 8 Task 25.7 Task 6), whose
+    /// row is the `Running` one [`Self::checkpoint_map_item_step_waiting`]
+    /// wrote for it — correctly, since a human has been asked about that item
+    /// and neither stop condition may withdraw the question. Both callers want
     /// exactly that — but it is also why run-budget exhaustion cannot stop an
     /// item that has begun, which
     /// [`crate::exec::map_step::run_budget_is_exhausted`] records as the
@@ -3233,6 +3537,10 @@ impl<H: WorkflowHost> Loop<'_, H> {
     /// `per_item_caps` is this item's share of the run's remaining ceiling,
     /// enforced at the one point an inner step becomes real work — see
     /// [`per_item_dispatch_refusal`].
+    ///
+    /// A nested `gate:` is the one inner step that can stop the item without
+    /// dispatching anything: it returns [`ItemAdvance::WantsPark`], which the
+    /// caller may or may not act on this segment (Phase 8 Task 25.7 Task 6).
     #[allow(clippy::too_many_arguments)]
     fn advance_map_item(
         &mut self,
@@ -3244,6 +3552,7 @@ impl<H: WorkflowHost> Loop<'_, H> {
         isolation: Option<&MapIsolationDef>,
         per_item_caps: &ResourceCaps,
         any_item_secret_derived: &mut bool,
+        phase: Phase,
     ) -> Result<ItemAdvance, RunLoopError> {
         let mut last = ItemOutcome::Completed(Value::Null);
         let mut worktree: Option<ItemWorktree> = None;
@@ -3301,8 +3610,133 @@ impl<H: WorkflowHost> Loop<'_, H> {
                 break;
             }
 
+            // **A nested `gate:` is intercepted here, not dispatched** (Phase 8
+            // Task 25.7 Task 6) — the per-item counterpart of
+            // `run_phase`'s own `StepBody::Gate` arm, and for the same reason
+            // that arm exists: parking needs the `Connection` and the
+            // `workflow_run` row, which `Executor` deliberately holds neither
+            // of. Destructured before the `when:` gate below so that the arm
+            // reads as one branch of the dispatch decision rather than a
+            // second `match` on the body inside it; an inner gate whose
+            // `when:` is false is still skipped rather than asked, because
+            // `evaluate_when_gate` runs first.
+            let gate_fields = match &inner.body {
+                StepBody::Gate {
+                    title,
+                    form,
+                    timeout,
+                    on_timeout,
+                    hold_workspace,
+                } => Some((title, form, timeout, on_timeout, *hold_workspace)),
+                _ => None,
+            };
             let outcome = match evaluate_when_gate(inner, &executor.ctx) {
                 GateDecision::Decided(outcome) => outcome,
+                GateDecision::Proceed {
+                    gate_condition_was_secret_derived,
+                } if gate_fields.is_some() => {
+                    let (title, form, timeout, on_timeout, hold_workspace) =
+                        gate_fields.expect("the guard on this arm is `gate_fields.is_some()`");
+                    // A human's answer for **this item's gate of this map**
+                    // resolves it, exactly as `dispatch_gate` resolves a
+                    // top-level one. All three parts of the match are load-
+                    // bearing:
+                    //
+                    // - the index, because the items of one `map` all share
+                    //   this inner step's id, so `step_id` alone would resolve
+                    //   every item's gate from one human's answer; and
+                    // - the map, because a workflow may declare two `map`
+                    //   steps whose inner gates share an id. Without it, an
+                    //   answer for the first map's item 1 would also resolve
+                    //   the *second* map's item 1 when the run drove on to it
+                    //   in the same segment — one human's decision applied to
+                    //   a question they were never shown. Which map an answer
+                    //   belongs to is `ensure_gate_step`'s finding; see its
+                    //   own doc for what that leaves ambiguous.
+                    if let Some(answer) = self
+                        .gate_answer
+                        .as_ref()
+                        .filter(|a| {
+                            a.step_id == inner.id
+                                && a.item_index == Some(item_index)
+                                && self.answers_this_maps_gate(map_step_id)
+                        })
+                        .cloned()
+                    {
+                        StepOutcome {
+                            step_id: inner.id.clone(),
+                            output: answer.output,
+                            // A human's answer is not derived from this run's
+                            // secrets — `dispatch_gate`'s own note, unchanged
+                            // by the nesting. This item's `when:` taint is
+                            // carried in the field below and folded into this
+                            // one a few lines down, where every inner step's
+                            // is.
+                            status: StepStatus::Completed,
+                            output_is_secret_derived: false,
+                            gate_condition_was_secret_derived,
+                        }
+                    } else if phase != Phase::Main {
+                        // §8.13's cancel must converge, so no park may be
+                        // acquired from a block that runs while the run is
+                        // ending. The item fails closed rather than the map
+                        // step doing so, which keeps `on_item_error`'s
+                        // existing granularity.
+                        last = nested_gate_cannot_park_from(map_step_id, &inner.id, phase);
+                        break;
+                    } else if worktree.as_ref().is_some_and(ItemWorktree::holds_worktree) {
+                        // A park suspends the run for as long as a human
+                        // takes, so it spans a resume even more surely than a
+                        // dispatch does — see `worktree_cannot_span_a_suspend`.
+                        let refusal = worktree_cannot_span_a_suspend(
+                            map_step_id,
+                            &inner.id,
+                            "needs a human's answer, which parks the run",
+                        );
+                        let held = worktree
+                            .take()
+                            .expect("the branch condition is `worktree.is_some_and(..)`");
+                        last = executor.release_item_isolation(map_step_id, held, refusal);
+                        break;
+                    } else {
+                        // Nothing has answered it, so this item asks for the
+                        // run to be parked. The wait is built **here**, while
+                        // this item's `as:` binding is still live, because the
+                        // caller restores that root before it decides whether
+                        // to park (see `Self::dispatch_map`).
+                        let title_text = match gate_title_text(executor, title) {
+                            Ok(text) => text,
+                            Err(why) => {
+                                last = ItemOutcome::Failed(format!(
+                                    "map step `{map_step_id}`: inner step `{}`: {why}",
+                                    inner.id
+                                ));
+                                break;
+                            }
+                        };
+                        // Fallible for the same reason the top-level gate's
+                        // is, and failing the **run** rather than the item for
+                        // the same reason: a malformed `timeout:` or a `form:`
+                        // that is not an object is a static defect of the
+                        // workflow, identical for every item, not something
+                        // one item can be said to have got wrong.
+                        let awaiting = AwaitingHuman::from_gate(
+                            TaskId::new(),
+                            &title_text,
+                            form,
+                            timeout,
+                            on_timeout,
+                        )?
+                        .about_map_item(item_index);
+                        return Ok(ItemAdvance::WantsPark(Box::new(PendingPark {
+                            item_index,
+                            step: inner.clone(),
+                            awaiting,
+                            hold_workspace,
+                            gate_condition_was_secret_derived,
+                        })));
+                    }
+                }
                 GateDecision::Proceed {
                     gate_condition_was_secret_derived,
                 } => match executor.dispatch_step(inner) {
@@ -3342,7 +3776,11 @@ impl<H: WorkflowHost> Loop<'_, H> {
                         // **Except when this item holds a worktree** — see
                         // `Self::worktree_cannot_span_a_suspend`.
                         if worktree.as_ref().is_some_and(ItemWorktree::holds_worktree) {
-                            let refusal = worktree_cannot_span_a_suspend(map_step_id, &inner.id);
+                            let refusal = worktree_cannot_span_a_suspend(
+                                map_step_id,
+                                &inner.id,
+                                "needs real dispatch, which suspends the run",
+                            );
                             let held = worktree
                                 .take()
                                 .expect("the branch condition is `worktree.is_some_and(..)`");
@@ -3421,6 +3859,17 @@ impl<H: WorkflowHost> Loop<'_, H> {
     /// crash between here and the matching [`WorkDone`] is
     /// [`recover_run`]'s `Indeterminate` reclassification by construction.
     ///
+    /// **Two kinds of suspension write it** (Phase 8 Task 25.7 Task 6): an
+    /// inner step whose dispatch the caller must perform, and an inner
+    /// `gate:` the run is about to park on. For the gate this row is more
+    /// than bookkeeping — it is the durable *"which item, at which inner
+    /// step"* a park needs, since `workflow_run` has one park slot and no
+    /// item dimension (see [`crate::parking::ParkResult::item_index`]). It
+    /// does not decide the resume: a gate is `Idempotent`
+    /// ([`derive_disposition`]), so [`Self::decided_map_item_step`] re-derives
+    /// this row as undecided and the gate is simply reached again — which is
+    /// exactly what makes re-presenting it to a human safe.
+    ///
     /// It is also the **only** place this item's `when:` gate taint can wait
     /// for its answer: [`WorkDone`] carries no such field, and the segment
     /// that computed the bit is about to end. `StepOutput` persists exactly
@@ -3463,11 +3912,12 @@ impl<H: WorkflowHost> Loop<'_, H> {
     /// re-drive, applied per item, which is what stops a resumed `map`
     /// re-running inner steps other items' waves already finished.
     ///
-    /// `Failed` is inherited **only** on a [`Resume::Work`] continuation, for
-    /// the argument [`failed_step_rows`] makes at the top level: a failure
-    /// this drive already decided must not be re-decided (it would be
-    /// re-dispatched on every subsequent wave, forever), while a failure left
-    /// behind by a drive that then died is §8.10 tier 2's to re-decide.
+    /// `Failed` is inherited **only** on a continuation of the drive that
+    /// decided it ([`Self::continues_this_maps_drive`]), for the argument
+    /// [`failed_step_rows`] makes at the top level: a failure this drive
+    /// already decided must not be re-decided (it would be re-dispatched on
+    /// every subsequent wave, forever), while a failure left behind by a drive
+    /// that then died is §8.10 tier 2's to re-decide.
     ///
     /// A row this load found **started but not finished** — `Running` for a
     /// `Pure`/`Idempotent` step, the `Indeterminate` [`recover_run`]
@@ -3496,7 +3946,7 @@ impl<H: WorkflowHost> Loop<'_, H> {
                 },
                 Value::Null,
             ),
-            StepRunState::Failed if self.resuming_work => (
+            StepRunState::Failed if self.continues_this_maps_drive(map_step_id) => (
                 StepStatus::Failed {
                     message: row.error.clone().unwrap_or_default(),
                 },
@@ -3545,6 +3995,32 @@ impl<H: WorkflowHost> Loop<'_, H> {
         })
     }
 
+    /// Whether this entry carries the answer to a `gate:` nested inside
+    /// **this** `map` — the one thing that makes a `map` found mid-fan-out a
+    /// continuation rather than a crash re-drive, on an entry that carries no
+    /// [`Resume::Work`] at all.
+    ///
+    /// Scoped by step id rather than answering "is there a nested answer at
+    /// all", so a *different* `map` whose row a dead drive left `Running`
+    /// still takes §8.10 tier 2's treatment. See [`Self::nested_gate_map`].
+    fn answers_this_maps_gate(&self, map_step_id: &str) -> bool {
+        self.nested_gate_map.as_deref() == Some(map_step_id)
+    }
+
+    /// Whether this entry continues the drive that wrote **this** `map`'s
+    /// per-item rows — a [`Resume::Work`] answering one of its own waves, or
+    /// (Phase 8 Task 25.7 Task 6) the answer to a `gate:` nested inside it.
+    ///
+    /// The two are the same fact about the rows: the drive that wrote them is
+    /// still in progress, so a decision it already made is settled rather than
+    /// re-decidable. A park is a *durable* suspension — the run row says
+    /// `AwaitingHuman` — so the answer that releases it continues that drive
+    /// even if the daemon restarted in between, which is why a crash between
+    /// the park and the answer does not make this a cold entry.
+    fn continues_this_maps_drive(&self, map_step_id: &str) -> bool {
+        self.resuming_work || self.answers_this_maps_gate(map_step_id)
+    }
+
     /// Whether the row a `map` item's inner step already has records
     /// secret-derived material — read back when its [`WorkDone`] arrives, to
     /// recover the `when:` gate taint parked by
@@ -3558,20 +4034,26 @@ impl<H: WorkflowHost> Loop<'_, H> {
 }
 
 /// **§8.10 tier 2's `ask`/`fail` for one `map` item's interrupted inner step,
-/// failed closed rather than silently re-run** (Phase 8 Task 25.7 Task 2;
-/// Task 6 owns closing the `ask` half).
+/// failed closed rather than silently re-run** (Phase 8 Task 25.7 Task 2).
 ///
 /// A top-level step found `Indeterminate` goes through
 /// [`Loop::crash_recovery_park`], which **parks the run** and asks a human
-/// `rerun | skip | fail`. That mechanism has no item dimension anywhere along
-/// it: [`CrashRecoveryAnswer`] names a `step_id` and nothing else,
-/// [`ensure_crash_recovery_step`] looks that id up in the workflow's
-/// top-level `steps:` list — which a `map` inner step is not in — and
-/// [`crate::hitl::AwaitingHuman`]/[`crate::parking::ParkResult`] carry no
-/// index either. So the question genuinely cannot be *asked* per item today;
-/// threading `item_index` down the whole park path is exactly the plumbing
-/// Phase 8 Task 25.7 Task 6 enumerates for a nested `gate:`, and the two want
-/// the same seam.
+/// `rerun | skip | fail`. Half of what stopped that being asked per item is
+/// now built: Task 6 threaded `item_index` through the *asking* half
+/// ([`crate::hitl::AwaitingHuman`], [`crate::parking::ParkResult`]) and
+/// through [`Loop::dispatch_map`]'s cooperative park, so a `map` item can
+/// suspend the run on a question about itself.
+///
+/// What is still missing is the *answering* half, and it is what this refusal
+/// now turns on: [`CrashRecoveryAnswer`] names a `step_id` and nothing else,
+/// and [`ensure_crash_recovery_step`] looks that id up in the workflow's
+/// top-level `steps:` list — which a `map` inner step is not in. So a
+/// crash-recovery park taken for one item could be presented but never
+/// resolved: the answer would name a step the check refuses, and a park
+/// nobody can answer is worse than a failure nobody has to. Closing it means
+/// giving [`CrashRecoveryAnswer`] the same index [`GateAnswer`] now carries
+/// and widening that check the way [`ensure_gate_step`] was widened — a
+/// smaller job than it was, and still not this task's.
 ///
 /// What must not happen in the meantime is the alternative this replaces:
 /// before this refusal, a `map` item's interrupted inner step simply re-ran.
@@ -3637,14 +4119,56 @@ fn map_item_crash_refusal(
 /// that would suspend is refused, and `on_item_error` governs what that does
 /// to the rest of the fan-out — the same granularity a missing
 /// `WorktreeProvider` already had.
-fn worktree_cannot_span_a_suspend(map_step_id: &str, inner_step_id: &str) -> ItemOutcome {
+///
+/// `suspension` names *how* the step would suspend — a dispatch the caller
+/// must perform, or (Phase 8 Task 25.7 Task 6) a human's answer to a nested
+/// `gate:`. Both leave and re-enter [`run_workflow`], which is the whole
+/// hazard, so the two callers share this refusal rather than growing a second
+/// one that could drift from it.
+fn worktree_cannot_span_a_suspend(
+    map_step_id: &str,
+    inner_step_id: &str,
+    suspension: &str,
+) -> ItemOutcome {
     ItemOutcome::Failed(format!(
-        "map step `{map_step_id}`: inner step `{inner_step_id}` needs real dispatch, which \
-         suspends the run — and this item declares `isolation: worktree`, which cannot span a \
-         suspend: the run loop is rebuilt on every resume, so the materialized worktree path \
-         would not survive and the item would silently continue in a freshly materialized one. \
-         Refusing rather than re-materializing; until durable per-item worktrees land, a `map` \
-         with `isolation: worktree` can only run inner steps that need no dispatch"
+        "map step `{map_step_id}`: inner step `{inner_step_id}` {suspension} — and this item \
+         declares `isolation: worktree`, which cannot span a suspend: the run loop is rebuilt on \
+         every resume, so the materialized worktree path would not survive and the item would \
+         silently continue in a freshly materialized one. Refusing rather than re-materializing; \
+         until durable per-item worktrees land, a `map` with `isolation: worktree` can only run \
+         inner steps that neither dispatch nor wait on a human"
+    ))
+}
+
+/// **A nested `gate:` cannot park a run from `catch:`/`finally:`** — the
+/// per-item leg of the rule [`Loop::dispatch_gate`] applies to a top-level
+/// gate, refused for the same reason: §8.13 requires `finally:` to run
+/// *during a cancel*, and a park suspends the run indefinitely waiting on a
+/// human, so a cancel that stops on a cleanup prompt is a cancel that does
+/// not converge. It applies to `catch:` too, for the weaker but sufficient
+/// reason that a failing run should end rather than wait.
+///
+/// The **item** fails rather than the `map` step, which is what keeps
+/// `on_item_error`'s granularity: the rest of the fan-out behaves exactly as
+/// it would for any other item failure, and the reason is on the item's own
+/// row.
+fn nested_gate_cannot_park_from(
+    map_step_id: &str,
+    inner_step_id: &str,
+    phase: Phase,
+) -> ItemOutcome {
+    let block = match phase {
+        Phase::Catch => "catch:",
+        Phase::Finally => "finally:",
+        // Unreachable: the caller returns before building this message for
+        // `Main`. Written out rather than left to a `_` arm so that a fourth
+        // phase is a compile error here, not a message that blames the wrong
+        // block.
+        Phase::Main => "steps:",
+    };
+    ItemOutcome::Failed(format!(
+        "map step `{map_step_id}`: inner step `{inner_step_id}` is a `gate:`, and a gate cannot \
+         park a run from a `{block}` block: the run is already ending"
     ))
 }
 
@@ -3662,12 +4186,23 @@ fn inner_step_needs_real_dispatch(body: &StepBody) -> bool {
         // and a nested `map:` (which runs its own items through
         // `Executor::dispatch_map_step`'s in-memory loop).
         //
-        // `gate:`/`call:` inside a `map` take `Executor::dispatch_step`'s
-        // catch-all refusal today and so dispatch nothing either. Phase 8 Task
-        // 25.7's Tasks 6 and 7 own making them real, and whichever lands first
-        // must decide this arm again — written out rather than left to a `_`
-        // so that a new `StepBody` variant is a compile error here instead of
-        // a silent hole in the ceiling.
+        // **`gate:` is real work for a human, and still not a dispatch**
+        // (decided by Phase 8 Task 25.7 Task 6, which is what this arm's
+        // previous note asked of whichever of Tasks 6/7 landed first). A
+        // nested gate now parks the run rather than taking
+        // `Executor::dispatch_step`'s catch-all refusal — but what this
+        // predicate counts is calls against the run's remaining
+        // `max_tool_calls` (see `per_item_dispatch_refusal` and
+        // `run_budget_is_exhausted`), and a park spends none: it releases the
+        // worker slot and the provider connection rather than consuming them.
+        // Counting it would withhold items from a fan-out whose gates cost
+        // the run nothing.
+        //
+        // `call:` inside a `map` still takes that catch-all refusal and so
+        // dispatches nothing either; Task 7 owns making it real and must
+        // decide this arm again. Written out rather than left to a `_` so
+        // that a new `StepBody` variant is a compile error here instead of a
+        // silent hole in the ceiling.
         StepBody::Emit { .. }
         | StepBody::Report { .. }
         | StepBody::Map { .. }
@@ -4341,6 +4876,7 @@ mod tests {
             indeterminate_before: HashMap::new(),
             failed_before: HashMap::new(),
             gate_answer: None,
+            nested_gate_map: None,
             crash_answer: None,
             work_results: HashMap::new(),
             resuming_work: false,

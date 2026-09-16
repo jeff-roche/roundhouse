@@ -884,10 +884,17 @@ pub(crate) fn parse_map_inner_steps(
 }
 
 /// **A `report:` is a property of the run, not of a map item** — the same
-/// argument already written for the nested `gate:` and `call:` refusals in
-/// [`crate::exec::Executor::dispatch_step`]'s catch-all arm, applied to the
-/// third step kind that has run-wide meaning (B12c fix round, ruling P116
-/// §B).
+/// argument already written for the nested `call:` refusal in
+/// [`crate::exec::Executor::dispatch_step`]'s catch-all arm, applied to
+/// another step kind with run-wide meaning (B12c fix round, ruling P116 §B).
+///
+/// **And it is the one of the three that stays refused.** A nested `gate:`
+/// carried the same "this is run-wide" objection until Phase 8 Task 25.7
+/// Task 6, which resolved it rather than accepting it: a park *is* run-wide,
+/// so one item's gate now parks the whole run and the durable record says
+/// which item. `report:` has no such resolution, and not for want of
+/// plumbing — a run has exactly one report (ruling P112), so an item cannot
+/// be given one without taking it from the run.
 ///
 /// Refused where the nesting *is* visible rather than in that arm, because
 /// `dispatch_step` is also how a *top-level* `report:` step is run, by both

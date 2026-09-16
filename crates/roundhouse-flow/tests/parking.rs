@@ -137,6 +137,7 @@ fn an_elicitation_with_no_deadline() -> AwaitingHuman {
         }),
         timeout_after: None,
         on_timeout: UncheckedOnTimeout::new(OnTimeout::Deny),
+        item_index: None,
     }
 }
 

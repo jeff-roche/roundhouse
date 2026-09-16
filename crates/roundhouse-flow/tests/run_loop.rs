@@ -1299,6 +1299,7 @@ fn a_gate_step_parks_the_run_and_resuming_it_answers_the_gate() {
         at(200),
         Some(Resume::Gate(GateAnswer {
             step_id: "approve".into(),
+            item_index: None,
             output: serde_json::json!({ "approve": true }),
         })),
     )
@@ -1368,6 +1369,7 @@ fn a_gate_answer_naming_a_non_gate_step_is_refused() {
         FakeHost::new(),
         Some(Resume::Gate(GateAnswer {
             step_id: "work".into(),
+            item_index: None,
             output: serde_json::json!({}),
         })),
     );
@@ -3395,6 +3397,7 @@ fn a_gate_answer_releases_only_the_gate_it_names() {
         at(10),
         Some(Resume::Gate(GateAnswer {
             step_id: "second_gate".into(),
+            item_index: None,
             output: serde_json::json!({ "ok": true }),
         })),
     )
@@ -3930,6 +3933,7 @@ fn one_sink_across_two_passes_sees_exactly_one_report_and_it_is_the_authored_one
         at(20),
         Some(Resume::Gate(GateAnswer {
             step_id: "approve".into(),
+            item_index: None,
             output: serde_json::json!({ "approve": true }),
         })),
     )
@@ -4396,6 +4400,7 @@ fn the_restore_matches_the_report_steps_own_row_and_not_merely_some_completed_ro
         at(20),
         Some(Resume::Gate(GateAnswer {
             step_id: "approve".into(),
+            item_index: None,
             output: serde_json::json!({ "approve": true }),
         })),
     )
@@ -6833,4 +6838,958 @@ fn a_map_the_ledger_refuses_to_admit_fails_before_any_item_starts() {
         "the refusal names the field that ran out: {fan_error:?}"
     );
     assert_eq!(sink.the_report()["needs_human"], true);
+}
+
+// ---------------------------------------------------------------------------
+// A nested `gate:` inside a `map:` — Phase 8 Task 25.7 (#64) Task 6
+//
+// §8.9's own reference workflow nests a `gate:` in a `map`'s `steps:`; until
+// this task it took `Executor::dispatch_step`'s catch-all refusal, because a
+// park is a transition of the *run* and one run cannot be parked per item
+// (§8.11). The resolution: an item's gate **requests** a run-wide park, and
+// that request does not take effect until the whole current wave has drained
+// — cooperative, the way §8.13's cancel is, rather than abandoning the
+// dispatches its siblings already have out.
+// ---------------------------------------------------------------------------
+
+/// One `map` item's own inner-step row — [`step_row`]'s per-item counterpart.
+///
+/// Returns `None` rather than panicking when the row is absent, because
+/// "this sibling was never started" is an assertion in its own right here: it
+/// is exactly what an unstarted item looks like durably.
+fn item_step_row(
+    conn: &Connection,
+    run_id: RunId,
+    step_id: &str,
+    item_index: u32,
+) -> Option<(StepRunState, Option<String>)> {
+    recover_run(conn, run_id)
+        .expect("the run is recoverable")
+        .steps
+        .iter()
+        .find(|s| s.step_id == step_id && s.item_index == Some(item_index))
+        .map(|row| (row.state, row.error.clone()))
+}
+
+/// Every `awaiting_human` form a park put in the log, in the order they were
+/// emitted — §8.11's *"an `AwaitingHuman` task with a JSON-Schema form"*,
+/// which is the only thing a human is ever actually shown.
+fn awaiting_human_forms(sink: &RecordingSink) -> Vec<Value> {
+    sink.emitted
+        .iter()
+        .filter_map(|(_, payload)| match payload {
+            EventPayload::TaskCreated {
+                input: TaskInput::Json(v),
+                ..
+            } => v.get("awaiting_human").cloned(),
+            _ => None,
+        })
+        .collect()
+}
+
+/// A `map` whose inner steps are a nested `gate:` and a free `emit:`, with the
+/// gate's own `when:` reading the item — so one fixture can hold items that
+/// need a human and items that do not.
+///
+/// The gate is **first**, so an item that wants to park has no other inner
+/// step's row to make it look started: the park's own durable record is the
+/// only thing that can.
+fn map_over_gate(max_parallel: u32) -> String {
+    format!(
+        "steps:\n\
+         \x20 - id: fan\n\
+         \x20   map:\n\
+         \x20     over: \"${{{{ inputs.items }}}}\"\n\
+         \x20     as: item\n\
+         \x20     max_parallel: {max_parallel}\n\
+         \x20     on_item_error: continue\n\
+         \x20   steps:\n\
+         \x20     - id: approve\n\
+         \x20       when: \"${{{{ item.gated }}}}\"\n\
+         \x20       gate:\n\
+         \x20         title: \"ship ${{{{ item.name }}}}?\"\n\
+         \x20         form: {{ approve: {{ type: boolean }} }}\n\
+         \x20         timeout: 24h\n\
+         \x20         on_timeout: deny\n\
+         \x20     - id: done\n\
+         \x20       emit: {{ shipped: \"${{{{ item.name }}}}\" }}\n"
+    )
+}
+
+/// `[{name: item-0, gated: <g0>}, ..]` — one object per entry of `gated`.
+fn gated_items(gated: &[bool]) -> Value {
+    Value::Array(
+        gated
+            .iter()
+            .enumerate()
+            .map(|(i, g)| serde_json::json!({ "name": format!("item-{i}"), "gated": g }))
+            .collect(),
+    )
+}
+
+/// **The task's headline case.** An item's nested `gate:` parks the run;
+/// answering it resumes exactly that item; and the siblings — one that had
+/// already completed, one that had not started — are untouched by either the
+/// park or the answer.
+#[test]
+fn a_map_items_nested_gate_parks_the_run_and_its_answer_resumes_exactly_that_item() {
+    let mut conn = open_test_db();
+    let (run_id, session_id) = seed_run(&mut conn);
+    let def = parse_workflow(&workflow(&map_over_gate(3))).expect("fixture parses");
+    let mut sink = RecordingSink::default();
+    let mut host = FakeHost::new();
+    let mut run_ctx = ctx(run_id);
+    run_ctx.inputs = serde_json::json!({ "items": gated_items(&[false, true, true]) });
+
+    let first = run_workflow(
+        &mut conn,
+        &def,
+        run_id,
+        &mut sink,
+        &mut host,
+        run_ctx.clone(),
+        at(100),
+        None,
+    )
+    .expect("the run drives to the item's gate");
+
+    let RunOutcome::Parked(parked) = first else {
+        panic!("a `map` item's nested gate must park the run, got {first:?}");
+    };
+    assert_eq!(
+        parked.item_index,
+        Some(1),
+        "item 0's gate is skipped by its own `when:`, so the first item that needs a human is 1"
+    );
+    assert_eq!(parked.session_id, session_id);
+    assert_eq!(
+        parked.awaiting_until,
+        Some(at(100 + 24 * 3600)),
+        "the nested gate's own `timeout:` decides the wait, exactly as a top-level one's does"
+    );
+    assert_eq!(
+        recover_run(&conn, run_id).unwrap().run.state,
+        RunState::AwaitingHuman
+    );
+    assert_eq!(host.checkpoints.len(), 1, "§8.11's implicit checkpoint ran");
+
+    // The durable record §8.11's resume needs: *which item*, at *which inner
+    // step*.
+    assert_eq!(
+        item_step_row(&conn, run_id, "approve", 1).map(|r| r.0),
+        Some(StepRunState::Running),
+        "the parked item's own gate row is what says the map is mid-fan-out at this item"
+    );
+    // The sibling that finished before the park.
+    assert_eq!(
+        item_step_row(&conn, run_id, "approve", 0).map(|r| r.0),
+        Some(StepRunState::Skipped)
+    );
+    assert_eq!(
+        item_step_row(&conn, run_id, "done", 0).map(|r| r.0),
+        Some(StepRunState::Completed)
+    );
+    // The sibling that wanted to park too: only one park can be live, so it
+    // is left with no row at all rather than a second park's worth of state.
+    assert_eq!(item_step_row(&conn, run_id, "approve", 2), None);
+
+    let forms = awaiting_human_forms(&sink);
+    assert_eq!(forms.len(), 1, "exactly one human is asked: {forms:?}");
+    assert_eq!(
+        forms[0]["item_index"], 1,
+        "the form says which item is being asked about: {:?}",
+        forms[0]
+    );
+    assert_eq!(
+        forms[0]["form_schema"]["title"], "ship item-1?",
+        "the title is interpolated against the item that parked: {:?}",
+        forms[0]
+    );
+
+    // The human answers item 1's gate. Item 0 is inherited, item 1 finishes,
+    // and item 2 — which wanted to park in the first wave too — takes its
+    // turn now that the run is drivable again.
+    let second = run_workflow(
+        &mut conn,
+        &def,
+        run_id,
+        &mut sink,
+        &mut host,
+        run_ctx.clone(),
+        at(200),
+        Some(Resume::Gate(GateAnswer {
+            step_id: "approve".into(),
+            item_index: Some(1),
+            output: serde_json::json!({ "approve": true }),
+        })),
+    )
+    .expect("the answer releases the park");
+
+    let RunOutcome::Parked(second_park) = second else {
+        panic!("item 2's gate has no answer, so the map parks again, got {second:?}");
+    };
+    assert_eq!(
+        second_park.item_index,
+        Some(2),
+        "the siblings' parks resolve one at a time, in item order"
+    );
+    let forms = awaiting_human_forms(&sink);
+    assert_eq!(
+        forms.last().map(|f| f["source"].clone()),
+        Some(serde_json::json!("gate")),
+        "**the hazard the `resuming_map` guard closes**: the parked `map`'s own row is \
+         `Indeterminate` on this entry, so without it §8.10 tier 2 would re-park the run on a \
+         crash question about a `map` that never crashed: {forms:?}"
+    );
+    assert_eq!(
+        item_step_row(&conn, run_id, "approve", 1).map(|r| r.0),
+        Some(StepRunState::Completed),
+        "the answered item's gate is settled, not re-presented"
+    );
+    assert_eq!(
+        item_step_row(&conn, run_id, "done", 1).map(|r| r.0),
+        Some(StepRunState::Completed),
+        "and the item carried on past its gate"
+    );
+
+    let third = run_workflow(
+        &mut conn,
+        &def,
+        run_id,
+        &mut sink,
+        &mut host,
+        run_ctx,
+        at(300),
+        Some(Resume::Gate(GateAnswer {
+            step_id: "approve".into(),
+            item_index: Some(2),
+            output: serde_json::json!({ "approve": false }),
+        })),
+    )
+    .expect("the answer releases the second park");
+
+    let RunOutcome::Terminal { state, .. } = &third else {
+        panic!("every gate is answered, so the map finishes, got {third:?}");
+    };
+    assert_eq!(*state, RunState::Completed);
+    let output = map_output(&third, "fan");
+    let entries = output["items"].as_array().expect("one entry per item");
+    assert_eq!(
+        entries
+            .iter()
+            .map(|e| e["status"].as_str().unwrap_or("?"))
+            .collect::<Vec<_>>(),
+        vec!["completed", "completed", "completed"],
+        "every item ran its own inner steps to the end: {entries:?}"
+    );
+    assert_eq!(
+        entries
+            .iter()
+            .map(|e| e["output"]["shipped"].as_str().unwrap_or("?"))
+            .collect::<Vec<_>>(),
+        vec!["item-0", "item-1", "item-2"],
+        "each item's own `as:` binding survived its own park: {entries:?}"
+    );
+    let shipped_emits = sink
+        .emitted
+        .iter()
+        .filter(|(_, p)| match p {
+            EventPayload::TaskCreated {
+                input: TaskInput::Json(v),
+                ..
+            } => v.get("shipped").is_some(),
+            _ => false,
+        })
+        .count();
+    assert_eq!(
+        shipped_emits, 3,
+        "one `emit:` per item and no more — a resumed park must not re-run a sibling's \
+         already-completed inner step"
+    );
+}
+
+/// **The cooperative half, which is the whole reason a park request is not a
+/// park.** A wave that discovers one item wants a human must still dispatch
+/// the real work its other items decided they need — §8.13's cancel semantics
+/// applied to a park: nothing already in flight is abandoned, and nothing the
+/// wave has already decided to start is withheld.
+#[test]
+fn a_wave_still_dispatches_its_other_items_work_before_a_nested_gates_park_takes_effect() {
+    use roundhouse_flow::exec::run_loop::{PendingWork, WorkDone, WorkStatus};
+
+    let body = "steps:\n\
+         \x20 - id: fan\n\
+         \x20   map:\n\
+         \x20     over: \"${{ inputs.items }}\"\n\
+         \x20     as: item\n\
+         \x20     max_parallel: 1\n\
+         \x20     on_item_error: continue\n\
+         \x20   steps:\n\
+         \x20     - id: build\n\
+         \x20       tool: shell\n\
+         \x20       with: { cmd: [echo, \"${{ item }}\"] }\n\
+         \x20     - id: approve\n\
+         \x20       gate:\n\
+         \x20         title: \"ship ${{ item }}?\"\n\
+         \x20         form: { approve: { type: boolean } }\n\
+         \x20         timeout: 24h\n\
+         \x20         on_timeout: deny\n";
+    let mut conn = open_test_db();
+    let (run_id, _) = seed_run(&mut conn);
+    let def = parse_workflow(&workflow(body)).expect("fixture parses");
+    let mut sink = RecordingSink::default();
+    let mut host = FakeHost::new();
+    let mut run_ctx = ctx(run_id);
+    run_ctx.inputs = serde_json::json!({ "items": map_items(2) });
+
+    // What the loop asked to have dispatched, across every wave — the tally
+    // the closing assertion reads, since a `map` mid-fan-out must never ask
+    // for the same item's work twice.
+    let mut dispatched: Vec<(String, Option<u32>)> = Vec::new();
+
+    /// Answers a wave the way the daemon would, recording what it was asked
+    /// to dispatch.
+    fn answer(
+        pending: &[PendingWork],
+        dispatched: &mut Vec<(String, Option<u32>)>,
+    ) -> Vec<WorkDone> {
+        pending
+            .iter()
+            .map(|p| {
+                dispatched.push((p.step_id.clone(), p.item_index));
+                WorkDone {
+                    step_id: p.step_id.clone(),
+                    item_index: p.item_index,
+                    status: WorkStatus::Completed,
+                    output: serde_json::json!({ "built": p.item_index }),
+                    output_is_secret_derived: false,
+                    task_id: Some(TaskId::new()),
+                    first_task_seq: None,
+                    last_task_seq: None,
+                }
+            })
+            .collect()
+    }
+
+    // Wave 1: `max_parallel: 1`, so only item 0's `build` goes out.
+    let first = run_workflow(
+        &mut conn,
+        &def,
+        run_id,
+        &mut sink,
+        &mut host,
+        run_ctx.clone(),
+        at(10),
+        None,
+    )
+    .expect("the run drives");
+    let RunOutcome::AwaitingWork { pending } = first else {
+        panic!("item 0's `build` is real work, got {first:?}");
+    };
+    assert_eq!(
+        pending
+            .iter()
+            .map(|p| (p.step_id.as_str(), p.item_index))
+            .collect::<Vec<_>>(),
+        vec![("build", Some(0))]
+    );
+
+    // Wave 2: item 0 reaches its gate and asks to park — and item 1's `build`
+    // is dispatched anyway. This is the assertion the whole mechanism exists
+    // for: the run is still `Running`, and no checkpoint has been taken.
+    let second = run_workflow(
+        &mut conn,
+        &def,
+        run_id,
+        &mut sink,
+        &mut host,
+        run_ctx.clone(),
+        at(20),
+        Some(Resume::Work(answer(&pending, &mut dispatched))),
+    )
+    .expect("the run drives");
+    let RunOutcome::AwaitingWork { pending } = second else {
+        panic!(
+            "the wave must drain before the park takes effect: item 1's `build` still needs \
+             dispatching, got {second:?}"
+        );
+    };
+    assert_eq!(
+        pending
+            .iter()
+            .map(|p| (p.step_id.as_str(), p.item_index))
+            .collect::<Vec<_>>(),
+        vec![("build", Some(1))],
+        "item 0 wants a human, but item 1's real work is not withheld for it"
+    );
+    assert_eq!(
+        recover_run(&conn, run_id).unwrap().run.state,
+        RunState::Running,
+        "a park request is not a park: the run is not suspended while work is outstanding"
+    );
+    assert!(
+        host.checkpoints.is_empty(),
+        "and §8.11's implicit checkpoint has not been taken either"
+    );
+    assert_eq!(
+        item_step_row(&conn, run_id, "approve", 0),
+        None,
+        "nor is any durable park record written for a request that did not park"
+    );
+
+    // Wave 3: nothing is left to dispatch, so the park finally takes effect —
+    // on item 0, the first item that asked.
+    let third = run_workflow(
+        &mut conn,
+        &def,
+        run_id,
+        &mut sink,
+        &mut host,
+        run_ctx,
+        at(30),
+        Some(Resume::Work(answer(&pending, &mut dispatched))),
+    )
+    .expect("the run drives");
+    let RunOutcome::Parked(parked) = third else {
+        panic!("with the wave drained, the deferred park takes effect, got {third:?}");
+    };
+    assert_eq!(parked.item_index, Some(0));
+    assert_eq!(
+        recover_run(&conn, run_id).unwrap().run.state,
+        RunState::AwaitingHuman
+    );
+    assert_eq!(
+        item_step_row(&conn, run_id, "build", 1).map(|r| r.0),
+        Some(StepRunState::Completed),
+        "item 1's dispatch was answered and recorded before the park, not discarded by it"
+    );
+    assert_eq!(
+        dispatched,
+        vec![
+            ("build".to_string(), Some(0)),
+            ("build".to_string(), Some(1)),
+        ],
+        "each item's `build` was asked for exactly once: a park deferred across a wave must not \
+         re-dispatch the work that wave already did"
+    );
+}
+
+/// Two siblings reaching their own gates in one wave is an ordinary shape,
+/// and only one park can be live at a time (§8.11). They resolve **in
+/// sequence** — one park, one answer, the next park — rather than
+/// simultaneously, and rather than deadlocking because neither can park.
+#[test]
+fn two_items_wanting_to_park_in_one_wave_resolve_one_at_a_time() {
+    let mut conn = open_test_db();
+    let (run_id, _) = seed_run(&mut conn);
+    let def = parse_workflow(&workflow(&map_over_gate(2))).expect("fixture parses");
+    let mut sink = RecordingSink::default();
+    let mut host = FakeHost::new();
+    let mut run_ctx = ctx(run_id);
+    run_ctx.inputs = serde_json::json!({ "items": gated_items(&[true, true]) });
+
+    let mut parked_items: Vec<Option<u32>> = Vec::new();
+    let mut resume: Option<Resume> = None;
+    let mut segments = 0usize;
+    let terminal = loop {
+        segments += 1;
+        assert!(
+            segments <= MAX_SEGMENTS,
+            "the run has been re-entered {segments} times without reaching a terminal state: \
+             parks so far {parked_items:?}"
+        );
+        let outcome = run_workflow(
+            &mut conn,
+            &def,
+            run_id,
+            &mut sink,
+            &mut host,
+            run_ctx.clone(),
+            at(100 * segments as i64),
+            resume.take(),
+        )
+        .expect("the run drives");
+        match outcome {
+            RunOutcome::Parked(parked) => {
+                parked_items.push(parked.item_index);
+                resume = Some(Resume::Gate(GateAnswer {
+                    step_id: "approve".into(),
+                    item_index: parked.item_index,
+                    output: serde_json::json!({ "approve": true }),
+                }));
+            }
+            other => break other,
+        }
+    };
+
+    assert_eq!(
+        parked_items,
+        vec![Some(0), Some(1)],
+        "both items want a human in the first wave; the run parks on one, and the other takes \
+         its turn once that one is answered"
+    );
+    let RunOutcome::Terminal { state, .. } = &terminal else {
+        panic!("both gates are answered, so the map finishes, got {terminal:?}");
+    };
+    assert_eq!(*state, RunState::Completed);
+    assert_eq!(
+        host.checkpoints.len(),
+        2,
+        "one implicit checkpoint per park, not one for a batch of them"
+    );
+    let forms = awaiting_human_forms(&sink);
+    assert_eq!(
+        forms
+            .iter()
+            .map(|f| f["item_index"].clone())
+            .collect::<Vec<_>>(),
+        vec![serde_json::json!(0), serde_json::json!(1)],
+        "each park asks about exactly one item: {forms:?}"
+    );
+}
+
+/// **A park is a durable suspension, so the entry that answers it continues
+/// the drive that took it.** A sibling item this same drive already failed
+/// must therefore be inherited, not re-decided: re-deciding it would
+/// re-dispatch a `shell` step that already ran and already failed, once per
+/// park the fan-out takes.
+#[test]
+fn a_sibling_item_that_failed_before_the_park_is_not_re_dispatched_by_the_answer() {
+    use roundhouse_flow::exec::run_loop::{WorkDone, WorkStatus};
+
+    let body = "steps:\n\
+         \x20 - id: fan\n\
+         \x20   map:\n\
+         \x20     over: \"${{ inputs.items }}\"\n\
+         \x20     as: item\n\
+         \x20     max_parallel: 2\n\
+         \x20     on_item_error: continue\n\
+         \x20   steps:\n\
+         \x20     - id: build\n\
+         \x20       tool: shell\n\
+         \x20       with: { cmd: [echo, \"${{ item.name }}\"] }\n\
+         \x20     - id: approve\n\
+         \x20       when: \"${{ item.gated }}\"\n\
+         \x20       gate:\n\
+         \x20         title: \"ship ${{ item.name }}?\"\n\
+         \x20         form: { approve: { type: boolean } }\n\
+         \x20         timeout: 24h\n\
+         \x20         on_timeout: deny\n";
+    let mut conn = open_test_db();
+    let (run_id, _) = seed_run(&mut conn);
+    let def = parse_workflow(&workflow(body)).expect("fixture parses");
+    let mut sink = RecordingSink::default();
+    let mut host = FakeHost::new();
+    let mut run_ctx = ctx(run_id);
+    run_ctx.inputs = serde_json::json!({ "items": gated_items(&[false, true]) });
+
+    let mut waves: Vec<Wave> = Vec::new();
+    let mut resume: Option<Resume> = None;
+    let terminal = loop {
+        assert!(
+            waves.len() <= MAX_SEGMENTS,
+            "the run never reached a terminal state; waves so far: {waves:?}"
+        );
+        let outcome = run_workflow(
+            &mut conn,
+            &def,
+            run_id,
+            &mut sink,
+            &mut host,
+            run_ctx.clone(),
+            at(10),
+            resume.take(),
+        )
+        .expect("the run drives");
+        match outcome {
+            RunOutcome::AwaitingWork { pending } => {
+                waves.push(
+                    pending
+                        .iter()
+                        .map(|p| (p.step_id.clone(), p.item_index))
+                        .collect(),
+                );
+                // Item 0's `build` fails; item 1's succeeds and carries it on
+                // to its gate.
+                resume = Some(Resume::Work(
+                    pending
+                        .iter()
+                        .map(|p| WorkDone {
+                            step_id: p.step_id.clone(),
+                            item_index: p.item_index,
+                            status: if p.item_index == Some(0) {
+                                WorkStatus::Failed {
+                                    message: "the build broke".to_string(),
+                                }
+                            } else {
+                                WorkStatus::Completed
+                            },
+                            output: Value::Null,
+                            output_is_secret_derived: false,
+                            task_id: Some(TaskId::new()),
+                            first_task_seq: None,
+                            last_task_seq: None,
+                        })
+                        .collect(),
+                ));
+            }
+            RunOutcome::Parked(parked) => {
+                assert_eq!(parked.item_index, Some(1));
+                resume = Some(Resume::Gate(GateAnswer {
+                    step_id: "approve".into(),
+                    item_index: parked.item_index,
+                    output: serde_json::json!({ "approve": true }),
+                }));
+            }
+            other => break other,
+        }
+    };
+
+    assert_eq!(
+        waves,
+        vec![vec![
+            ("build".to_string(), Some(0)),
+            ("build".to_string(), Some(1)),
+        ]],
+        "one wave: item 0's failed `build` must not be dispatched a second time when the \
+         answer to item 1's gate re-enters the run: {waves:?}"
+    );
+    let output = map_output(&terminal, "fan");
+    let entries = output["items"].as_array().expect("one entry per item");
+    assert_eq!(entries[0]["status"], "failed");
+    assert_eq!(
+        entries[0]["error"], "the build broke",
+        "the failure this drive already decided is carried, not re-derived: {entries:?}"
+    );
+    assert_eq!(entries[1]["status"], "completed");
+}
+
+/// A park spans a resume even more surely than a dispatch does — it waits for
+/// a human — so an item holding a worktree is refused at its gate for exactly
+/// the reason it is refused at a dispatch, with the worktree still released.
+#[test]
+fn an_items_worktree_cannot_span_a_nested_gates_park_either() {
+    let provider = Arc::new(CountingWorktreeProvider::default());
+    let (conn, run_id, sink, waves, result) = drive_waves_with_context(
+        "steps:\n\
+         \x20 - id: fan\n\
+         \x20   map:\n\
+         \x20     over: \"${{ inputs.items }}\"\n\
+         \x20     as: item\n\
+         \x20     on_item_error: continue\n\
+         \x20     isolation: worktree\n\
+         \x20   steps:\n\
+         \x20     - id: approve\n\
+         \x20       gate:\n\
+         \x20         title: \"ship it?\"\n\
+         \x20         form: { approve: { type: boolean } }\n\
+         \x20         timeout: 1h\n\
+         \x20         on_timeout: deny\n",
+        &[],
+        |run_ctx| {
+            run_ctx.inputs = serde_json::json!({ "items": map_items(2) });
+            run_ctx.worktree_provider = Some(provider.clone());
+        },
+    );
+    let outcome = result.expect("the run drives");
+
+    assert!(waves.is_empty(), "nothing is dispatched: {waves:?}");
+    assert!(
+        awaiting_human_forms(&sink).is_empty(),
+        "and nobody is asked, because the park is refused before it is taken"
+    );
+    assert_eq!(
+        recover_run(&conn, run_id).unwrap().run.state,
+        RunState::Completed,
+        "the run is not left suspended on a park that was refused"
+    );
+    let output = map_output(&outcome, "fan");
+    let entries = output["items"].as_array().expect("one entry per item");
+    assert_eq!(entries.len(), 2);
+    for entry in entries {
+        assert_eq!(entry["status"], "failed");
+        assert!(
+            entry["error"]
+                .as_str()
+                .is_some_and(|e| e.contains("isolation: worktree") && e.contains("parks the run")),
+            "the refusal names the suspension it is about: {entry:?}"
+        );
+    }
+    let materialized = provider.materialized.lock().expect("not poisoned").clone();
+    assert_eq!(materialized.len(), 2, "one worktree per item");
+    assert_eq!(
+        provider.released.lock().expect("not poisoned").clone(),
+        materialized,
+        "every worktree the refusal abandoned is still released"
+    );
+}
+
+/// A `map` is one step of the run, so §8.4's admission charges it once —
+/// however many of its items park. The companion of
+/// [`a_map_step_is_admitted_once_however_many_waves_it_takes`] for the other
+/// way a `map` is re-entered, and the same comparison: two runs of one
+/// fixture differing only in whether its items need a human.
+#[test]
+fn a_map_is_admitted_once_however_many_of_its_items_park() {
+    fn drive_to_terminal(gated: &[bool]) -> (Connection, RunId) {
+        let mut conn = open_test_db();
+        let (run_id, _) = seed_run(&mut conn);
+        let def = parse_workflow(&workflow(&map_over_gate(2))).expect("fixture parses");
+        let mut sink = RecordingSink::default();
+        let mut host = FakeHost::new();
+        let mut run_ctx = ctx(run_id);
+        run_ctx.inputs = serde_json::json!({ "items": gated_items(gated) });
+        let mut resume: Option<Resume> = None;
+        for segment in 1..=MAX_SEGMENTS {
+            let outcome = run_workflow(
+                &mut conn,
+                &def,
+                run_id,
+                &mut sink,
+                &mut host,
+                run_ctx.clone(),
+                at(100 * segment as i64),
+                resume.take(),
+            )
+            .expect("the run drives");
+            match outcome {
+                RunOutcome::Parked(parked) => {
+                    resume = Some(Resume::Gate(GateAnswer {
+                        step_id: "approve".into(),
+                        item_index: parked.item_index,
+                        output: serde_json::json!({ "approve": true }),
+                    }))
+                }
+                RunOutcome::Terminal { .. } => return (conn, run_id),
+                other => panic!("this fixture dispatches nothing, got {other:?}"),
+            }
+        }
+        panic!("the run never reached a terminal state");
+    }
+
+    let (parking_conn, parking_run) = drive_to_terminal(&[true, true]);
+    let (quiet_conn, quiet_run) = drive_to_terminal(&[false, false]);
+    assert_eq!(
+        run_ledger(&parking_conn, parking_run)
+            .expect("ledger")
+            .spent
+            .tasks,
+        run_ledger(&quiet_conn, quiet_run)
+            .expect("ledger")
+            .spent
+            .tasks,
+        "a `map` re-admitted once per park would charge three tasks in the run whose items \
+         both needed a human and one in the run whose items did not"
+    );
+}
+
+/// A nested gate cannot park a run from `finally:` for the same reason a
+/// top-level one cannot (§8.13: the cancel must converge) — the item fails
+/// with the reason on its own row rather than suspending a run that is
+/// ending.
+#[test]
+fn a_nested_gate_inside_finally_fails_its_item_rather_than_parking_a_run_that_is_ending() {
+    let mut conn = open_test_db();
+    let (run_id, _) = seed_run(&mut conn);
+    let def = parse_workflow(&workflow(
+        "steps:\n\
+         \x20 - id: work\n\
+         \x20   emit: { a: 1 }\n\
+         finally:\n\
+         \x20 - id: fan\n\
+         \x20   map:\n\
+         \x20     over: \"${{ inputs.items }}\"\n\
+         \x20     as: item\n\
+         \x20     on_item_error: continue\n\
+         \x20   steps:\n\
+         \x20     - id: approve\n\
+         \x20       gate:\n\
+         \x20         title: \"one more thing?\"\n\
+         \x20         form: { ok: { type: boolean } }\n\
+         \x20         timeout: 1h\n\
+         \x20         on_timeout: deny\n",
+    ))
+    .expect("fixture parses");
+    let mut sink = RecordingSink::default();
+    let mut host = FakeHost::new();
+    let mut run_ctx = ctx(run_id);
+    run_ctx.inputs = serde_json::json!({ "items": map_items(2) });
+    let outcome = run_workflow(
+        &mut conn,
+        &def,
+        run_id,
+        &mut sink,
+        &mut host,
+        run_ctx,
+        at(10),
+        None,
+    )
+    .expect("the run drives");
+    let RunOutcome::Terminal { .. } = &outcome else {
+        panic!("a `finally:` map must not park, got {outcome:?}");
+    };
+    assert!(host.checkpoints.is_empty(), "no park, so no checkpoint");
+    assert!(
+        awaiting_human_forms(&sink).is_empty(),
+        "and nobody was asked"
+    );
+    let output = map_output(&outcome, "fan");
+    let entries = output["items"].as_array().expect("one entry per item");
+    assert!(
+        entries.iter().all(|e| e["status"] == "failed"
+            && e["error"].as_str().is_some_and(|m| m.contains("finally:"))),
+        "each item's entry says why it could not park: {entries:?}"
+    );
+}
+
+/// **One human's answer must not resolve a question they were never shown.**
+/// A [`GateAnswer`] names a step id and an item index, and two `map` steps may
+/// declare inner gates under the same id — so an answer for the first map's
+/// item is scoped to that map, rather than also releasing the second map's
+/// item of the same index when the run drives on to it.
+#[test]
+fn a_nested_gate_answer_does_not_also_release_a_second_maps_gate_of_the_same_id() {
+    let body = "steps:\n\
+         \x20 - id: first\n\
+         \x20   map:\n\
+         \x20     over: \"${{ inputs.items }}\"\n\
+         \x20     as: item\n\
+         \x20     on_item_error: continue\n\
+         \x20   steps:\n\
+         \x20     - id: approve\n\
+         \x20       gate:\n\
+         \x20         title: \"first: ship ${{ item.name }}?\"\n\
+         \x20         form: { approve: { type: boolean } }\n\
+         \x20         timeout: 1h\n\
+         \x20         on_timeout: deny\n\
+         \x20 - id: second\n\
+         \x20   needs: [first]\n\
+         \x20   map:\n\
+         \x20     over: \"${{ inputs.items }}\"\n\
+         \x20     as: item\n\
+         \x20     on_item_error: continue\n\
+         \x20   steps:\n\
+         \x20     - id: approve\n\
+         \x20       gate:\n\
+         \x20         title: \"second: ship ${{ item.name }}?\"\n\
+         \x20         form: { approve: { type: boolean } }\n\
+         \x20         timeout: 1h\n\
+         \x20         on_timeout: deny\n";
+    let mut conn = open_test_db();
+    let (run_id, _) = seed_run(&mut conn);
+    let def = parse_workflow(&workflow(body)).expect("fixture parses");
+    let mut sink = RecordingSink::default();
+    let mut host = FakeHost::new();
+    let mut run_ctx = ctx(run_id);
+    run_ctx.inputs = serde_json::json!({ "items": gated_items(&[true]) });
+
+    let first = run_workflow(
+        &mut conn,
+        &def,
+        run_id,
+        &mut sink,
+        &mut host,
+        run_ctx.clone(),
+        at(10),
+        None,
+    )
+    .expect("the run drives");
+    assert!(
+        matches!(first, RunOutcome::Parked(_)),
+        "the first map's item parks, got {first:?}"
+    );
+
+    let second = run_workflow(
+        &mut conn,
+        &def,
+        run_id,
+        &mut sink,
+        &mut host,
+        run_ctx,
+        at(20),
+        Some(Resume::Gate(GateAnswer {
+            step_id: "approve".into(),
+            item_index: Some(0),
+            output: serde_json::json!({ "approve": true }),
+        })),
+    )
+    .expect("the answer releases the park");
+
+    assert!(
+        matches!(second, RunOutcome::Parked(_)),
+        "the second map's identically-named gate still has to be asked, got {second:?}"
+    );
+    assert_eq!(
+        item_step_row(&conn, run_id, "approve", 0).map(|r| r.0),
+        Some(StepRunState::Running),
+        "and it is waiting on its own park, not carrying the first map's answer"
+    );
+    let titles: Vec<String> = awaiting_human_forms(&sink)
+        .iter()
+        .map(|f| {
+            f["form_schema"]["title"]
+                .as_str()
+                .unwrap_or("?")
+                .to_string()
+        })
+        .collect();
+    assert_eq!(
+        titles,
+        vec!["first: ship item-0?", "second: ship item-0?"],
+        "two questions were asked, and the second is the second map's own: {titles:?}"
+    );
+}
+
+/// A gate answer's `item_index` decides **which list** it is validated
+/// against, so an answer filed at the wrong nesting level is refused rather
+/// than silently resolving a same-named gate at the other one.
+#[test]
+fn a_gate_answer_filed_at_the_wrong_nesting_level_is_refused() {
+    let nested = map_over_gate(1);
+    let top_level = "steps:\n\
+         \x20 - id: approve\n\
+         \x20   gate:\n\
+         \x20     title: \"ship it?\"\n\
+         \x20     form: { approve: { type: boolean } }\n\
+         \x20     timeout: 1h\n\
+         \x20     on_timeout: deny\n";
+
+    for (body, answer, why) in [
+        (
+            nested.as_str(),
+            GateAnswer {
+                step_id: "approve".into(),
+                item_index: None,
+                output: serde_json::json!({}),
+            },
+            "`approve` is a `map` inner step, so a top-level answer names no gate of the \
+             `steps:` phase",
+        ),
+        (
+            nested.as_str(),
+            GateAnswer {
+                step_id: "done".into(),
+                item_index: Some(0),
+                output: serde_json::json!({}),
+            },
+            "`done` is an `emit:` inner step, not a gate — injecting an output under its id \
+             would overwrite the value it is about to write",
+        ),
+        (
+            top_level,
+            GateAnswer {
+                step_id: "approve".into(),
+                item_index: Some(0),
+                output: serde_json::json!({}),
+            },
+            "a top-level gate has no item dimension, so an indexed answer names no nested gate",
+        ),
+    ] {
+        let (_, _, _, _, result) =
+            drive_with(body, 10, FakeHost::new(), Some(Resume::Gate(answer)));
+        assert!(
+            matches!(result, Err(RunLoopError::UnknownGateStep { .. })),
+            "{why}: got {result:?}"
+        );
+    }
 }

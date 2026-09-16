@@ -507,6 +507,7 @@ fn parked_run_resumes_after_host_restart_from_durable_step_rows() {
         Timestamp::from_unix_nanos(2),
         Some(Resume::Gate(GateAnswer {
             step_id: "approve".into(),
+            item_index: None,
             output: serde_json::json!({ "approved": true }),
         })),
     )
@@ -791,6 +792,7 @@ fn repark_replaces_the_previous_checkpoint_blob_reference() {
         on_timeout: roundhouse_flow::hitl::UncheckedOnTimeout::new(
             roundhouse_flow::parse::types::OnTimeout::Deny,
         ),
+        item_index: None,
     };
     let mut checkpointer = FileCheckpointer::new(workspace.path(), state.path());
 
@@ -838,6 +840,7 @@ fn failed_park_indexes_the_prepared_blob_for_garbage_collection() {
         on_timeout: roundhouse_flow::hitl::UncheckedOnTimeout::new(
             roundhouse_flow::parse::types::OnTimeout::Deny,
         ),
+        item_index: None,
     };
     let mut checkpointer = FileCheckpointer::with_quota(workspace.path(), state.path(), 0);
 

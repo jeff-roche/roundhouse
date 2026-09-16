@@ -6442,6 +6442,9 @@ mod child_run_tests {
                 Timestamp::from_unix_nanos(1_700_000_000_000_000_001),
                 Some(Resume::Gate(roundhouse_flow::exec::run_loop::GateAnswer {
                     step_id: "approve".into(),
+                    // A top-level `gate:` step, so no item dimension — see
+                    // `GateAnswer::item_index`.
+                    item_index: None,
                     output: serde_json::json!({ "approved": true }),
                 })),
             )

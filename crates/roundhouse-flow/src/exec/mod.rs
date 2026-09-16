@@ -1429,23 +1429,26 @@ impl<'a> Executor<'a> {
             //
             // 1. `Executor::run_to_completion`, the in-memory sequencer, which
             //    has no run row at all.
-            // 2. Either `map` inner-step loop, for a `gate:` or `call:`
-            //    nested inside a `map` — `map_step::dispatch_map_step`'s
-            //    in-memory one, and `run_loop::Loop::dispatch_map`'s
-            //    wave-driven one, which deliberately routes a nested
-            //    `gate:`/`call:` through this same generic arm rather than
-            //    growing arms of its own (Phase 8 Task 25.7 Task 2). §8.9's
-            //    own reference workflow nests a `gate:` that way, so this is
-            //    a real shape that is refused rather than an impossible one —
-            //    and it is refused for a structural reason, not an omission:
-            //    a park is a transition of *the run*, and one run cannot be
-            //    parked per-item; a nested `call:` needs the per-item budget
-            //    pool whose ceilings ruling P77 §C defers. (Task 34 closed
-            //    `map`'s worktree fan-out, and Phase 8 Task 25.7 Task 2
-            //    closed its per-item `tool:`/`agent:` dispatch; see
-            //    `run_loop::Loop::dispatch_map`'s own doc comment for what
-            //    that task deliberately left here.) Resolving the two
-            //    refusals above is Phase 8 Task 25.7's Tasks 6 and 7.
+            // 2. `map_step::dispatch_map_step`'s in-memory inner-step loop,
+            //    for a `gate:` or `call:` nested inside a `map`. That loop
+            //    runs under `Executor::run_to_completion`, so it is case 1
+            //    one level down: there is no run row to park and no child run
+            //    to fund, and §8.9's own reference workflow nests a `gate:`
+            //    that way, so this is a real shape refused rather than an
+            //    impossible one.
+            //
+            //    `run_loop::Loop::dispatch_map`'s wave-driven loop — the one
+            //    that *does* have a `Connection` — used to route both here
+            //    too (Phase 8 Task 25.7 Task 2). It no longer routes a
+            //    `gate:`: Phase 8 Task 25.7 Task 6 gave it an arm of its own
+            //    that parks the run on the item's behalf, cooperatively, once
+            //    its wave has drained. A nested `call:` still arrives here
+            //    from that loop, because it needs the per-item budget pool
+            //    whose ceilings ruling P77 §C defers; Task 7 owns it. (Task
+            //    34 closed `map`'s worktree fan-out and Task 2 closed its
+            //    per-item `tool:`/`agent:` dispatch; see
+            //    `run_loop::Loop::dispatch_map`'s own doc comment for what is
+            //    left.)
             //
             // Fix round 1, item 8: the message used to be
             // `format!("step kind {other:?} handled by a later task")` — a
