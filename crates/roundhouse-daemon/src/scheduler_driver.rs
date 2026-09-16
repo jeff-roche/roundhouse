@@ -803,6 +803,38 @@ enum PendingExecution {
     ChildParked,
 }
 
+/// The child-driving failures that must be observable without allowing a
+/// workspace, session, or run-loop error to carry raw workflow input into a
+/// log field.
+#[derive(Clone, Copy)]
+enum ChildDispatchFailure {
+    WorkspaceRegistryUnavailable,
+    WorkspaceUnresolvable,
+    SessionConstruction,
+    RunLoop,
+    Driver,
+}
+
+impl ChildDispatchFailure {
+    const fn kind(self) -> &'static str {
+        match self {
+            Self::WorkspaceRegistryUnavailable => "child_workspace_registry_unavailable",
+            Self::WorkspaceUnresolvable => "child_workspace_unresolvable",
+            Self::SessionConstruction => "child_session_construction",
+            Self::RunLoop => "child_run_loop",
+            Self::Driver => "child_driver",
+        }
+    }
+}
+
+fn park_child_after_failure(failure: ChildDispatchFailure) -> PendingExecution {
+    tracing::error!(
+        kind = failure.kind(),
+        "child workflow dispatch failed; leaving the parent and child nonterminal"
+    );
+    PendingExecution::ChildParked
+}
+
 /// How [`DeliveryExecutor::handle_run_outcome`] treats a run that reached
 /// `RunState::Cancelled` — see that method's own doc comment for the full
 /// reasoning. Every other terminal state (`Completed`, and every non-
@@ -1626,6 +1658,7 @@ impl DeliveryExecutor {
 
         let run_ctx = RunContext {
             inputs: serde_json::Value::Null,
+            inputs_secret_derived: false,
             vars: serde_json::Value::Null,
             secrets: HashMap::new(),
             run_id,
@@ -1802,6 +1835,7 @@ impl DeliveryExecutor {
 
         let run_ctx = RunContext {
             inputs: serde_json::Value::Null,
+            inputs_secret_derived: false,
             vars: serde_json::Value::Null,
             secrets: HashMap::new(),
             run_id,
@@ -2010,6 +2044,7 @@ impl DeliveryExecutor {
                     child_run_id,
                     child_session_id,
                     dispatch_input,
+                    inputs_secret_derived,
                     ..
                 } => {
                     let mut child_spec = session_spec.clone();
@@ -2017,9 +2052,17 @@ impl DeliveryExecutor {
                     let workspace = match self.resources.workspace_registry.as_ref() {
                         Some(registry) => match registry.resolve_by_id(child_spec.workspace) {
                             Ok(workspace) => workspace,
-                            Err(_) => return PendingExecution::ChildParked,
+                            Err(_) => {
+                                return park_child_after_failure(
+                                    ChildDispatchFailure::WorkspaceUnresolvable,
+                                );
+                            }
                         },
-                        None => return PendingExecution::ChildParked,
+                        None => {
+                            return park_child_after_failure(
+                                ChildDispatchFailure::WorkspaceRegistryUnavailable,
+                            );
+                        }
                     };
                     let child_session = match create_headless_session(
                         &self.resources,
@@ -2033,10 +2076,15 @@ impl DeliveryExecutor {
                     .await
                     {
                         Ok(session) => session,
-                        Err(_) => return PendingExecution::ChildParked,
+                        Err(_) => {
+                            return park_child_after_failure(
+                                ChildDispatchFailure::SessionConstruction,
+                            );
+                        }
                     };
                     let child_ctx = RunContext {
                         inputs: dispatch_input,
+                        inputs_secret_derived,
                         vars: serde_json::Value::Null,
                         secrets: HashMap::new(),
                         run_id: child_run_id,
@@ -2054,10 +2102,17 @@ impl DeliveryExecutor {
                         self.now(),
                     ))
                     .await;
-                    let Ok(Ok(DrivenRun::Outcome(RunOutcome::Terminal { state, .. }))) =
-                        child_outcome
-                    else {
-                        return PendingExecution::ChildParked;
+                    let state = match child_outcome {
+                        Ok(Ok(DrivenRun::Outcome(RunOutcome::Terminal { state, .. }))) => state,
+                        Ok(Ok(
+                            DrivenRun::ChildParked | DrivenRun::Outcome(RunOutcome::Parked(_)),
+                        )) => return PendingExecution::ChildParked,
+                        Ok(Err(_)) => {
+                            return park_child_after_failure(ChildDispatchFailure::RunLoop);
+                        }
+                        Err(_) | Ok(Ok(DrivenRun::Outcome(RunOutcome::AwaitingWork { .. }))) => {
+                            return park_child_after_failure(ChildDispatchFailure::Driver);
+                        }
                     };
                     child_session
                         .teardown(&self.sessions, &self.resources.proxy)
@@ -3931,6 +3986,19 @@ mod delivery_tests {
             .to_string()
     }
 
+    fn child_parking_workflow() -> String {
+        "name: child-gate\nversion: 1\npermissions:\n  default: deny\n  unattended:\n    \
+         escalate: fail\nsteps:\n  - id: approve\n    gate:\n      title: approve\n      \
+         form: { approved: { type: boolean } }\n      timeout: 1h\n      on_timeout: deny\n"
+            .to_string()
+    }
+
+    fn parent_calling_child_gate_workflow() -> String {
+        "name: parent-call-gate\nversion: 1\npermissions:\n  default: deny\n  unattended:\n    \
+         escalate: fail\nsteps:\n  - id: child\n    call: child-gate\n    with: {}\n"
+            .to_string()
+    }
+
     fn allow_read_rules() -> crate::session_bootstrap::PolicyRuleSource {
         Arc::new(|| {
             vec![CompiledRule::test_new(
@@ -3974,6 +4042,71 @@ mod delivery_tests {
          escalate: fail\nsteps:\n  - id: approve\n    gate:\n      title: approve\n      \
          form: { approved: { type: boolean } }\n      timeout: 1h\n      on_timeout: deny\n"
             .to_string()
+    }
+
+    #[derive(Clone, Default)]
+    struct CapturingWriter(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for CapturingWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturingWriter {
+        type Writer = CapturingWriter;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    #[test]
+    fn child_dispatch_failures_log_only_static_categories() {
+        let captured = CapturingWriter::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(captured.clone())
+            .with_ansi(false)
+            .finish();
+
+        tracing::subscriber::with_default(subscriber, || {
+            for failure in [
+                ChildDispatchFailure::WorkspaceRegistryUnavailable,
+                ChildDispatchFailure::WorkspaceUnresolvable,
+                ChildDispatchFailure::SessionConstruction,
+                ChildDispatchFailure::RunLoop,
+                ChildDispatchFailure::Driver,
+            ] {
+                assert!(matches!(
+                    park_child_after_failure(failure),
+                    PendingExecution::ChildParked
+                ));
+            }
+        });
+
+        let rendered = String::from_utf8(captured.0.lock().unwrap().clone())
+            .expect("the tracing subscriber emits UTF-8");
+        for kind in [
+            "child_workspace_registry_unavailable",
+            "child_workspace_unresolvable",
+            "child_session_construction",
+            "child_run_loop",
+            "child_driver",
+        ] {
+            assert!(
+                rendered.contains(kind),
+                "missing child failure category {kind}: {rendered}"
+            );
+        }
+        assert!(
+            !rendered.contains("sk-child-secret"),
+            "child failure logs must not contain raw dispatched input: {rendered}"
+        );
     }
 
     struct Harness {
@@ -4637,6 +4770,75 @@ mod delivery_tests {
                 .count(),
             1,
             "the real read task must be filed under the child session"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_child_gate_keeps_the_parent_delivery_running() {
+        let harness = harness(parent_calling_child_gate_workflow()).await;
+        let child_source = harness.workspace_root.join("child.yaml");
+        std::fs::write(&child_source, child_parking_workflow()).unwrap();
+        let root = harness.workspace_root.clone();
+        let conn = harness.store.pool.get().await.unwrap();
+        conn.interact(move |connection| {
+            register_workflow_file(connection, &root, &child_source, template()).unwrap();
+        })
+        .await
+        .unwrap();
+
+        harness
+            .executor
+            .claim_and_run(harness.delivery.clone(), harness.stored.clone())
+            .await;
+
+        let row = harness.delivery_row().await;
+        let parent_run_id = RunId::from_uuid(
+            Uuid::parse_str(row.run_id.as_deref().expect("reserve stamps a run id")).unwrap(),
+        );
+        let conn = harness.store.pool.get().await.unwrap();
+        let (parent_call_state, child_run_id, child_session_id) = conn
+            .interact(move |connection| {
+                let parent_call_state: String = connection
+                    .query_row(
+                        "SELECT state FROM workflow_step_run WHERE run_id = ?1 AND step_id = ?2",
+                        [parent_run_id.to_string(), "child".to_string()],
+                        |row| row.get(0),
+                    )
+                    .unwrap();
+                let (child_run_id, child_session_id) = connection
+                    .query_row(
+                        "SELECT id, session_id FROM workflow_run WHERE parent_run_id = ?1",
+                        [parent_run_id.to_string()],
+                        |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+                    )
+                    .unwrap();
+                (
+                    parent_call_state,
+                    RunId::from_uuid(Uuid::parse_str(&child_run_id).unwrap()),
+                    SessionId::from_uuid(Uuid::parse_str(&child_session_id).unwrap()),
+                )
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(row.state, DeliveryState::Running);
+        assert_eq!(
+            harness.active(),
+            1,
+            "the live parent keeps its admission slot"
+        );
+        assert_eq!(
+            parent_call_state, "running",
+            "the parent must not fabricate a terminal child result"
+        );
+        assert_eq!(
+            harness.run_state(child_run_id).await,
+            RunState::AwaitingHuman,
+            "the child gate must remain in its explicit nonterminal state"
+        );
+        assert!(
+            harness.sessions.actor(child_session_id).is_some(),
+            "the parked child session must remain live for a later gate answer"
         );
     }
 

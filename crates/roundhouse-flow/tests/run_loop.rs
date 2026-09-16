@@ -297,6 +297,7 @@ fn seed_run(conn: &mut Connection) -> (RunId, SessionId) {
 fn ctx(run_id: RunId) -> RunContext {
     RunContext {
         inputs: serde_json::json!({}),
+        inputs_secret_derived: false,
         vars: serde_json::json!({}),
         secrets: HashMap::new(),
         run_id,
@@ -1288,6 +1289,7 @@ fn a_call_step_suspends_until_its_child_result_arrives() {
         child_session_id,
         parent_task_id,
         dispatch_input,
+        ..
     } = &pending[0].kind
     else {
         panic!("a call creates pending child work");
@@ -2697,6 +2699,97 @@ fn a_calls_with_block_is_needle_redacted_on_its_way_into_the_parents_log() {
     let logged = format!("{:?}", sink.emitted);
     assert!(!logged.contains("sk-typed-straight-in"), "got {logged}");
     assert!(logged.contains("***"), "got {logged}");
+}
+
+/// A child must inherit secret provenance from its parent's interpolated
+/// `call.with`, even though the child receives the resolved value as `inputs`.
+/// The daemon uses this bit to bind the child's whole `inputs` root as secret
+/// derived, conservatively redacting any later use rather than leaking it.
+#[test]
+fn a_calls_secret_derived_with_block_marks_the_child_inputs_secret_derived() {
+    let mut conn = open_test_db();
+    let (run_id, _) = seed_run(&mut conn);
+    let def = parse_workflow(&workflow(
+        "steps:\n\
+         \x20 - id: sub\n\
+         \x20   call: child-flow\n\
+         \x20   with: { token: \"${{ secrets.TOKEN }}\" }\n",
+    ))
+    .expect("fixture parses");
+    let mut sink = RecordingSink::default();
+    let mut host = FakeHost::new().resolving("child-flow");
+    let mut run_ctx = ctx(run_id);
+    run_ctx
+        .secrets
+        .insert("TOKEN".into(), "sk-child-secret".into());
+
+    let outcome = run_workflow(
+        &mut conn,
+        &def,
+        run_id,
+        &mut sink,
+        &mut host,
+        run_ctx,
+        at(10),
+        None,
+    )
+    .expect("the parent reaches child dispatch");
+
+    let RunOutcome::AwaitingWork { pending } = outcome else {
+        panic!("the funded child awaits driving");
+    };
+    let roundhouse_flow::exec::run_loop::PendingKind::ChildRun {
+        inputs_secret_derived,
+        ..
+    } = &pending[0].kind
+    else {
+        panic!("the call creates pending child work");
+    };
+
+    assert!(
+        inputs_secret_derived,
+        "the child driver must receive the source interpolation's provenance"
+    );
+}
+
+#[test]
+fn secret_derived_inputs_are_redacted_when_a_child_uses_them() {
+    let mut conn = open_test_db();
+    let (run_id, _) = seed_run(&mut conn);
+    let def = parse_workflow(&workflow(
+        "steps:\n\
+         \x20 - id: expose_input\n\
+         \x20   emit: { token: \"${{ inputs.token }}\" }\n",
+    ))
+    .expect("fixture parses");
+    let mut sink = RecordingSink::default();
+    let mut host = FakeHost::new();
+    let mut run_ctx = ctx(run_id);
+    run_ctx.inputs = serde_json::json!({ "token": "sk-child-secret" });
+    run_ctx.inputs_secret_derived = true;
+
+    let outcome = run_workflow(
+        &mut conn,
+        &def,
+        run_id,
+        &mut sink,
+        &mut host,
+        run_ctx,
+        at(10),
+        None,
+    )
+    .expect("the child run completes");
+
+    assert!(matches!(outcome, RunOutcome::Terminal { .. }));
+    let logged = format!("{:?}", sink.emitted);
+    assert!(
+        !logged.contains("sk-child-secret"),
+        "a secret-derived child input must not reach the task log: {logged}"
+    );
+    assert!(
+        logged.contains("***"),
+        "the emitted value must be redacted: {logged}"
+    );
 }
 
 /// A gate answer names one gate, not whichever gate the loop reaches first.

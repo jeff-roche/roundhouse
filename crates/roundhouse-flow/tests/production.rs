@@ -175,6 +175,7 @@ fn open_file_db(path: &Path) -> Connection {
 fn context(run_id: RunId) -> RunContext {
     RunContext {
         inputs: Value::Object(Default::default()),
+        inputs_secret_derived: false,
         vars: Value::Object(Default::default()),
         secrets: Default::default(),
         run_id,

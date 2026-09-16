@@ -455,6 +455,10 @@ pub enum PendingKind {
         child_session_id: SessionId,
         parent_task_id: TaskId,
         dispatch_input: Value,
+        /// Whether `dispatch_input` was derived from a parent secret. The
+        /// daemon passes this to the child's `RunContext` so the child can
+        /// bind its complete `inputs` root conservatively as secret-derived.
+        inputs_secret_derived: bool,
     },
 }
 
@@ -1993,6 +1997,7 @@ impl<H: WorkflowHost> Loop<'_, H> {
             resolved_with.redacted_for_logging(),
             &executor.redaction_needles,
         );
+        let inputs_secret_derived = resolved_with.is_secret_derived();
         let dispatch_input = resolved_with.into_unredacted_for_dispatch();
         let parent_step = self.step_run(step, StepRunState::Running, None, None, None, None);
         if let Err(e) =
@@ -2026,6 +2031,7 @@ impl<H: WorkflowHost> Loop<'_, H> {
             child_session_id: called.session_id,
             parent_task_id: task_id,
             dispatch_input,
+            inputs_secret_derived,
         })
     }
 }

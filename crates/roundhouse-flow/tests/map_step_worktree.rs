@@ -239,6 +239,7 @@ fn run_ctx(
 ) -> RunContext {
     RunContext {
         inputs,
+        inputs_secret_derived: false,
         vars: serde_json::json!({}),
         secrets: HashMap::new(),
         run_id: roundhouse_flow::exec::RunId::new(),
@@ -258,6 +259,7 @@ fn secret_run_ctx(
     secrets.insert(key.to_string(), value.to_string());
     RunContext {
         inputs,
+        inputs_secret_derived: false,
         vars: serde_json::json!({}),
         secrets,
         run_id: roundhouse_flow::exec::RunId::new(),

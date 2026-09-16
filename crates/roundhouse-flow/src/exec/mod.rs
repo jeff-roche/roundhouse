@@ -348,6 +348,10 @@ pub trait TaskSink {
 #[derive(Clone)]
 pub struct RunContext {
     pub inputs: Value,
+    /// Whether `inputs` originated from a secret-derived interpolation. A
+    /// child `call:` carries this provenance in memory from its parent's
+    /// `with:` expression; callers otherwise set this to `false`.
+    pub inputs_secret_derived: bool,
     pub vars: Value,
     pub secrets: HashMap<String, String>,
     pub run_id: RunId,
@@ -417,18 +421,21 @@ impl fmt::Debug for RunContext {
     /// values (`{"GH_TOKEN": "sk-super-secret"}`), and `RunContext` is
     /// `pub`, `Clone`, and reachable from any caller's `tracing::debug!`,
     /// `dbg!`, or an `expect` on a `Result` that happens to embed one.
-    /// Prints only the sorted list of secret *names* — never their values —
-    /// alongside `inputs`/`vars` in full, since those are not secret-shaped
-    /// by this crate's own contract (a caller handing a resolved secret in
-    /// as `inputs`/`vars` rather than through `secrets` is a caller-side
-    /// misuse this type cannot detect, the same limitation `ExprContext`'s
-    /// own doc comment states for its "cannot tell a secret apart from any
-    /// other value" caveat).
+    /// Prints only the sorted list of secret *names* — never their values.
+    /// `inputs` are shown only when the caller marked them clean; a
+    /// secret-derived child input is rendered as the redaction placeholder.
+    /// `vars` remain visible because this crate has no provenance for them.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let mut secret_names: Vec<&str> = self.secrets.keys().map(String::as_str).collect();
         secret_names.sort_unstable();
-        f.debug_struct("RunContext")
-            .field("inputs", &self.inputs)
+        let mut debug = f.debug_struct("RunContext");
+        if self.inputs_secret_derived {
+            debug.field("inputs", &crate::expr::REDACTION_PLACEHOLDER);
+        } else {
+            debug.field("inputs", &self.inputs);
+        }
+        debug
+            .field("inputs_secret_derived", &self.inputs_secret_derived)
             .field("vars", &self.vars)
             .field("secrets", &secret_names)
             .field("run_id", &self.run_id)
@@ -775,19 +782,23 @@ impl<'a> Executor<'a> {
         let mut ctx = ExprContext::new();
         // Finding 8: bind everything the expression language needs besides
         // `steps` (set fresh on every iteration inside `run_to_completion`).
-        ctx.set_public("inputs", run_ctx.inputs);
+        if run_ctx.inputs_secret_derived {
+            ctx.set_secret("inputs", run_ctx.inputs);
+        } else {
+            ctx.set_public("inputs", run_ctx.inputs);
+        }
         ctx.set_public("vars", run_ctx.vars);
-        // Fix round 3 (ruling P33): bound through `set_secret`, not the
-        // non-secret `set_public` the three roots above use. That one call is
+        // Fix round 3 (ruling P33): `secrets` bind through `set_secret`.
+        // Secret-derived child inputs take the same conservative path above;
+        // every other root here is caller-asserted public. That call is
         // what makes every value any expression computes by reading through
         // `secrets` — a whole value, a field of a parsed JSON secret, its
         // length, a comparison against it — log as `***` while still reaching
         // the dispatched task for real.
         //
-        // The three `set_public` calls above are the assertions ruling P35
-        // makes load-bearing: `inputs`/`vars`/`run` are declared non-secret
-        // here, and a caller who routes a credential through `inputs` rather
-        // than `secrets` gets no taint on it. That boundary is pinned by
+        // The public bindings above are the assertions ruling P35 makes
+        // load-bearing: a caller who routes a credential through unmarked
+        // `inputs` rather than `secrets` gets no taint on it. That boundary is pinned by
         // `tests/exec_sequencing.rs`'s
         // `a_credential_handed_in_as_inputs_or_vars_instead_of_secrets_is_not_tainted_and_logs_in_cleartext`
         // so it is a red test, not a stale comment, if it ever changes.

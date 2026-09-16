@@ -38,6 +38,7 @@ impl TaskSink for RecordingSink {
 fn run_ctx(inputs: serde_json::Value) -> RunContext {
     RunContext {
         inputs,
+        inputs_secret_derived: false,
         vars: serde_json::json!({}),
         secrets: HashMap::new(),
         run_id: roundhouse_flow::exec::RunId::new(),
@@ -554,6 +555,7 @@ steps:
     secrets.insert("GH_TOKEN".to_string(), "sk-super-secret".to_string());
     let ctx = RunContext {
         inputs: serde_json::json!({}),
+        inputs_secret_derived: false,
         vars: serde_json::json!({}),
         secrets,
         run_id: roundhouse_flow::exec::RunId::new(),
@@ -595,6 +597,7 @@ fn secret_run_ctx(inputs: serde_json::Value, key: &str, value: &str) -> RunConte
     secrets.insert(key.to_string(), value.to_string());
     RunContext {
         inputs,
+        inputs_secret_derived: false,
         vars: serde_json::json!({}),
         secrets,
         run_id: roundhouse_flow::exec::RunId::new(),
@@ -854,6 +857,7 @@ fn run_id_bound_into_the_expression_context_is_the_one_from_run_context() {
     let run_id = roundhouse_flow::exec::RunId::new();
     let ctx = RunContext {
         inputs: serde_json::json!({}),
+        inputs_secret_derived: false,
         vars: serde_json::json!({}),
         secrets: HashMap::new(),
         run_id,
@@ -1207,6 +1211,7 @@ fn probe_emit(field: &str, secrets: &[(&str, &str)]) -> (serde_json::Value, serd
     }
     let ctx = RunContext {
         inputs: serde_json::json!({"clean": "ordinary-input-value"}),
+        inputs_secret_derived: false,
         vars: serde_json::json!({"list": [10, 11, 12]}),
         secrets: secret_map,
         run_id: roundhouse_flow::exec::RunId::new(),
@@ -1921,6 +1926,7 @@ steps:
     let mut sink = RecordingSink(Vec::new());
     let ctx = RunContext {
         inputs: serde_json::json!({}),
+        inputs_secret_derived: false,
         vars: serde_json::json!({}),
         secrets: HashMap::new(),
         run_id: roundhouse_flow::exec::RunId::new(),
@@ -2054,6 +2060,7 @@ steps:
     let mut sink = RecordingSink(Vec::new());
     let ctx = RunContext {
         inputs: serde_json::json!({"carried": "INPUTSCARRIEDSECRET"}),
+        inputs_secret_derived: false,
         vars: serde_json::json!({"carried": "VARSCARRIEDSECRET"}),
         secrets: HashMap::new(),
         run_id: roundhouse_flow::exec::RunId::new(),
@@ -2105,6 +2112,7 @@ steps:
             "carried": "INPUTSCARRIEDSECRET",
             "list": ["DERIVED-FROM-MISBOUND-0001", "x"],
         }),
+        inputs_secret_derived: false,
         vars: serde_json::json!({}),
         secrets,
         run_id: roundhouse_flow::exec::RunId::new(),
