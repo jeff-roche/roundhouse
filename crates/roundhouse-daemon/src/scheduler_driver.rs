@@ -4867,7 +4867,7 @@ mod delivery_tests {
         );
         let parent_session_id = row.session_id.expect("reserve stamps a session id");
         let conn = harness.store.pool.get().await.unwrap();
-        let (parent_call_state, parent_task_completions, child_run_id, child_session_id) = conn
+        let (parent_call_state, parent_terminal_task_events, child_run_id, child_session_id) = conn
             .interact(move |connection| {
                 let parent_call_state: String = connection
                     .query_row(
@@ -4876,7 +4876,7 @@ mod delivery_tests {
                         |row| row.get(0),
                     )
                     .unwrap();
-                let parent_task_completions = connection
+                let parent_terminal_task_events = connection
                     .prepare("SELECT payload FROM events WHERE session_id = ?1 ORDER BY seq")
                     .unwrap()
                     .query_map([parent_session_id.to_string()], |row| {
@@ -4888,6 +4888,8 @@ mod delivery_tests {
                         matches!(
                             serde_json::from_str::<EventPayload>(payload).unwrap(),
                             EventPayload::TaskCompleted { .. }
+                                | EventPayload::TaskFailed { .. }
+                                | EventPayload::TaskCancelled { .. }
                         )
                     })
                     .count();
@@ -4900,7 +4902,7 @@ mod delivery_tests {
                     .unwrap();
                 (
                     parent_call_state,
-                    parent_task_completions,
+                    parent_terminal_task_events,
                     RunId::from_uuid(Uuid::parse_str(&child_run_id).unwrap()),
                     SessionId::from_uuid(Uuid::parse_str(&child_session_id).unwrap()),
                 )
@@ -4924,8 +4926,9 @@ mod delivery_tests {
             "the parent must not fabricate a terminal child result"
         );
         assert_eq!(
-            parent_task_completions, 0,
-            "the parent agent task must not complete before Task 3 joins a child result"
+            parent_terminal_task_events, 0,
+            "the parent agent task must not reach any terminal event before Task 3 joins a child \
+             result"
         );
         assert!(
             harness.sessions.actor(parent_session_id).is_some(),
