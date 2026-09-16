@@ -1061,17 +1061,13 @@ async fn dispatch_mcp(
         .await
         .map_err(|e| format!("failed to record the dispatched MCP tool call starting: {e}"))?;
 
-    // Taint: `Taint::Tainted` (the conservative of the two values §6.8
-    // defines) — this codebase has no live per-session taint tracker today
-    // (nothing populates one across turns), so this is a fail-closed
-    // default for a field some future config rule may consult, not a
-    // measured "this session is untrustworthy" judgment. Revisit once a
-    // real taint tracker exists.
+    // Taint: this session's real, live, actor-local §6.8 taint (Task 25.5
+    // Task 4) — no longer a hardcoded conservative placeholder.
     let ctx = roundhouse_mcp::executor::TaskCtx {
         task: task_id,
         session: actor.session_id(),
         parent: Some(parent),
-        taint: roundhouse_policy::Taint::Tainted,
+        taint: actor.current_taint(),
     };
     let mcp_input = roundhouse_mcp::executor::TaskInput::Mcp {
         server,
@@ -1142,11 +1138,20 @@ async fn dispatch_mcp(
                 task_id,
                 TaskOutput::Text(rendered.clone()),
                 usage,
+                // §6.8 names "MCP results" explicitly as Untrusted — this
+                // is exactly that: content an MCP server returned, not
+                // something this session verified.
+                roundhouse_core::Trust::Untrusted,
                 1,
             );
             writer.append(completed).await.map_err(|e| {
                 format!("failed to record the dispatched MCP tool call completing: {e}")
             })?;
+            // §6.8: an MCP result is external, Untrusted content — once it
+            // has entered this session's context, the session's live taint
+            // stays Tainted until its next human turn, regardless of
+            // whether the call itself reported `is_error`.
+            actor.mark_tainted();
             if is_error {
                 Err(rendered)
             } else {
@@ -1535,6 +1540,9 @@ async fn dispatch_builtin(
                 task_id,
                 TaskOutput::Text(summary),
                 Usage::default(),
+                // A local builtin (read/write/edit/find/shell): nothing
+                // here entered context from outside the session.
+                roundhouse_core::Trust::Trusted,
                 1,
             );
             writer.append(completed).await.map_err(|e| {

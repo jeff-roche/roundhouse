@@ -241,7 +241,11 @@ impl Redactor {
                     n,
                 )
             }
-            EventPayload::TaskCompleted { output, usage } => {
+            EventPayload::TaskCompleted {
+                output,
+                usage,
+                trust,
+            } => {
                 let (output, n) = match output {
                     TaskOutput::Text(text) => {
                         let (redacted, n) = self.redact(&text);
@@ -253,7 +257,14 @@ impl Redactor {
                     }
                     other @ TaskOutput::Blob(_) => (other, 0),
                 };
-                (EventPayload::TaskCompleted { output, usage }, n)
+                (
+                    EventPayload::TaskCompleted {
+                        output,
+                        usage,
+                        trust,
+                    },
+                    n,
+                )
             }
             other => (other, 0),
         }

@@ -173,6 +173,11 @@ pub fn map_update(update: &AcpSessionUpdate) -> Option<EventPayload> {
         AcpSessionUpdate::StateUpdateIdle { stop_reason } => Some(EventPayload::TaskCompleted {
             output: TaskOutput::Text(stop_reason.clone()),
             usage: Usage::default(),
+            // §6.8 names "ACP external agent claims" explicitly as
+            // Untrusted — this is exactly that: a stop-reason string the
+            // external ACP agent itself reported, not something this
+            // session verified.
+            trust: roundhouse_core::Trust::Untrusted,
         }),
         AcpSessionUpdate::UsageUpdate { .. } => None,
     }

@@ -34,7 +34,7 @@ use roundhouse_net::policy::{EgressPolicy, HostPattern};
 use roundhouse_net::proxy::{LoopbackProxy, ProxyHandle, ProxyNotServingError};
 use roundhouse_policy::engine::{Decision, Outcome, PolicyEngine, RuleId};
 use roundhouse_policy::sealed::SealedContext;
-use roundhouse_policy::TaskParams;
+use roundhouse_policy::{Taint, TaskParams};
 use roundhouse_provider::RequestCtx;
 use roundhouse_sandbox::{Attestation, Child, CommandSpec, Handle, Isolate, IsolationError};
 use roundhouse_store::redact::Redactor;
@@ -291,6 +291,17 @@ pub struct SessionActor {
     /// a recorded `sub_agent_host_unavailable` failure, exactly as
     /// `agent_loop`'s MCP arm refuses an MCP call in a session with no host.
     sub_agent_host: RwLock<Option<Arc<dyn crate::tools::agent_spawn_tool::SubAgentHost>>>,
+    /// §6.8's `PolicyInput.taint`: the live, actor-local union of `Trust`
+    /// over everything that has entered this session's context since its
+    /// last human turn. Mirrors `mcp_resolved`'s own shape — a cache kept
+    /// current by explicit hook calls (`mark_tainted`,
+    /// `reset_taint_for_human_turn`), not a full event-log rehydration —
+    /// because, like `mcp_resolved`, every real `SessionActor` this session
+    /// ever runs as is freshly constructed (`create_real_session`,
+    /// `sub_agent_host`'s child constructor), never rehydrated from a prior
+    /// process's history. Starts `Taint::Trusted`: a session with nothing
+    /// yet in its context has, vacuously, ingested nothing untrusted.
+    taint: RwLock<Taint>,
 }
 
 impl SessionActor {
@@ -429,6 +440,7 @@ impl SessionActor {
             effective_tier,
             tool_defs,
             sub_agent_host: RwLock::new(None),
+            taint: RwLock::new(Taint::Trusted),
         }
     }
 
@@ -558,7 +570,46 @@ impl SessionActor {
             &self.sealed_context(),
             raw,
             env,
+            self.current_taint(),
         )
+    }
+
+    /// This session's current §6.8 taint — see the `taint` field's own doc
+    /// comment. A poisoned lock reads as `Taint::Tainted`, the fail-closed
+    /// direction (mirroring `mcp_resolved`'s fail-closed poisoned-lock
+    /// read): a reader that can't trust its own cache must assume the worse
+    /// case, not the better one.
+    pub fn current_taint(&self) -> Taint {
+        self.taint
+            .read()
+            .map(|guard| *guard)
+            .unwrap_or(Taint::Tainted)
+    }
+
+    /// Records that untrusted content has entered this session's context
+    /// (external ingestion — an MCP result, fetched web content, or a
+    /// tainted child session's return — per this session's resolved reading
+    /// of §6.8; see `docs/architecture/03-security-and-sandboxing.md` §6.8).
+    /// Union-only: once tainted, stays tainted until the next human turn.
+    /// A poisoned lock is left poisoned — `current_taint`'s fail-closed read
+    /// already treats that as `Tainted`, so there is nothing further to do
+    /// here that wouldn't also be a lie about having actually recorded it.
+    pub fn mark_tainted(&self) {
+        if let Ok(mut guard) = self.taint.write() {
+            *guard = Taint::Tainted;
+        }
+    }
+
+    /// Resets this session's taint at the start of a new human turn — the
+    /// one reset point §6.8's fold is defined against. Callers must be
+    /// genuinely human-submitted turns only (e.g.
+    /// `socket_server::run_submitted_turn`), never every internal
+    /// `run_chat_turn` iteration, which mints its own `Origin::User` `chat`
+    /// task on each agent-loop pass without a human having sent anything.
+    pub fn reset_taint_for_human_turn(&self) {
+        if let Ok(mut guard) = self.taint.write() {
+            *guard = Taint::Trusted;
+        }
     }
 
     /// Records which MCP servers this session actually resolved, so
@@ -834,7 +885,9 @@ impl SessionActor {
 
         let unsealed = self.policy.unsealed();
         let ctx = self.sealed_context();
-        let decision = self.policy.decide_sealed(&req.params, &ctx);
+        let decision = self
+            .policy
+            .decide_sealed(&req.params, &ctx, self.current_taint());
 
         // Task 25 fix-round-2 (security review): recorded AFTER the
         // decision is known, and describing the REAL outcome — fix-round-1

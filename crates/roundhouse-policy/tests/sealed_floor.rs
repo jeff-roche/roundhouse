@@ -31,7 +31,7 @@ fn sealed_floor_denies_ssh_write_even_with_an_explicit_config_allow_rule() {
         Predicate::fs_write_prefix(home.join(".ssh").to_str().unwrap()),
     )]);
 
-    let decision = policy.decide_sealed(&params, &ctx());
+    let decision = policy.decide_sealed(&params, &ctx(), Taint::Trusted);
     assert_eq!(decision.outcome, Outcome::Deny);
     assert_eq!(decision.rule.unwrap().0, "sealed:ssh-write");
 }
@@ -51,7 +51,7 @@ fn unsealed_flag_falls_through_to_config_and_is_recorded() {
     )])
     .with_unsealed(true);
 
-    let decision = policy.decide_sealed(&params, &ctx());
+    let decision = policy.decide_sealed(&params, &ctx(), Taint::Trusted);
     assert_eq!(
         decision.outcome,
         Outcome::Allow,
@@ -69,7 +69,7 @@ fn state_dir_write_is_sealed() {
     };
     let policy = PolicyEngine::from_rules(vec![]);
     assert_eq!(
-        policy.decide_sealed(&params, &c).outcome,
+        policy.decide_sealed(&params, &c, Taint::Trusted).outcome,
         Outcome::Deny,
         "§6.2 lists the state dir on the sealed floor, not just dotfiles"
     );
@@ -85,7 +85,7 @@ fn daemon_binary_write_is_sealed() {
     };
     let policy = PolicyEngine::from_rules(vec![]);
     assert_eq!(
-        policy.decide_sealed(&params, &c).outcome,
+        policy.decide_sealed(&params, &c, Taint::Trusted).outcome,
         Outcome::Deny,
         "§6.2 lists the daemon binary on the sealed floor"
     );
@@ -105,7 +105,7 @@ fn mcp_tool_on_an_unresolved_server_is_sealed_denied() {
         Predicate::mcp(ServerId("never-connected".into()), None),
     )]);
     assert_eq!(
-        policy.decide_sealed(&params, &c).outcome,
+        policy.decide_sealed(&params, &c, Taint::Trusted).outcome,
         Outcome::Deny,
         "§6.2: MCP tools on unresolved servers are sealed, even with an explicit allow rule"
     );
@@ -127,7 +127,7 @@ fn tier_shortfall_seals_every_task_kind_not_just_agent() {
         Predicate::fs_write_prefix("/workspace"),
     )]);
     assert_eq!(
-        policy.decide_sealed(&params, &c).outcome,
+        policy.decide_sealed(&params, &c, Taint::Trusted).outcome,
         Outcome::Deny,
         "attested_tier < requested_tier seals EVERY task in the session, not only Agent spawns (previous stub was hardcoded to Agent-only and `&& false`)"
     );
@@ -142,7 +142,7 @@ fn ssh_write_sibling_prefix_does_not_seal_match() {
         canonical: Ok(home.join(".sshfoo/authorized_keys")),
     };
     let policy = PolicyEngine::from_rules(vec![]);
-    let decision = policy.decide_sealed(&params, &ctx());
+    let decision = policy.decide_sealed(&params, &ctx(), Taint::Trusted);
     assert_eq!(
         decision.outcome,
         Outcome::Ask,
@@ -226,7 +226,7 @@ fn edit_on_authorized_keys_is_sealed_despite_allow_rule() {
         Outcome::Allow,
         Predicate::fs_edit_prefix(home.join(".ssh").to_str().unwrap()),
     )]);
-    let decision = policy.decide_sealed(&params, &ctx());
+    let decision = policy.decide_sealed(&params, &ctx(), Taint::Trusted);
     assert_eq!(decision.outcome, Outcome::Deny);
     assert_eq!(decision.rule.unwrap().0, "sealed:ssh-write");
 }
@@ -249,7 +249,7 @@ fn dotfile_write_is_sealed_denied_when_home_is_unset_fail_closed() {
         Outcome::Allow,
         Predicate::fs_write_prefix("/some/arbitrary/path/not/under/any/home"),
     )]);
-    let decision = policy.decide_sealed(&params, &c);
+    let decision = policy.decide_sealed(&params, &c, Taint::Trusted);
     assert_eq!(
         decision.outcome,
         Outcome::Deny,
@@ -264,7 +264,7 @@ fn priv_escalation_program_matches_absolute_path() {
         argv: vec!["whoami".into()],
     });
     let policy = PolicyEngine::from_rules(vec![]);
-    let decision = policy.decide_sealed(&params, &ctx());
+    let decision = policy.decide_sealed(&params, &ctx(), Taint::Trusted);
     assert_eq!(decision.outcome, Outcome::Deny);
     assert_eq!(decision.rule.unwrap().0, "sealed:priv-escalation-program");
 }

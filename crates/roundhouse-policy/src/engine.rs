@@ -1,4 +1,4 @@
-use crate::{FsOp, MemoryOp, Method, PolicyInput, ProviderId, ServerId, TaskParams};
+use crate::{FsOp, MemoryOp, Method, PolicyInput, ProviderId, ServerId, Taint, TaskParams};
 use roundhouse_core::{MemoryScope, PolicyDecision, SessionId, TeamId, Tier};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -642,6 +642,21 @@ impl CompiledRule {
         Self::new(scope, outcome, predicate, 0, RuleId("test".into()))
     }
 
+    /// [`Self::test_new`], but with an explicit `id` — needed to build a
+    /// rule shaped like a real synthesized grant (`id: "grant:<session>:
+    /// <task>"`, the exact prefix `PolicyEngine::decide_sealed`'s §6.8 taint
+    /// downgrade keys off — see that method's own doc comment) without
+    /// going through the full `approval::synthesize_grant` ceremony.
+    #[cfg(any(test, feature = "test-util"))]
+    pub fn test_new_with_id(
+        scope: Scope,
+        outcome: Outcome,
+        predicate: Predicate,
+        id: &str,
+    ) -> Self {
+        Self::new(scope, outcome, predicate, 0, RuleId(id.to_string()))
+    }
+
     /// Test-only sugar for a `Predicate::Shell` rule with an explicit
     /// `allow_interpreter` flag (bare program name, any argv).
     #[cfg(any(test, feature = "test-util"))]
@@ -756,10 +771,24 @@ impl PolicyEngine {
     /// documented escape is `round daemon --unsealed`, which must be recorded on
     /// every task in the session once `TaskSecurity`/attestation lands
     /// (Tasks 17/25), never silent.
+    ///
+    /// `taint` applies §6.8's taint-gated autonomy AFTER the sealed floor
+    /// and ordinary rule matching have already produced a `Decision`: an
+    /// `Allow` outcome whose matched rule is a synthesized standing grant
+    /// (identified by [`RuleId`]'s `"grant:"` prefix —
+    /// `approval::synthesize_grant`'s own id format, the only shape this
+    /// check recognizes) downgrades to `Ask` when `taint` is
+    /// [`Taint::Tainted`] AND `params` names one of §6.8's irreversible or
+    /// exfiltrating kinds ([`is_irreversible_or_exfiltrating`]). This is a
+    /// post-match downgrade, not a new `Predicate` variant — it cannot
+    /// upgrade `Ask`/`Deny`, and it never touches an author-configured
+    /// (non-grant) rule: §6.8 says "allow-**grants**," a human's standing
+    /// approval, not every `Allow` a project's own policy file authors.
     pub fn decide_sealed(
         &self,
         params: &TaskParams,
         ctx: &crate::sealed::SealedContext,
+        taint: Taint,
     ) -> Decision {
         if !self.unsealed {
             for rule in crate::sealed::sealed_rules() {
@@ -771,7 +800,7 @@ impl PolicyEngine {
                 }
             }
         }
-        self.decide(params)
+        downgrade_tainted_grant(self.decide(params), params, taint)
     }
 
     /// A path that fails to canonicalise is Deny, never Ask — a human cannot
@@ -912,8 +941,8 @@ impl PolicyEngine {
     /// Unattended runs default DenyAll (§6.4): an unmatched task is Deny, not
     /// the interactive default of Ask, because there is no human to answer the
     /// Ask. The sealed floor is still applied first.
-    pub fn decide_unattended(&self, params: &TaskParams) -> Decision {
-        let d = self.decide_sealed(params, &self.sealed_ctx());
+    pub fn decide_unattended(&self, params: &TaskParams, taint: Taint) -> Decision {
+        let d = self.decide_sealed(params, &self.sealed_ctx(), taint);
         if d.rule.is_none() && d.outcome == Outcome::Ask {
             Decision {
                 outcome: Outcome::Deny,
@@ -934,8 +963,62 @@ impl PolicyEngine {
 /// through the trait-object call path either.
 impl crate::Policy for PolicyEngine {
     fn decide(&self, input: &PolicyInput) -> PolicyDecision {
-        self.decide_sealed(&input.params, &self.sealed_ctx())
+        self.decide_sealed(&input.params, &self.sealed_ctx(), input.taint)
             .outcome
             .into()
+    }
+}
+
+/// §6.8's "irreversible or exfiltrating kinds": `http` non-GET, `git push`,
+/// a filesystem write, and an `agent` spawn. `message` is named in the same
+/// sentence but has no `TaskParams` variant of its own yet (nothing in this
+/// workspace dispatches a bus `message` through policy admission today) —
+/// omitted here, not silently assumed covered; add it the day that variant
+/// exists.
+///
+/// **`Fs { op: Write | Edit, .. }` is a deliberate widening of "writes
+/// OUTSIDE the workspace" to "every write."** Neither `TaskParams` nor
+/// `SealedContext` carries a workspace root `decide`/`decide_sealed` could
+/// compare a canonical path against — the workspace boundary is enforced
+/// entirely by which `prefix` a rule's own `Predicate::FsPrefix` happens to
+/// scope, not by a fact this function can independently derive. Rather than
+/// inventing new plumbing to reconstruct a boundary this layer was never
+/// given, this treats every write as in-scope for the downgrade — strictly
+/// more conservative (never under-protects) than the literal text, at the
+/// cost of also gating an in-workspace grant that the letter of §6.8 would
+/// leave alone. `TaskParams::Fs.canonical` is not consulted for the same
+/// reason `Predicate`'s own Fs matchers don't: it distinguishes "resolves
+/// safely" from "symlink-escape", not "inside" from "outside" a workspace.
+fn is_irreversible_or_exfiltrating(params: &TaskParams) -> bool {
+    match params {
+        TaskParams::Http { method, .. } => *method != Method::Get,
+        TaskParams::Git { subcommand, .. } => subcommand == "push",
+        TaskParams::Fs {
+            op: FsOp::Write | FsOp::Edit,
+            ..
+        } => true,
+        TaskParams::Agent { .. } => true,
+        _ => false,
+    }
+}
+
+/// The post-match half of §6.8's taint-gated autonomy — see
+/// [`PolicyEngine::decide_sealed`]'s own doc comment for the full contract.
+/// Free (not a method) because it needs nothing from `&self`: it only ever
+/// narrows an already-computed [`Decision`], never re-consults `self.rules`.
+fn downgrade_tainted_grant(decision: Decision, params: &TaskParams, taint: Taint) -> Decision {
+    if taint != Taint::Tainted || decision.outcome != Outcome::Allow {
+        return decision;
+    }
+    let is_grant = decision
+        .rule
+        .as_ref()
+        .is_some_and(|rule| rule.0.starts_with("grant:"));
+    if !is_grant || !is_irreversible_or_exfiltrating(params) {
+        return decision;
+    }
+    Decision {
+        outcome: Outcome::Ask,
+        rule: decision.rule,
     }
 }

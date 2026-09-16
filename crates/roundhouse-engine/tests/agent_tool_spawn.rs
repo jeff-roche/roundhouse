@@ -27,7 +27,7 @@ use roundhouse_core::{
     EventPayload, OnDegrade, SessionId, SessionSpec, SessionState, TaskKind, TeamId, Tier,
 };
 use roundhouse_engine::agent_loop::{run_agent_loop, AgentLoopConfig};
-use roundhouse_engine::agent_spawn::Budget;
+use roundhouse_engine::agent_spawn::{Budget, TaintSet};
 use roundhouse_engine::tool_catalog::{builtin_tool_defs, resolve_tool_target, ToolTarget};
 use roundhouse_engine::tools::agent_spawn_tool::{
     ChildSessionError, ChildSessionRequest, SubAgentHost,
@@ -220,6 +220,7 @@ struct CreatedChild {
     spec: SessionSpec,
     depth: u8,
     budget: Budget,
+    taint: TaintSet,
 }
 
 impl FakeHost {
@@ -279,6 +280,7 @@ impl SubAgentHost for FakeHost {
             spec: req.spec,
             depth: req.depth,
             budget: req.child_budget,
+            taint: req.taint,
         });
         Ok(())
     }
@@ -509,6 +511,43 @@ async fn a_model_issued_agent_call_creates_a_tracked_child_session() {
     assert!(
         failure_categories(&fx).await.is_empty(),
         "a successful spawn records no TaskFailed"
+    );
+}
+
+/// §6.8, Task 25.5 Task 4: "a child session's taint is seeded from its
+/// parent's current `TaintSet` at spawn time" — the request the real
+/// implementor receives must actually carry the parent's live taint, not a
+/// hardcoded placeholder.
+#[tokio::test]
+async fn a_tainted_parents_spawn_request_seeds_the_childs_taint() {
+    let dir = tempfile::tempdir().unwrap();
+    let fx = fixture(dir.path(), None).await;
+    fx.actor.mark_tainted();
+
+    drive(&fx, agent_args(300)).await;
+
+    let created = fx.host.created();
+    assert_eq!(created.len(), 1);
+    assert_eq!(
+        created[0].taint,
+        TaintSet { tainted: true },
+        "a tainted parent must seed its spawned child's session request as tainted too"
+    );
+}
+
+#[tokio::test]
+async fn a_clean_parents_spawn_request_seeds_an_untainted_child() {
+    let dir = tempfile::tempdir().unwrap();
+    let fx = fixture(dir.path(), None).await;
+
+    drive(&fx, agent_args(300)).await;
+
+    let created = fx.host.created();
+    assert_eq!(created.len(), 1);
+    assert_eq!(
+        created[0].taint,
+        TaintSet { tainted: false },
+        "a clean parent must not seed a spawned child's session request as tainted"
     );
 }
 

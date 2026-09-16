@@ -66,7 +66,16 @@ async fn seed_completed_task(
     }));
 
     writer
-        .append(RUNNER.record_task_completed(session_id, 0, now_ts(), task_id, output, usage, 1))
+        .append(RUNNER.record_task_completed(
+            session_id,
+            0,
+            now_ts(),
+            task_id,
+            output,
+            usage,
+            roundhouse_core::Trust::Trusted,
+            1,
+        ))
         .await
         .unwrap();
 }
@@ -377,6 +386,7 @@ async fn session_cost_rollup_tolerates_a_real_chat_shaped_completed_task() {
             chat_task,
             TaskOutput::Text(String::new()),
             Usage::default(),
+            roundhouse_core::Trust::Trusted,
             1,
         ))
         .await

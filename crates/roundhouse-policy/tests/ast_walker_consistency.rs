@@ -31,6 +31,7 @@ use roundhouse_policy::sealed::SealedContext;
 use roundhouse_policy::shell::classify::{parse_command, Classification, SessionEnv};
 use roundhouse_policy::shell::opaque::{classify_shell, ShellClassification};
 use roundhouse_policy::shell::pipeline::{decide_pipeline, decide_shell_command};
+use roundhouse_policy::Taint;
 use std::collections::HashSet;
 use std::path::PathBuf;
 
@@ -62,6 +63,7 @@ fn pipeline_walker_sees_a_dangerous_command_inside_a_c_style_for_loop_body() {
         &ctx(),
         "for ((i=0; i<1; i++)); do rm -rf /tmp/pwned1; done",
         &SessionEnv::default(),
+        Taint::Trusted,
     );
     assert_eq!(
         decision.outcome,
@@ -79,6 +81,7 @@ fn pipeline_walker_sees_a_dangerous_command_inside_a_nested_c_style_for_loop_bod
         &ctx(),
         "if true; then for ((i=0; i<1; i++)); do rm -rf /tmp/pwned2; done; fi",
         &SessionEnv::default(),
+        Taint::Trusted,
     );
     assert_eq!(
         decision.outcome,
@@ -165,7 +168,7 @@ fn classify_walker_expands_plain_variables_inside_a_c_style_for_loop_body() {
         Outcome::Deny,
         Predicate::argv_prefix("rm", &["-rf", "/tmp/pwned6"]),
     )]);
-    let decision = decide_pipeline(&policy, &ctx(), &cmd);
+    let decision = decide_pipeline(&policy, &ctx(), &cmd, Taint::Trusted);
 
     assert_eq!(
         decision.outcome,

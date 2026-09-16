@@ -1060,6 +1060,116 @@ async fn two_workspaces_keep_project_policy_and_filesystem_roots_separate_across
     assert_eq!(reopened.resolve("beta").unwrap().root, beta_root);
 }
 
+/// A single-turn scripted `Provider` returning one final text block and no
+/// tool calls — `ScriptedToolCallProvider` always opens with a `ToolUse`,
+/// which this test deliberately avoids so nothing but `run_submitted_turn`'s
+/// own reset touches the session's taint.
+struct ScriptedTextOnlyProvider {
+    text: String,
+}
+
+impl Provider for ScriptedTextOnlyProvider {
+    fn capabilities(&self, _model: &ModelId) -> Capabilities {
+        Capabilities::default()
+    }
+    fn resolve(&self, _req: &ChatRequest) -> Result<Plan, ProviderError> {
+        Ok(Plan {
+            endpoint: "fake".into(),
+        })
+    }
+    fn stream_chat<'a>(
+        &'a self,
+        _req: &'a ChatRequest,
+        _ctx: &'a RequestCtx,
+    ) -> BoxFut<'a, Result<ChatStream, ProviderError>> {
+        let text = self.text.clone();
+        Box::pin(async move {
+            let events = vec![
+                StreamEvent::BlockStart {
+                    index: 0,
+                    kind: BlockKind::Text,
+                },
+                StreamEvent::BlockDelta {
+                    index: 0,
+                    delta: BlockDelta::Text(text),
+                },
+                StreamEvent::BlockStop { index: 0 },
+                StreamEvent::MessageStop,
+            ];
+            Ok(ChatStream(Box::pin(stream::iter(events))))
+        })
+    }
+    fn count_tokens<'a>(
+        &'a self,
+        _req: &'a ChatRequest,
+        _ctx: &'a RequestCtx,
+    ) -> BoxFut<'a, Result<TokenCount, ProviderError>> {
+        Box::pin(async { Ok(TokenCount::default()) })
+    }
+    fn list_models<'a>(
+        &'a self,
+        _ctx: &'a RequestCtx,
+    ) -> BoxFut<'a, Result<Vec<ModelInfo>, ProviderError>> {
+        Box::pin(async { Ok(Vec::new()) })
+    }
+}
+
+/// §6.8, Task 25.5 Task 4: `run_submitted_turn` is the one real place a
+/// human turn genuinely starts (as distinct from `chat.rs`'s
+/// `run_chat_turn`, which mints its own `Origin::User` `chat` task on every
+/// internal agent-loop iteration) — it must reset the session's taint.
+#[tokio::test]
+async fn a_submitted_turn_resets_a_previously_tainted_session() {
+    let provider = Arc::new(ScriptedTextOnlyProvider {
+        text: "hello".to_string(),
+    });
+    let daemon = start_daemon(provider).await;
+
+    let mut creator = tokio::time::timeout(
+        Duration::from_secs(5),
+        roundhouse_tui::connect_create(&daemon.socket_path, "default"),
+    )
+    .await
+    .expect("connect_create must not hang")
+    .unwrap();
+    let session_id = creator.session_id();
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let actor = loop {
+        if let Some(actor) = daemon.registry.actor(session_id) {
+            break actor;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "timed out waiting for the real socket-created session's actor to register"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    };
+
+    actor.mark_tainted();
+    assert_eq!(actor.current_taint(), roundhouse_policy::Taint::Tainted);
+
+    creator
+        .send(&ClientRequest::SubmitTurn {
+            session_id,
+            text: "hello".to_string(),
+        })
+        .await
+        .unwrap();
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    loop {
+        if actor.current_taint() == roundhouse_policy::Taint::Trusted {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "timed out waiting for a submitted turn to reset this session's taint"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
 /// Phase 8, L5: a session created over the **real socket** must come out of
 /// `drive_session` able to spawn sub-agents.
 ///

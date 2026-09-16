@@ -2775,6 +2775,9 @@ fn persist_report(
         EventPayload::TaskCompleted {
             output: TaskOutput::Json(annotated),
             usage: Usage::default(),
+            // A run-synthesized report document, built from run state by
+            // this engine, not ingested from outside it.
+            trust: roundhouse_core::Trust::Trusted,
         },
     );
     Ok(())

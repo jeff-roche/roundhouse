@@ -1219,6 +1219,11 @@ impl<'a> Executor<'a> {
                     EventPayload::TaskCompleted {
                         output: TaskOutput::Json(logged),
                         usage: Usage::default(),
+                        // An authored `emit:` template, interpolated by this
+                        // engine against workflow context — bookkeeping,
+                        // like the sibling `Flow`/`Report` synthesis sites,
+                        // not external ingestion.
+                        trust: roundhouse_core::Trust::Trusted,
                     },
                 );
                 DispatchDecision::Done(StepOutcome {
@@ -1335,6 +1340,11 @@ impl<'a> Executor<'a> {
                             EventPayload::TaskCompleted {
                                 output: TaskOutput::Json(logged),
                                 usage: Usage::default(),
+                                // An authored `report:` document, validated
+                                // and persisted by this engine — same
+                                // bookkeeping classification as
+                                // `persist_report` (`run_loop.rs`).
+                                trust: roundhouse_core::Trust::Trusted,
                             },
                         );
                     }

@@ -2354,7 +2354,7 @@ mod tests {
         .unwrap();
         let policy = roundhouse_policy::engine::PolicyEngine::from_rules(vec![]);
         let ctx = roundhouse_policy::sealed::default_context();
-        let decision = policy.decide_sealed(&params, &ctx);
+        let decision = policy.decide_sealed(&params, &ctx, roundhouse_policy::Taint::Trusted);
         assert_eq!(
             decision.outcome,
             roundhouse_policy::engine::Outcome::Deny,
@@ -2427,7 +2427,7 @@ mod tests {
         });
         let policy = roundhouse_policy::engine::PolicyEngine::from_rules(vec![]);
         let ctx = roundhouse_policy::sealed::default_context();
-        let decision = policy.decide_sealed(&params, &ctx);
+        let decision = policy.decide_sealed(&params, &ctx, roundhouse_policy::Taint::Trusted);
         assert_eq!(
             decision.outcome,
             roundhouse_policy::engine::Outcome::Deny,

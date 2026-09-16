@@ -172,6 +172,15 @@ pub struct ChildSessionRequest {
     pub workspace_root: PathBuf,
     /// The parent's `(device, inode)` workspace identity, when it has one.
     pub workspace_identity: Option<(i64, i64)>,
+    /// [`crate::agent_spawn::AgentSpawnOutput::child_spec`]'s own `taint`
+    /// verbatim — §6.8's "a child session's taint is seeded from its
+    /// parent's current `TaintSet` at spawn time." The implementor must
+    /// apply this to the real child `SessionActor` it constructs (via
+    /// `SessionActor::mark_tainted` when `tainted`); a child left at its
+    /// constructor default of `Taint::Trusted` regardless of this field
+    /// would silently break the seed half of the spawn-boundary rule even
+    /// though the parent's own taint was computed correctly.
+    pub taint: crate::agent_spawn::TaintSet,
 }
 
 /// A child session could not be created or durably recorded.
@@ -440,6 +449,12 @@ pub async fn dispatch_agent(
                 task_id,
                 TaskOutput::Text(text.clone()),
                 Usage::default(),
+                // Not itself untrusted content — it's this call's own "a
+                // child now exists" bookkeeping. §6.8's taint from the
+                // child flows through the spawn-boundary merge instead
+                // (`merge_taint_on_child_return`), applied wherever the
+                // child is later driven to completion.
+                roundhouse_core::Trust::Trusted,
                 1,
             );
             writer.append(completed).await.map_err(|e| {
@@ -539,14 +554,10 @@ pub(crate) async fn spawn_child(
         role: args.role.clone(),
         provider: args.provider.clone(),
         budget_tokens: args.budget_tokens,
-        // §6.8 seeds the child's taint from the parent's CURRENT taint, and
-        // this workspace still has no live per-session taint tracker (see
-        // `agent_loop::dispatch_mcp`, which picks the same conservative value
-        // for the same reason). `Tainted` is the fail-closed of the two: a
-        // child can only ever be at least as restricted as its parent, never
-        // laundered clean by a tracker that does not exist yet. Revisit
-        // together with that call site once one does.
-        parent_taint: TaintSet { tainted: true },
+        // §6.8 seeds the child's taint from the parent's CURRENT, live,
+        // actor-local taint (Task 25.5 Task 4) — no longer a hardcoded
+        // conservative placeholder.
+        parent_taint: TaintSet::from_taint(actor.current_taint()),
     };
 
     let outcome = {
@@ -594,6 +605,7 @@ pub(crate) async fn spawn_child(
             spec: out.session_spec,
             workspace_root: actor.workspace_root().to_path_buf(),
             workspace_identity: actor.workspace_identity(),
+            taint: out.child_spec.taint,
         })
         .await;
     if let Err(err) = create {

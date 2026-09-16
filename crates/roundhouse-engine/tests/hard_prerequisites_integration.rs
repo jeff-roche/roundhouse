@@ -1219,6 +1219,7 @@ async fn a_c_style_arithmetic_for_loop_never_reaches_the_ast_walkers_through_the
         },
         &command,
         &roundhouse_policy::shell::classify::SessionEnv::default(),
+        roundhouse_policy::Taint::Trusted,
     );
     assert_eq!(
         walker_decision.outcome,

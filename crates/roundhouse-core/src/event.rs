@@ -4,7 +4,7 @@ use crate::session::{SessionOutcome, SessionPatch, SessionSpec, SessionState};
 use crate::task_kind::TaskKind;
 use crate::task_meta::{
     CancelReason, Envelope, Handle, IsolationAttestation, NoteLevel, Origin, PolicyDecision,
-    Progress, RuleId, SuspendReason, TaskError, TaskInput, TaskOutput, Usage,
+    Progress, RuleId, SuspendReason, TaskError, TaskInput, TaskOutput, Trust, Usage,
 };
 use crate::timestamp::Timestamp;
 use schemars::JsonSchema;
@@ -159,6 +159,22 @@ pub enum EventPayload {
     TaskCompleted {
         output: TaskOutput,
         usage: Usage,
+        /// §6.8's taint carry: this task's own contribution to the
+        /// session-taint fold — `Trust::Untrusted` for content that entered
+        /// context from outside the session (an MCP tool result or tool
+        /// description, a fetched `http` response), `Trust::Trusted`
+        /// otherwise (local tool execution, the model's own generated
+        /// text, a workflow-authored `emit:` value). See
+        /// `roundhouse_store::fold::session_taint` for the fold this feeds
+        /// and `docs/architecture/03-security-and-sandboxing.md` §6.8 for
+        /// the full mechanism.
+        ///
+        /// `#[serde(default)]`, defaulting to `Trust::Untrusted` (`Trust`'s
+        /// own `#[default]`) — fail-closed, so a row durably written before
+        /// this field existed still deserializes, and folds as tainted
+        /// rather than silently clean.
+        #[serde(default)]
+        trust: Trust,
     },
     TaskFailed {
         error: TaskError,

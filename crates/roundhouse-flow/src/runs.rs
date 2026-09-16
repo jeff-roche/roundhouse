@@ -444,6 +444,7 @@ pub fn seed_report_task(
             output_tokens: 0,
             cache_read_tokens: 0,
         },
+        trust: roundhouse_core::Trust::Trusted,
     })
     .expect("an EventPayload serializes to JSON");
 
@@ -509,6 +510,7 @@ mod tests {
                 output_tokens: 0,
                 cache_read_tokens: 0,
             },
+            trust: roundhouse_core::Trust::Trusted,
         };
         let serialized = roundhouse_store::serialize_payload(&payload)
             .expect("an EventPayload serializes to JSON");
@@ -533,6 +535,7 @@ mod tests {
                 output_tokens: 0,
                 cache_read_tokens: 0,
             },
+            trust: roundhouse_core::Trust::Trusted,
         };
         let serialized = roundhouse_store::serialize_payload(&payload)
             .expect("an EventPayload serializes to JSON");

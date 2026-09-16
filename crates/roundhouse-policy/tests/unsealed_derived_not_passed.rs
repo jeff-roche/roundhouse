@@ -31,7 +31,7 @@ use roundhouse_policy::engine::{CompiledRule, Outcome, PolicyEngine, Predicate, 
 use roundhouse_policy::sealed::{home_dir, SealedContext};
 use roundhouse_policy::shell::classify::SessionEnv;
 use roundhouse_policy::shell::pipeline::decide_shell_command;
-use roundhouse_policy::{FsOp, TaskParams};
+use roundhouse_policy::{FsOp, Taint, TaskParams};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
@@ -66,7 +66,7 @@ fn decide_sealed_derives_unsealed_from_the_engine_not_a_parameter() {
     // Compile-shape: decide_sealed now takes only (&self, &TaskParams,
     // &SealedContext) — no caller-supplied `unsealed` bool.
     let sealed = PolicyEngine::from_rules(vec![ssh_write_allow_rule(&home)]);
-    let decision = sealed.decide_sealed(&params, &ctx());
+    let decision = sealed.decide_sealed(&params, &ctx(), Taint::Trusted);
     assert_eq!(
         decision.outcome,
         Outcome::Deny,
@@ -76,7 +76,7 @@ fn decide_sealed_derives_unsealed_from_the_engine_not_a_parameter() {
     assert_eq!(decision.rule.unwrap().0, "sealed:ssh-write");
 
     let unsealed = PolicyEngine::from_rules(vec![ssh_write_allow_rule(&home)]).with_unsealed(true);
-    let decision = unsealed.decide_sealed(&params, &ctx());
+    let decision = unsealed.decide_sealed(&params, &ctx(), Taint::Trusted);
     assert_eq!(
         decision.outcome,
         Outcome::Allow,
@@ -108,7 +108,7 @@ fn decide_shell_command_derives_unsealed_from_the_engine_not_a_parameter() {
     // Compile-shape: decide_shell_command now takes only
     // (&PolicyEngine, &SealedContext, &str, &SessionEnv) — no `unsealed` bool.
     let sealed = engine_allowing_sudo();
-    let decision = decide_shell_command(&sealed, &ctx(), &cmdline, &env);
+    let decision = decide_shell_command(&sealed, &ctx(), &cmdline, &env, Taint::Trusted);
     assert_eq!(
         decision.outcome,
         Outcome::Deny,
@@ -118,7 +118,7 @@ fn decide_shell_command_derives_unsealed_from_the_engine_not_a_parameter() {
     assert_eq!(decision.rule.unwrap().0, "sealed:priv-escalation-program");
 
     let unsealed = engine_allowing_sudo().with_unsealed(true);
-    let decision = decide_shell_command(&unsealed, &ctx(), &cmdline, &env);
+    let decision = decide_shell_command(&unsealed, &ctx(), &cmdline, &env, Taint::Trusted);
     assert_eq!(
         decision.outcome,
         Outcome::Allow,

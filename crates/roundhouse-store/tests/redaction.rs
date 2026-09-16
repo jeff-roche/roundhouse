@@ -454,6 +454,7 @@ async fn task_completed_text_output_is_redacted() {
                 "exit_code=Some(0)\nstdout:\nyour key is sk-live-abc123\nstderr:\n".into(),
             ),
             roundhouse_core::Usage::default(),
+            roundhouse_core::Trust::Trusted,
             1,
         ))
         .await

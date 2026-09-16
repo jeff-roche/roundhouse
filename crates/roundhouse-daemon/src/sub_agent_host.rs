@@ -381,13 +381,22 @@ impl SubAgentHost for DaemonSubAgentHost {
         // what make §7.7's `MAX_DEPTH` and its budget conservation mean
         // anything beyond the first level.
         match self.registry.actor(req.child) {
-            Some(actor) => actor.register_sub_agent_host(Arc::new(DaemonSubAgentHost::for_child(
-                Arc::clone(&self.resources),
-                Arc::clone(&self.registry),
-                req.child,
-                req.depth,
-                req.child_budget,
-            ))),
+            Some(actor) => {
+                actor.register_sub_agent_host(Arc::new(DaemonSubAgentHost::for_child(
+                    Arc::clone(&self.resources),
+                    Arc::clone(&self.registry),
+                    req.child,
+                    req.depth,
+                    req.child_budget,
+                )));
+                // §6.8: "a child session's taint is seeded from its parent's
+                // current `TaintSet` at spawn time." A freshly constructed
+                // `SessionActor` already starts `Taint::Trusted`, so only
+                // the tainted case needs an explicit mark.
+                if req.taint.tainted {
+                    actor.mark_tainted();
+                }
+            }
             // `create_headless_session` returned `Ok`, which means it
             // registered this session — so the only way here is the child
             // being retired between that return and this line. Never silent:

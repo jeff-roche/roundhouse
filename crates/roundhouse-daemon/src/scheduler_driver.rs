@@ -1005,13 +1005,18 @@ fn flush_task_events(
                 input,
                 EVENT_SCHEMA_V,
             ),
-            EventPayload::TaskCompleted { output, usage } => runner.record_task_completed(
+            EventPayload::TaskCompleted {
+                output,
+                usage,
+                trust,
+            } => runner.record_task_completed(
                 session_id,
                 0,
                 now,
                 task_id,
                 output,
                 usage,
+                trust,
                 EVENT_SCHEMA_V,
             ),
             EventPayload::TaskFailed { error, retryable } => runner.record_task_failed(
@@ -1074,6 +1079,21 @@ fn unanswerable_work(step_id: String, message: String) -> WorkDone {
 /// confirmed, leaving the task for the next boot's recovery pass, exactly
 /// like `execute_pending_with_context`'s `PendingKind::Tool` timeout arm's
 /// identical `Err` branch.
+/// §6.8: "taint crosses the spawn boundary monotonically, in both
+/// directions" — on a driven child's return, the parent's taint becomes the
+/// union of its own and the child's. A pure, directly testable wrapper over
+/// `SessionActor::mark_tainted`/`current_taint` so [`DeliveryExecutor::
+/// drive_workflow_agent_child`]'s own merge point has a real, unit-testable
+/// seam independent of the full daemon harness.
+fn apply_taint_boundary_merge(
+    parent_actor: &roundhouse_engine::SessionActor,
+    child_actor: &roundhouse_engine::SessionActor,
+) {
+    if child_actor.current_taint() == roundhouse_policy::Taint::Tainted {
+        parent_actor.mark_tainted();
+    }
+}
+
 fn failed_work_done_after_recording(
     step_id: String,
     task_id: TaskId,
@@ -2904,6 +2924,12 @@ impl DeliveryExecutor {
         )
         .await;
 
+        // Read before `retire_child` (below) tears the child session down;
+        // applied regardless of how the drive itself concluded, since a
+        // child that ingested untrusted content (e.g. an MCP call) before
+        // later timing out or erroring still genuinely tainted its parent.
+        apply_taint_boundary_merge(parent_actor, &child_actor);
+
         self.resources
             .sub_agents
             .retire_child(
@@ -3123,6 +3149,13 @@ impl DeliveryExecutor {
                                     call.parent_task_id,
                                     TaskOutput::Json(report_json),
                                     Usage::default(),
+                                    // The parent-side synthesis of a joined
+                                    // child run's report — mirrors
+                                    // `record_workflow_task_completed`'s own
+                                    // `Trusted` wrapper classification for
+                                    // the same reason (Task 25.5's Task 4
+                                    // doc comment on that function).
+                                    roundhouse_core::Trust::Trusted,
                                     EVENT_SCHEMA_V,
                                 ),
                                 RunState::Failed => runner.record_task_failed(
@@ -7199,6 +7232,42 @@ mod child_run_tests {
             harness.resources.sub_agents.len(),
             0,
             "a driving FAILURE must still release the spawned child's fan-out slot, not just success"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_taint_boundary_merge_carries_a_tainted_childs_taint_onto_its_parent() {
+        let parent_dir = tempfile::tempdir().unwrap();
+        let child_dir = tempfile::tempdir().unwrap();
+        let parent = crate::test_support::real_actor(parent_dir.path()).await;
+        let child = crate::test_support::real_actor(child_dir.path()).await;
+
+        child.mark_tainted();
+        assert_eq!(parent.current_taint(), roundhouse_policy::Taint::Trusted);
+
+        apply_taint_boundary_merge(&parent, &child);
+
+        assert_eq!(
+            parent.current_taint(),
+            roundhouse_policy::Taint::Tainted,
+            "a tainted child's return must taint its parent, per §6.8's monotonic \
+             spawn-boundary union"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_taint_boundary_merge_leaves_a_clean_parent_untainted_by_a_clean_child() {
+        let parent_dir = tempfile::tempdir().unwrap();
+        let child_dir = tempfile::tempdir().unwrap();
+        let parent = crate::test_support::real_actor(parent_dir.path()).await;
+        let child = crate::test_support::real_actor(child_dir.path()).await;
+
+        apply_taint_boundary_merge(&parent, &child);
+
+        assert_eq!(
+            parent.current_taint(),
+            roundhouse_policy::Taint::Trusted,
+            "a clean child's return must not taint an already-clean parent"
         );
     }
 

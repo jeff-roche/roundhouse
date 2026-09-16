@@ -4,6 +4,7 @@ use roundhouse_policy::sealed::SealedContext;
 use roundhouse_policy::shell::classify::SessionEnv;
 use roundhouse_policy::shell::pipeline::decide_shell_command;
 use roundhouse_policy::FsOp;
+use roundhouse_policy::Taint;
 use std::collections::HashSet;
 use std::path::PathBuf;
 
@@ -42,6 +43,7 @@ fn conjunction_fails_closed_on_the_second_node_and_or() {
         &ctx(),
         "git status && rm -rf /",
         &SessionEnv::default(),
+        Taint::Trusted,
     );
     assert_eq!(
         decision.outcome,
@@ -58,6 +60,7 @@ fn conjunction_with_semicolon_also_fails_closed() {
         &ctx(),
         "git status; rm -rf /",
         &SessionEnv::default(),
+        Taint::Trusted,
     );
     assert_eq!(decision.outcome, Outcome::Deny);
 }
@@ -78,6 +81,7 @@ fn naive_substring_matching_would_wrongly_allow_this_and_must_not() {
         &ctx(),
         "falsely_ls_named_binary --danger",
         &SessionEnv::default(),
+        Taint::Trusted,
     );
     assert_ne!(
         decision.outcome,
@@ -95,7 +99,13 @@ fn redirection_target_is_evaluated_as_a_synthetic_write_task() {
     )]);
     let home = roundhouse_policy::sealed::home_dir().unwrap();
     let cmdline = format!("echo secret > {}/.ssh/authorized_keys", home.display());
-    let decision = decide_shell_command(&policy, &ctx(), &cmdline, &SessionEnv::default());
+    let decision = decide_shell_command(
+        &policy,
+        &ctx(),
+        &cmdline,
+        &SessionEnv::default(),
+        Taint::Trusted,
+    );
     assert_eq!(
         decision.outcome,
         Outcome::Deny,
@@ -114,7 +124,13 @@ fn opaque_construct_inside_a_pipeline_is_hard_denied_by_the_composed_entry_point
         Outcome::Allow,
         Predicate::program("sh"),
     )]);
-    let decision = decide_shell_command(&policy, &ctx(), "echo $(whoami)", &SessionEnv::default());
+    let decision = decide_shell_command(
+        &policy,
+        &ctx(),
+        "echo $(whoami)",
+        &SessionEnv::default(),
+        Taint::Trusted,
+    );
     assert_eq!(
         decision.outcome,
         Outcome::Deny,
@@ -144,6 +160,7 @@ fn arithmetic_for_loop_body_commands_are_policy_checked() {
         &ctx(),
         "echo start && for ((i=0;i<1;i++)); do rm -rf /tmp/pwned; done",
         &SessionEnv::default(),
+        Taint::Trusted,
     );
     assert_eq!(
         decision.outcome,
@@ -168,7 +185,13 @@ fn output_and_error_redirection_hits_the_sealed_floor() {
     )]);
     let home = roundhouse_policy::sealed::home_dir().unwrap();
     let cmdline = format!("echo secret &> {}/.ssh/authorized_keys", home.display());
-    let decision = decide_shell_command(&policy, &ctx(), &cmdline, &SessionEnv::default());
+    let decision = decide_shell_command(
+        &policy,
+        &ctx(),
+        &cmdline,
+        &SessionEnv::default(),
+        Taint::Trusted,
+    );
     assert_eq!(
         decision.outcome,
         Outcome::Deny,
@@ -189,7 +212,13 @@ fn duplicate_output_word_redirection_hits_the_sealed_floor() {
     )]);
     let home = roundhouse_policy::sealed::home_dir().unwrap();
     let cmdline = format!("echo secret >& {}/.ssh/authorized_keys", home.display());
-    let decision = decide_shell_command(&policy, &ctx(), &cmdline, &SessionEnv::default());
+    let decision = decide_shell_command(
+        &policy,
+        &ctx(),
+        &cmdline,
+        &SessionEnv::default(),
+        Taint::Trusted,
+    );
     assert_eq!(
         decision.outcome,
         Outcome::Deny,
@@ -226,7 +255,13 @@ fn input_redirection_is_evaluated_as_a_read_not_a_write() {
         CompiledRule::test_new(Scope::Project, Outcome::Allow, Predicate::program("cat")),
     ]);
     let cmdline = format!("cat < {}", secret.display());
-    let decision = decide_shell_command(&policy, &ctx(), &cmdline, &SessionEnv::default());
+    let decision = decide_shell_command(
+        &policy,
+        &ctx(),
+        &cmdline,
+        &SessionEnv::default(),
+        Taint::Trusted,
+    );
 
     let _ = std::fs::remove_dir_all(&dir);
 

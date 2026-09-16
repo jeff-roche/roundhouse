@@ -203,6 +203,7 @@ impl TaskRunner {
         task_id: TaskId,
         output: TaskOutput,
         usage: Usage,
+        trust: crate::Trust,
         schema_v: u16,
     ) -> Event {
         Event::new_sealed(
@@ -210,7 +211,11 @@ impl TaskRunner {
             seq,
             ts,
             Some(task_id),
-            EventPayload::TaskCompleted { output, usage },
+            EventPayload::TaskCompleted {
+                output,
+                usage,
+                trust,
+            },
             schema_v,
         )
     }

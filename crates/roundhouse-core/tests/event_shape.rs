@@ -1,5 +1,6 @@
 use roundhouse_core::{
-    Delta, Envelope, EventPayload, NoteLevel, Origin, TaskId, TaskInput, TaskKind, Timestamp,
+    Delta, Envelope, EventPayload, NoteLevel, Origin, TaskId, TaskInput, TaskKind, TaskOutput,
+    Timestamp, Trust, Usage,
 };
 
 #[test]
@@ -189,5 +190,50 @@ fn task_started_carries_an_optional_handle_for_long_running_tasks() {
             ..
         } => {}
         _ => panic!("expected Some(Handle::Pid(12345)) for a long-running task"),
+    }
+}
+
+// --- §6.8 taint carry — Phase 8 Task 25.5 (#62) Task 4 ---
+
+#[test]
+fn task_completed_carries_its_trust_level() {
+    let payload = EventPayload::TaskCompleted {
+        output: TaskOutput::Text("mcp result".into()),
+        usage: Usage::default(),
+        trust: Trust::Untrusted,
+    };
+    match payload {
+        EventPayload::TaskCompleted {
+            trust: Trust::Untrusted,
+            ..
+        } => {}
+        _ => panic!("expected TaskCompleted to carry Trust::Untrusted"),
+    }
+}
+
+#[test]
+fn an_old_schema_task_completed_row_with_no_trust_field_deserializes_as_untrusted() {
+    // A `TaskCompleted` serialized before `trust` existed — proves
+    // `#[serde(default)]` (fail-closed to `Trust::Untrusted`, `Trust`'s own
+    // `#[default]`) lets an old durable row keep deserializing rather than
+    // failing to parse, and that the default is the conservative one, not a
+    // silent "clean" assumption.
+    let old_schema_json = serde_json::json!({
+        "TaskCompleted": {
+            "output": { "Text": "old row, no trust field" },
+            "usage": Usage::default(),
+        }
+    });
+    let restored: EventPayload = serde_json::from_value(old_schema_json)
+        .expect("a pre-trust TaskCompleted row must still deserialize");
+    match restored {
+        EventPayload::TaskCompleted { trust, .. } => {
+            assert_eq!(
+                trust,
+                Trust::Untrusted,
+                "missing trust must default fail-closed"
+            );
+        }
+        other => panic!("expected TaskCompleted, got {other:?}"),
     }
 }

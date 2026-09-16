@@ -344,6 +344,10 @@ pub async fn dispatch_tool_for_workflow(
                 task_id,
                 TaskOutput::Json(output.clone()),
                 Usage::default(),
+                // The five allowlisted kinds (Read/Write/Edit/Find/Shell)
+                // are all local execution — nothing here entered context
+                // from outside the session.
+                roundhouse_core::Trust::Trusted,
                 1,
             );
             let last_task_seq = writer.append(completed).await.map_err(|e| {
@@ -463,6 +467,13 @@ pub async fn record_workflow_task_completed(
         task_id,
         TaskOutput::Json(output),
         Usage::default(),
+        // This wrapper event's own content (the parent-side synthesis of a
+        // driven child's result) is `Trusted` — the child's own turns
+        // already recorded their real `Trust` on their own session log, and
+        // §6.8's spawn-boundary union is applied separately, by
+        // `mark_tainted` on the parent actor when the child returns
+        // tainted, not by this event's own field.
+        roundhouse_core::Trust::Trusted,
         1,
     );
     actor

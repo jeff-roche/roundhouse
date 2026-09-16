@@ -179,6 +179,11 @@ async fn append_completed(
         // TaskOutput has no Default either — same fix; Usage does derive Default.
         TaskOutput::Text(String::new()),
         Usage::default(),
+        // A chat turn's own generated text is not an external-ingestion
+        // taint source (see the taint-fold's own doc comment) — only a
+        // real MCP/http result, or a returning child's merged taint,
+        // taints the session.
+        roundhouse_core::Trust::Trusted,
         1,
     );
     writer.append(event).await?;
