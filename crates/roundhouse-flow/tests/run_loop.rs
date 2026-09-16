@@ -5945,24 +5945,38 @@ fn read_tasks(sink: &RecordingSink) -> usize {
         .count()
 }
 
-/// What the daemon does the instant it takes a `PendingWork` for a `read`
-/// step: mint the task and log it. Separated from *answering* it, because the
-/// gap between the two is exactly where a crash leaves a dispatch that really
-/// happened with no answer to show for it.
-fn mint_read_task(sink: &mut RecordingSink) -> TaskId {
+/// What the daemon does the instant it takes a `PendingWork`: mint the task
+/// and log it. Separated from *answering* it, because the gap between the two
+/// is exactly where a crash leaves a dispatch that really happened with no
+/// answer to show for it.
+fn mint_task(sink: &mut RecordingSink, kind: TaskKind) -> TaskId {
     let task_id = TaskId::new();
     sink.emit(
         task_id,
         None,
-        TaskKind::Read,
+        kind.clone(),
         EventPayload::TaskCreated {
-            kind: TaskKind::Read,
+            kind,
             parent: None,
             origin: Origin::System,
             input: TaskInput::Json(serde_json::json!({})),
         },
     );
     task_id
+}
+
+/// The inner step a per-item cap refusal names, read back out of the message
+/// `per_item_dispatch_refusal` builds. `"?"` for an item that failed for any
+/// other reason, so a right-answer-wrong-reason pass is impossible.
+fn refused_inner_step(entry: &Value) -> String {
+    let error = entry["error"].as_str().unwrap_or_default();
+    if !error.contains("max_tool_calls") {
+        return "?".to_string();
+    }
+    error
+        .split_once("inner step `")
+        .and_then(|(_, rest)| rest.split_once('`'))
+        .map_or_else(|| "?".to_string(), |(id, _)| id.to_string())
 }
 
 /// Seeds a `Running` root run whose grant is `grant` rather than [`a_grant`]'s.
@@ -6017,13 +6031,20 @@ fn map_with_a_rerunnable_first_step() -> &'static str {
 /// its share nominally allows, per re-decide.
 ///
 /// **"Room to spare" is the load-bearing condition, and it is why this test
-/// has a sibling.** The re-decided step's own interrupted row is already in the
-/// snapshot, so it counts toward the tally its re-dispatch is measured against.
-/// Here the share is **two** and the row is the item's first, so one call is
-/// left and the re-dispatch goes out. When the share is one there is no such
-/// room, and the re-decided step's own re-dispatch is what gets refused — see
-/// `a_re_decided_inner_steps_own_re_dispatch_is_refused_when_the_share_is_one`,
-/// which is the same fixture and a smaller grant.
+/// has two siblings.** The re-decided step's own interrupted row is already in
+/// the snapshot, so it counts toward the tally its re-dispatch is measured
+/// against: with `P` other started steps and a ceiling of `allowed`, the
+/// re-dispatch proceeds exactly when `P + 1 < allowed`. This is the
+/// `P = 0, allowed = 2` instance, so one call is left and it goes out. The two
+/// `P + 1 >= allowed` instances — reached by a small share and by siblings
+/// eating the room — are
+/// `a_re_decided_inner_steps_own_re_dispatch_is_refused_when_the_share_is_one`
+/// and `a_re_decided_step_is_refused_at_itself_when_siblings_used_the_room_up`.
+///
+/// Note where refusal actually lands here, because it is *not* the step after
+/// the re-decided one: the re-dispatch leaves the running total at 1, so
+/// `build` proceeds, and it is `publish` — two steps later — that first finds
+/// the total at `allowed`.
 #[test]
 fn a_re_decided_inner_step_is_charged_to_the_item_once_however_often_it_dispatches() {
     let mut conn = open_test_db();
@@ -6063,7 +6084,7 @@ fn a_re_decided_inner_step_is_charged_to_the_item_once_however_often_it_dispatch
     // is the whole reason §8.10 tier 2 exists.
     for p in &pending {
         assert_eq!(p.item_index, Some(0));
-        mint_read_task(&mut sink);
+        mint_task(&mut sink, TaskKind::Read);
     }
     assert_eq!(read_tasks(&sink), 1, "item 0's first `probe` attempt");
 
@@ -6099,7 +6120,7 @@ fn a_re_decided_inner_step_is_charged_to_the_item_once_however_often_it_dispatch
     let answer = pending
         .iter()
         .map(|p| {
-            let task_id = mint_read_task(&mut sink);
+            let task_id = mint_task(&mut sink, TaskKind::Read);
             roundhouse_flow::exec::run_loop::WorkDone {
                 step_id: p.step_id.clone(),
                 item_index: p.item_index,
@@ -6135,7 +6156,8 @@ fn a_re_decided_inner_step_is_charged_to_the_item_once_however_often_it_dispatch
     assert_eq!(
         shell_tasks(&sink),
         2,
-        "one `build` each; neither item's `publish` is ever dispatched"
+        "`build` still fits for both items — the re-dispatch left the running total where it \
+         was — and neither item's `publish` does"
     );
 
     let RunOutcome::Terminal { steps, .. } = &outcome else {
@@ -6149,35 +6171,37 @@ fn a_re_decided_inner_step_is_charged_to_the_item_once_however_often_it_dispatch
             .map(|e| e["status"].as_str().unwrap_or("?"))
             .collect::<Vec<_>>(),
         vec!["failed", "failed"],
-        "the overshoot is bounded, not a hole: both items are still refused at their next \
-         fresh step: {entries:?}"
+        "the overshoot is bounded, not a hole — the ceiling still closes on both items: \
+         {entries:?}"
     );
     for entry in entries {
         assert!(
             entry["error"]
                 .as_str()
                 .is_some_and(|e| e.contains("publish") && e.contains("max_tool_calls")),
-            "the ceiling still closes on the step after the re-decided one: {entry:?}"
+            "refusal lands where the running total first reaches the share — `publish`, not \
+             the step immediately after the re-decided one: {entry:?}"
         );
     }
 }
 
-/// **The other half of the same rule: when the item's share is one, the
-/// re-decided step's own re-dispatch is what gets refused, and there is no
-/// overshoot at all.**
+/// **The other half of the same rule: when there is no room, the re-decided
+/// step's own re-dispatch is what gets refused, and there is no overshoot at
+/// all.** This is `P + 1 >= allowed` reached by a **small share** — the
+/// `P = 0, allowed = 1` instance.
 ///
 /// A re-decided step's interrupted row is already in the snapshot when its
 /// re-dispatch is measured, so the step's own prior attempt counts toward the
-/// tally. With a share of two that still leaves room and the re-dispatch goes
-/// out (the sibling test above measures the resulting one-call overshoot); with
-/// a share of **one** — `ceil(2 / 2)` over an ordinary two-item `map`, not a
-/// contrived figure — that one row alone reaches the ceiling, so the step is
-/// refused where it stands.
+/// tally. A share of one — `ceil(2 / 2)` over an ordinary two-item `map`, not a
+/// contrived figure — means that row alone reaches the ceiling, so the step is
+/// refused where it stands. `a_re_decided_step_is_refused_at_itself_when_siblings_used_the_room_up`
+/// reaches the same condition by the other route (`P = 1, allowed = 2`).
 ///
-/// Same fixture as the sibling, same crash, smaller grant. Item 1 supplies the
-/// contrast in the same run: it never crashed, so it spends its one call on
-/// `probe` and is refused at `build`, the *next* step. One test, both refusal
-/// sites.
+/// Same fixture as the overshoot sibling, same crash, smaller grant. Item 1
+/// supplies the contrast in the same run: it never crashed, so it spends its
+/// one call on `probe` and is refused at `build`. One test, both refusal
+/// sites — a re-decided step refused at itself, and a fresh one refused where
+/// the running total first reaches the share.
 #[test]
 fn a_re_decided_inner_steps_own_re_dispatch_is_refused_when_the_share_is_one() {
     let mut conn = open_test_db();
@@ -6214,7 +6238,7 @@ fn a_re_decided_inner_steps_own_re_dispatch_is_refused_when_the_share_is_one() {
         "item 0 spends its one call on `probe`"
     );
     for _ in &pending {
-        mint_read_task(&mut sink);
+        mint_task(&mut sink, TaskKind::Read);
     }
 
     // The cold re-drive, with the answer to that wave lost.
@@ -6246,7 +6270,7 @@ fn a_re_decided_inner_steps_own_re_dispatch_is_refused_when_the_share_is_one() {
     let answer = pending
         .iter()
         .map(|p| {
-            let task_id = mint_read_task(&mut sink);
+            let task_id = mint_task(&mut sink, TaskKind::Read);
             roundhouse_flow::exec::run_loop::WorkDone {
                 step_id: p.step_id.clone(),
                 item_index: p.item_index,
@@ -6290,23 +6314,208 @@ fn a_re_decided_inner_steps_own_re_dispatch_is_refused_when_the_share_is_one() {
             .collect::<Vec<_>>(),
         vec!["failed", "failed"],
     );
-    let refused_steps: Vec<&str> = entries
+    assert_eq!(
+        entries.iter().map(refused_inner_step).collect::<Vec<_>>(),
+        vec!["probe", "build"],
+        "item 0 is refused at the re-decided step itself; item 1, which never crashed, is \
+         refused where its own running total first reaches the share: {entries:?}"
+    );
+}
+
+/// **`P + 1 >= allowed` reached by the other route: the room is gone because
+/// the item's *siblings* used it, not because the share is small.**
+///
+/// `allowed` is **two** here — the same share that overshoots in
+/// `a_re_decided_inner_step_is_charged_to_the_item_once_however_often_it_dispatches`.
+/// What differs is that the re-decided step is the item's *second*, so one
+/// other step already holds a started row (`P = 1`) and the re-decided step's
+/// own row takes the tally to `2 >= 2`: refused at itself, zero overshoot, at a
+/// share no smaller than the one that overshoots.
+///
+/// Without this case the rule would be pinned only at `P = 0`, and "no room"
+/// would read as though it meant "a share of one".
+///
+/// Item 1 again supplies the contrast in the same run: it never crashed, so it
+/// spends its two calls on `setup` and `probe` and is refused at `build`.
+#[test]
+fn a_re_decided_step_is_refused_at_itself_when_siblings_used_the_room_up() {
+    let mut conn = open_test_db();
+    // Two items over four calls: a share of two each, as in the overshoot
+    // test — the room is used up by a sibling step, not by the share.
+    let run_id = seed_run_with_grant(&mut conn, a_grant_of_tool_calls(4));
+
+    let def = parse_workflow(&workflow(
+        "steps:\n\
+         \x20 - id: fan\n\
+         \x20   idempotency_key: \"fan-once\"\n\
+         \x20   map:\n\
+         \x20     over: \"${{ inputs.items }}\"\n\
+         \x20     as: item\n\
+         \x20     max_parallel: 1\n\
+         \x20     on_item_error: continue\n\
+         \x20   steps:\n\
+         \x20     - id: setup\n\
+         \x20       tool: shell\n\
+         \x20       with: { cmd: [echo, setup] }\n\
+         \x20     - id: probe\n\
+         \x20       tool: read\n\
+         \x20       with: { path: \"${{ item }}\" }\n\
+         \x20     - id: build\n\
+         \x20       tool: shell\n\
+         \x20       with: { cmd: [echo, build] }\n",
+    ))
+    .expect("fixture parses");
+    let mut sink = RecordingSink::default();
+    let mut host = FakeHost::new();
+    let mut run_ctx = ctx(run_id);
+    run_ctx.inputs = serde_json::json!({ "items": map_items(2) });
+
+    // Segment 1: item 0 spends its first call on `setup`, which is answered
+    // normally — this is the sibling that later leaves `probe` no room.
+    let first = run_workflow(
+        &mut conn,
+        &def,
+        run_id,
+        &mut sink,
+        &mut host,
+        run_ctx.clone(),
+        at(10),
+        None,
+    )
+    .expect("the run drives");
+    let RunOutcome::AwaitingWork { pending } = first else {
+        panic!("item 0's `setup` is dispatched first, got {first:?}");
+    };
+    assert_eq!(
+        pending
+            .iter()
+            .map(|p| (p.step_id.clone(), p.item_index))
+            .collect::<Vec<_>>(),
+        vec![("setup".to_string(), Some(0))],
+    );
+    let answer: Vec<_> = pending
         .iter()
-        .map(|e| {
-            let error = e["error"].as_str().unwrap_or_default();
-            if error.contains("`probe`") {
-                "probe"
-            } else if error.contains("`build`") {
-                "build"
-            } else {
-                "?"
+        .map(|p| {
+            let task_id = mint_task(&mut sink, TaskKind::Shell);
+            roundhouse_flow::exec::run_loop::WorkDone {
+                step_id: p.step_id.clone(),
+                item_index: p.item_index,
+                status: roundhouse_flow::exec::run_loop::WorkStatus::Completed,
+                output: serde_json::json!({}),
+                output_is_secret_derived: false,
+                task_id: Some(task_id),
+                first_task_seq: None,
+                last_task_seq: None,
             }
         })
         .collect();
+
+    // Segment 2: `setup` completes and item 0 spends its second call on
+    // `probe` — `P = 1`, tally 1 < 2, so this one still fits. The daemon mints
+    // the task and then dies.
+    let second = run_workflow(
+        &mut conn,
+        &def,
+        run_id,
+        &mut sink,
+        &mut host,
+        run_ctx.clone(),
+        at(20),
+        Some(Resume::Work(answer)),
+    )
+    .expect("the run drives");
+    let RunOutcome::AwaitingWork { pending } = second else {
+        panic!("item 0's `probe` still fits at `P = 1`, got {second:?}");
+    };
     assert_eq!(
-        refused_steps,
+        pending
+            .iter()
+            .map(|p| (p.step_id.clone(), p.item_index))
+            .collect::<Vec<_>>(),
+        vec![("probe".to_string(), Some(0))],
+    );
+    for _ in &pending {
+        mint_task(&mut sink, TaskKind::Read);
+    }
+
+    // Segment 3, cold: `setup`'s `Completed` row is inherited and `probe` is
+    // re-decided — so the tally is that sibling plus `probe`'s own interrupted
+    // row, which is the whole share.
+    let recovered = run_workflow(
+        &mut conn,
+        &def,
+        run_id,
+        &mut sink,
+        &mut host,
+        run_ctx.clone(),
+        at(30),
+        None,
+    )
+    .expect("the run drives");
+    let RunOutcome::AwaitingWork { pending } = recovered else {
+        panic!("item 1 has not started and still has its whole share, got {recovered:?}");
+    };
+    assert_eq!(
+        pending
+            .iter()
+            .map(|p| (p.step_id.clone(), p.item_index))
+            .collect::<Vec<_>>(),
+        vec![("setup".to_string(), Some(1))],
+        "item 0's `probe` is **not** re-dispatched: one completed sibling plus its own \
+         interrupted row already fills a share of two, so a re-decided step is refused at \
+         itself even where that same share leaves room when it is the item's first step. The \
+         wave belongs to item 1: {pending:?}"
+    );
+
+    let answer: Vec<_> = pending
+        .iter()
+        .map(|p| {
+            let task_id = mint_task(&mut sink, TaskKind::Shell);
+            roundhouse_flow::exec::run_loop::WorkDone {
+                step_id: p.step_id.clone(),
+                item_index: p.item_index,
+                status: roundhouse_flow::exec::run_loop::WorkStatus::Completed,
+                output: serde_json::json!({}),
+                output_is_secret_derived: false,
+                task_id: Some(task_id),
+                first_task_seq: None,
+                last_task_seq: None,
+            }
+        })
+        .collect();
+    let outcome = run_to_terminal(
+        &mut conn,
+        &def,
+        run_id,
+        &mut sink,
+        &mut host,
+        run_ctx,
+        40,
+        Some(Resume::Work(answer)),
+    )
+    .expect("the run drives");
+
+    assert_eq!(
+        shell_tasks(&sink),
+        2,
+        "one `setup` per item; `build` is never dispatched for either"
+    );
+    assert_eq!(
+        read_tasks(&sink),
+        2,
+        "one `probe` attempt per item — item 0's is not repeated, so there is no overshoot \
+         here even though the share is the same as the case that overshoots"
+    );
+
+    let RunOutcome::Terminal { steps, .. } = &outcome else {
+        panic!("the run must reach a terminal state, got {outcome:?}");
+    };
+    let map = steps.iter().find(|s| s.step_id == "fan").expect("the map");
+    let entries = map.output["items"].as_array().expect("one entry per item");
+    assert_eq!(
+        entries.iter().map(refused_inner_step).collect::<Vec<_>>(),
         vec!["probe", "build"],
-        "item 0 is refused at the re-decided step itself; item 1, which never crashed, is \
-         refused at the step *after* the one it spent its call on: {entries:?}"
+        "item 0 is refused at the re-decided step itself; item 1, which never crashed, spends \
+         both its calls and is refused at the step after them: {entries:?}"
     );
 }

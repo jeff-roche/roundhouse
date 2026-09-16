@@ -3004,36 +3004,61 @@ impl<H: WorkflowHost> Loop<'_, H> {
     /// So a step §8.10 tier 2 re-decides (an interrupted one whose
     /// [`crash_policy`] is `Rerun`, or a `Failed` row re-decided on a cold
     /// entry) contributes **one** to this tally however many times it is
-    /// really dispatched.
+    /// really dispatched: its row already exists, and re-dispatching it
+    /// rewrites that row rather than adding a second
+    /// ([`Self::checkpoint_map_item_step_waiting`] writes the same primary
+    /// key).
     ///
-    /// Note which row that is: the step being re-decided already has a
-    /// `Running`/`Indeterminate`/`Failed` row of its own in this segment's
-    /// snapshot, left by the attempt that was interrupted, so its **own** prior
-    /// attempt is part of the tally its re-dispatch is measured against. Which
-    /// of the two things that can happen does depends on how much room the item
-    /// has left once that one row is charged, and both really occur:
+    /// Write `P` for how many of the item's **other** dispatchable inner steps
+    /// already hold a started row, and `allowed` for
+    /// [`per_item_dispatch_refusal`]'s ceiling. This function computes the same
+    /// thing either way; all that differs is whether the step being decided is
+    /// itself one of the rows it counts:
     ///
-    /// - **Room to spare** (the item's share exceeds what its started steps,
-    ///   this one included, already account for): the re-dispatch goes out,
-    ///   and because the step is charged once rather than once per attempt,
-    ///   the item ends up making **one real dispatch more than its share
-    ///   nominally allows**, per re-decide. A bounded gap, stated rather than
-    ///   claimed away, and the ceiling still closes on the item's next step.
-    /// - **No room** — which is *always* the case when the item's share is 1,
-    ///   and whenever the item was already at its ceiling before this step's
-    ///   first attempt: the step's own row alone reaches the ceiling, so the
-    ///   **re-decided step's own re-dispatch** is what gets refused, and there
-    ///   is no overshoot at all.
+    /// | the step being decided | tally | refused when |
+    /// |---|---|---|
+    /// | fresh — no row yet | `P` | `P >= allowed` |
+    /// | re-decided — its own row exists | `P + 1` | `P + 1 >= allowed` |
+    ///
+    /// A re-decided step therefore sits exactly one slot nearer the ceiling
+    /// than a fresh step in the same position — never two, since its
+    /// re-dispatch adds no row — and the two reachable cases are:
+    ///
+    /// - **`P + 1 < allowed`:** the re-dispatch proceeds, and because that
+    ///   second attempt is never counted the item ends up making **one real
+    ///   dispatch more than `allowed` nominally permits**, per re-decide. The
+    ///   ceiling still closes, but not at a position that can be named in
+    ///   advance: the running total is unchanged by the re-dispatch, and each
+    ///   later step adds its own row to it, so refusal lands on whichever
+    ///   fresh step first finds that total already at `allowed` — which may be
+    ///   several steps after the re-decided one, not the next.
+    /// - **`P + 1 >= allowed`:** the re-decided step's own re-dispatch is
+    ///   refused, at itself, with **zero** overshoot. Reached both when the
+    ///   share is small (`P = 0`, `allowed = 1`) and when siblings have used
+    ///   the room up (`P = 1`, `allowed = 2`) — the same condition by two
+    ///   routes.
+    ///
+    /// **At most one step per item is in a re-decide state at a time**, so
+    /// these cases never compound within one item. An item's rows are a
+    /// *prefix* of its inner steps: the walk is sequential, and
+    /// [`Self::decided_map_item_step`] inherits a `Completed`/`Skipped` row on
+    /// every entry, so such a step never reaches the dispatch seam again and
+    /// its row can never go back to `Running`. A row that still needs deciding
+    /// is therefore always the item's furthest-progressed one, with nothing
+    /// after it holding a row at all — an inner-step failure ends the item
+    /// (`fold_inner_step_outcome`), so no later step was ever started either.
     ///
     /// Closing the first case outright would mean counting attempts, which
     /// needs durable per-attempt state this task deliberately does not add
     /// (§8.9's per-item budget is a transfer out of the run's remaining budget,
-    /// not a second ledger to keep). Both cases are measured rather than
-    /// asserted away, by
+    /// not a second ledger to keep). All three shapes are measured rather than
+    /// asserted away, in `tests/run_loop.rs`:
     /// `a_re_decided_inner_step_is_charged_to_the_item_once_however_often_it_dispatches`
-    /// (share 2, the overshoot) and
+    /// (`P = 0`, `allowed = 2` — the overshoot),
     /// `a_re_decided_inner_steps_own_re_dispatch_is_refused_when_the_share_is_one`
-    /// (share 1, no overshoot) in `tests/run_loop.rs`.
+    /// (`P = 0`, `allowed = 1`) and
+    /// `a_re_decided_step_is_refused_at_itself_when_siblings_used_the_room_up`
+    /// (`P = 1`, `allowed = 2`).
     fn map_item_dispatches_so_far(&self, inner_steps: &[StepDef], item_index: u32) -> u32 {
         inner_steps
             .iter()
