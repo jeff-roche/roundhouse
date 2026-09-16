@@ -99,12 +99,14 @@ use crate::durability::{
     CrashPolicy, DurabilityError, RunState, StepDisposition, StepOutput, StepRunState,
     WorkflowChildCall, WorkflowRun, WorkflowStepRun,
 };
-use crate::hitl::{AwaitingHuman, HitlError};
+use crate::hitl::{AwaitingHuman, CrashResolution, HitlError};
 use crate::ledger::{
     admit_spend, admit_spend_during_finally, refund_child_run, remaining_caps, run_ledger,
     LedgerError, Spend,
 };
-use crate::parking::{park, CheckpointError, Checkpointer, ParkError, ParkResult};
+use crate::parking::{
+    park, CheckpointError, Checkpointer, ParkError, ParkResult, DEFAULT_HOLD_TTL,
+};
 use crate::parse::steps::{parse_step, topological_order, StepBody, StepDef};
 use crate::parse::{ParseError, WorkflowDef};
 use crate::report::{build_carry_over_seed, validate_report};
@@ -306,7 +308,8 @@ pub enum RunLoopError {
     #[error(transparent)]
     Checkpoint(#[from] CheckpointError),
     /// [`run_workflow`] was asked to drive a run that is not `Running`, and
-    /// was given no gate answer that would release it.
+    /// was given no answer ([`Resume::Gate`] or [`Resume::CrashRecovery`])
+    /// that would release it.
     ///
     /// Distinguished from a step failure because it is a caller mistake, not a
     /// workflow outcome: pausing or cancelling a run and then asking the loop
@@ -318,6 +321,21 @@ pub enum RunLoopError {
     /// whose body is not a `gate:`.
     #[error("gate answer names step {step_id:?}, which is not a gate step of this workflow")]
     UnknownGateStep { step_id: String },
+    /// A [`CrashRecoveryAnswer`] names a step this run's `steps:` phase does
+    /// not contain, or one that could never have produced a crash-recovery
+    /// park in the first place (its resolved
+    /// [`CrashPolicy`](crate::durability::CrashPolicy) is not `Ask`).
+    ///
+    /// Refused rather than ignored, and for a sharper reason than
+    /// [`Self::UnknownGateStep`]'s: an answer nothing consumes would still
+    /// have released the park on the way in, leaving the run driving on with
+    /// the question it parked for unanswered — and the next load would park
+    /// it again, so the run would ping-pong rather than fail visibly.
+    #[error(
+        "crash-recovery answer names step {step_id:?}, which is not a step of this workflow's \
+         `steps:` phase whose on_crash policy is `ask`"
+    )]
+    UnknownCrashRecoveryStep { step_id: String },
     /// §8.8's `report:` block is *the* mandatory per-run block, and ruling
     /// P112 makes it **exactly one**. Two authored `report:` steps would
     /// persist two `TaskKind::Report` tasks and leave the Runs inbox choosing
@@ -379,6 +397,36 @@ pub struct GateAnswer {
     pub output: Value,
 }
 
+/// A human's answer to the §8.10 crash-recovery park a step's
+/// [`CrashPolicy::Ask`] took — the resume half of
+/// [`crate::hitl::HumanWaitSource::CrashRecovery`].
+///
+/// # Why this is not a [`GateAnswer`] (Phase 8 Task 25.4 Task 5's one open decision)
+///
+/// A [`GateAnswer`] is *data*: its `output` becomes
+/// `steps.<step_id>.output`, so a dependent's
+/// `${{ steps.gate.output.approve }}` reads what the human said, and
+/// [`ensure_gate_step`] refuses an answer naming a non-`gate:` step
+/// precisely because injecting a value under an id whose real step is about
+/// to run would overwrite it.
+///
+/// A crash-recovery answer is neither of those things. It is *control flow*
+/// — re-dispatch, skip, or fail — the step it names is by construction
+/// **not** a `gate:` step (it is the `shell`/`write`/`edit` step that was
+/// interrupted), and it must produce no `steps.<id>.output` at all, because
+/// on [`CrashResolution::Rerun`] the step is about to run and write its own.
+/// Reusing `GateAnswer` would therefore have meant relaxing
+/// [`ensure_gate_step`]'s check — the one check that stops exactly that
+/// overwrite — and then reading `output` as a control decision on some steps
+/// and as data on others. So this is a separate variant with a typed
+/// [`CrashResolution`] instead of an untyped `Value`, and
+/// [`ensure_crash_recovery_step`] is its own, differently-shaped check.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CrashRecoveryAnswer {
+    pub step_id: String,
+    pub resolution: CrashResolution,
+}
+
 /// What to hand [`run_workflow`] on a call that resumes a suspended run — a
 /// run has at most one live suspension at a time, so which case applies is
 /// the caller's to know, not this crate's to infer.
@@ -386,6 +434,10 @@ pub struct GateAnswer {
 pub enum Resume {
     /// Resolves an [`RunOutcome::Parked`] gate.
     Gate(GateAnswer),
+    /// Resolves an [`RunOutcome::Parked`] **crash-recovery** wait — §8.10's
+    /// `on_crash: ask`, which is the default for every `Effectful` step. See
+    /// [`CrashRecoveryAnswer`] for why this is not a [`Resume::Gate`].
+    CrashRecovery(CrashRecoveryAnswer),
     /// Resolves an [`RunOutcome::AwaitingWork`] suspension — one entry per
     /// [`PendingWork`] the caller was handed. Always length 1 today (nothing
     /// yet batches pending work); the `Vec` is here so a future caller that
@@ -560,10 +612,14 @@ pub enum RunOutcome {
         /// earlier pass) are not here; they are in the database.
         steps: Vec<StepOutcome>,
     },
-    /// A `gate:` parked the run. **Not terminal, so it carries no report** —
-    /// see [`crate::report::Outcome`]'s own doc: a run in `AwaitingHuman` has
-    /// no result to report yet. Call [`run_workflow`] again with a
-    /// [`GateAnswer`] to resume it.
+    /// A human wait parked the run — either a `gate:` step or (since Phase 8
+    /// Task 25.4) §8.10's `on_crash: ask` crash recovery. **Not terminal, so
+    /// it carries no report** — see [`crate::report::Outcome`]'s own doc: a
+    /// run in `AwaitingHuman` has no result to report yet. Call
+    /// [`run_workflow`] again with the matching [`Resume`] variant —
+    /// [`Resume::Gate`] or [`Resume::CrashRecovery`] — to resume it; the
+    /// [`crate::hitl::HumanWaitSource`] in the `awaiting_human` task this
+    /// park put in the log says which.
     ///
     /// **This holds even when the workflow's `report:` step has already
     /// completed** — the document it produced is held, not emitted, until the
@@ -621,7 +677,9 @@ struct ReportPersisted(ReportOrigin);
 /// `Cancelling`, which is drivable **because** §8.13's cancel is cooperative
 /// and this loop is what drains it (ruling P115 §A — refusing would leave
 /// `finally:` unrun and the mandatory report unwritten); or `AwaitingHuman`
-/// together with a `resume` answer for the gate it is parked on. Anything else
+/// together with a `resume` answer for the wait it is parked on — a
+/// [`Resume::Gate`] for a `gate:` step, a [`Resume::CrashRecovery`] for
+/// §8.10's `on_crash: ask`. Anything else
 /// is [`RunLoopError::RunNotDrivable`]. Creating the row is
 /// the caller's — [`crate::durability::insert_workflow_run`], which is also
 /// where a child run's grant is drawn from its parent.
@@ -671,14 +729,20 @@ pub fn run_workflow<H: WorkflowHost>(
     // Split the one `resume` parameter into the two internal channels it can
     // carry — a run has at most one live suspension at a time, so exactly
     // one of these is ever non-empty on any call.
-    let (gate_answer, work_results): (Option<GateAnswer>, HashMap<String, WorkDone>) = match resume
-    {
-        Some(Resume::Gate(answer)) => (Some(answer), HashMap::new()),
+    type ResumeChannels = (
+        Option<GateAnswer>,
+        Option<CrashRecoveryAnswer>,
+        HashMap<String, WorkDone>,
+    );
+    let (gate_answer, crash_answer, work_results): ResumeChannels = match resume {
+        Some(Resume::Gate(answer)) => (Some(answer), None, HashMap::new()),
+        Some(Resume::CrashRecovery(answer)) => (None, Some(answer), HashMap::new()),
         Some(Resume::Work(work)) => (
+            None,
             None,
             work.into_iter().map(|w| (w.step_id.clone(), w)).collect(),
         ),
-        None => (None, HashMap::new()),
+        None => (None, None, HashMap::new()),
     };
 
     let main = parse_phase(&def.steps)?;
@@ -708,25 +772,34 @@ pub fn run_workflow<H: WorkflowHost>(
     let session_id = recovered.run.session_id;
     let started_state = recovered.run.state;
 
-    match (started_state, &gate_answer) {
-        (RunState::Running, _) => {}
+    match (started_state, &gate_answer, &crash_answer) {
+        (RunState::Running, _, _) => {}
         // **`Cancelling` is drivable, and it has to be.** §8.13's cancel is
         // cooperative: an operator marks the row and the loop is what drains
         // it — refusing to drive it would leave the run `Cancelling` forever,
         // with `finally:` never run and no report ever written. Every step of
         // `steps:`/`catch:` is refused by admission (that is where the cancel
         // is observed), so what actually runs is the cleanup §8.13 requires.
-        (RunState::Cancelling, _) => {}
-        (RunState::AwaitingHuman, Some(answer)) => {
+        (RunState::Cancelling, _, _) => {}
+        (RunState::AwaitingHuman, Some(answer), _) => {
             release_park(conn, run_id, &main, answer, now)?;
         }
-        (state, _) => return Err(RunLoopError::RunNotDrivable { run_id, state }),
+        // The two answers cannot both be present: `Resume` is one enum and
+        // carries exactly one of them, which is §8.11's "a run has at most
+        // one live suspension at a time" expressed in the type.
+        (RunState::AwaitingHuman, None, Some(answer)) => {
+            release_crash_recovery_park(conn, run_id, &main, answer, now)?;
+        }
+        (state, _, _) => return Err(RunLoopError::RunNotDrivable { run_id, state }),
     }
     // Checked even when the run was already `Running`, so an answer naming a
     // step that is not a gate is refused on every path rather than only on the
     // resume path — see `release_park`.
     if let Some(answer) = &gate_answer {
         ensure_gate_step(&main, answer)?;
+    }
+    if let Some(answer) = &crash_answer {
+        ensure_crash_recovery_step(&main, answer)?;
     }
 
     // Task 19a: computed before `run_ctx` moves into `Executor::new` below,
@@ -787,6 +860,7 @@ pub fn run_workflow<H: WorkflowHost>(
             HashMap::new()
         },
         gate_answer,
+        crash_answer,
         work_results,
     };
     run.seed_context_from_checkpoints(&recovered.steps);
@@ -1010,6 +1084,58 @@ fn ensure_gate_step(main: &[StepDef], answer: &GateAnswer) -> Result<(), RunLoop
     })
 }
 
+/// [`release_park`]'s counterpart for §8.10's crash-recovery wait: check the
+/// answer names a step that could actually have parked, then move the run
+/// back to `Running`.
+///
+/// Two functions rather than one with an either-or parameter because the two
+/// checks are genuinely different questions — see [`CrashRecoveryAnswer`]'s
+/// own doc — while the `transition_run` they share is one line.
+fn release_crash_recovery_park(
+    conn: &mut Connection,
+    run_id: RunId,
+    main: &[StepDef],
+    answer: &CrashRecoveryAnswer,
+    now: Timestamp,
+) -> Result<(), RunLoopError> {
+    ensure_crash_recovery_step(main, answer)?;
+    // `transition` clears `awaiting_until`/`hold_until` and banks the parked
+    // stretch into `parked_nanos` on this edge, which is what makes §8.4's
+    // `run_active_timeout` exclude the wait.
+    transition_run(conn, run_id, RunState::Running, now)?;
+    Ok(())
+}
+
+/// The check [`release_crash_recovery_park`] exists for, split out so it runs
+/// on every entry carrying an answer and not only on the parked one — the
+/// same shape as [`ensure_gate_step`], asking the question that actually
+/// applies here.
+///
+/// **`steps:` only, and that is the whole set.** A crash-recovery park is
+/// taken by [`Loop::crash_recovery_park`], which refuses to park from
+/// `catch:`/`finally:` for §8.13's cancel-must-converge reason, so a `catch:`
+/// step can never be the subject of one.
+///
+/// **[`crash_policy`], not [`derive_disposition`]**: §8.10 lets an author
+/// override in both directions, and it is the *resolved* policy that decides
+/// whether a park was ever possible. A step declaring `on_crash: rerun` or
+/// `on_crash: fail` never parks, so an answer naming one is answering a
+/// question nobody asked.
+fn ensure_crash_recovery_step(
+    main: &[StepDef],
+    answer: &CrashRecoveryAnswer,
+) -> Result<(), RunLoopError> {
+    if main
+        .iter()
+        .any(|s| s.id == answer.step_id && crash_policy(s) == CrashPolicy::Ask)
+    {
+        return Ok(());
+    }
+    Err(RunLoopError::UnknownCrashRecoveryStep {
+        step_id: answer.step_id.clone(),
+    })
+}
+
 /// The terminal write, gated on a [`ReportPersisted`].
 ///
 /// **The parameter is the whole point** and it is why this is a function
@@ -1106,8 +1232,14 @@ enum PhaseEnd {
     /// chokepoint rather than by a second state read that could disagree
     /// with it.
     Cancelled,
-    /// A `gate:` parked the run. The whole loop unwinds; nothing after this
+    /// A human wait — a `gate:` step, or §8.10's `on_crash: ask` crash
+    /// recovery — parked the run. The whole loop unwinds; nothing after this
     /// step runs, and no report is written, because the run has not ended.
+    ///
+    /// Only [`Phase::Main`] ever produces this: both park sites refuse to
+    /// suspend a run from `catch:`/`finally:` (see [`Loop::dispatch_gate`]
+    /// and [`Loop::crash_recovery_park`]), because §8.13's cancel must
+    /// converge.
     Parked(ParkResult),
     /// A `tool:`/`agent:`/`call:` step needs real work. The whole loop unwinds
     /// exactly as for `Parked` — nothing after this step runs — but the run
@@ -1150,6 +1282,21 @@ struct Loop<'c, H: WorkflowHost> {
     /// argument. Drained as each is inherited.
     failed_before: HashMap<String, WorkflowStepRun>,
     gate_answer: Option<GateAnswer>,
+    /// A human's answer to the §8.10 crash-recovery park this run took, if
+    /// this entry carries one. Read (not drained) by [`Self::run_phase`]'s
+    /// crash-policy branch for the one step it names; every other step falls
+    /// through to `crash_policy` exactly as on a cold entry.
+    ///
+    /// It is consulted **only inside** that branch, so an answer for a step
+    /// this load no longer finds `Indeterminate` (it completed before the
+    /// crash, or its row was re-decided in between) is simply not applied,
+    /// and the step is driven normally. That is the right outcome: the
+    /// question the park asked no longer has a subject, and the run has
+    /// already been released back to `Running`, so there is nothing left to
+    /// answer. [`ensure_crash_recovery_step`] is what refuses the case that
+    /// *is* a caller mistake — an answer naming a step that could never have
+    /// parked at all.
+    crash_answer: Option<CrashRecoveryAnswer>,
     /// What a caller reported for a step this run suspended on, keyed by
     /// step id and drained as each is consumed. Populated from
     /// [`Resume::Work`]; empty on every other entry, including a crash
@@ -1332,34 +1479,110 @@ impl<H: WorkflowHost> Loop<'_, H> {
                 // re-admitted/re-dispatched regardless of its declared
                 // `on_crash`.
                 if let Some(row) = self.indeterminate_before.remove(&step.id) {
-                    let policy = crash_policy(step);
-                    match policy {
-                        CrashPolicy::Rerun => {}
-                        CrashPolicy::Fail | CrashPolicy::Ask => {
-                            // `Ask` (§8.10's default) belongs in the gate
-                            // queue; this crate has no park-on-ambiguous-crash
-                            // mechanism yet (Phase 8 Task 25.4's scope), so it
-                            // fails closed rather than silently re-running an
-                            // effectful step whose completion is unknown.
-                            // Never re-running such a step without a human
-                            // decision is the safety property that must hold
-                            // either way — failing closed is a narrower
-                            // interim behaviour than parking, not a weaker
-                            // one.
+                    // A human's answer to **this step's own** crash-recovery
+                    // park wins over re-deriving the policy: the park is the
+                    // question and this is its answer. Consulted before
+                    // `crash_policy` so an answered park cannot re-park,
+                    // which would be a wait nobody could ever escape.
+                    let answered = self
+                        .crash_answer
+                        .as_ref()
+                        .filter(|a| a.step_id == step.id)
+                        .map(|a| a.resolution);
+                    match answered {
+                        // §8.10's `rerun`, which is exactly an at-least-once
+                        // crash re-run: the `Indeterminate` classification is
+                        // already cleared by the `remove` above, so falling
+                        // through re-admits and re-dispatches the step the
+                        // same way a declared `on_crash: rerun` does.
+                        Some(CrashResolution::Rerun) => {}
+                        Some(CrashResolution::Skip) => {
+                            // Durably skipped, with the reason naming the
+                            // human: a reader of the row must be able to tell
+                            // a person's decision from a `when:` that
+                            // evaluated false.
+                            let outcome = StepOutcome {
+                                step_id: step.id.clone(),
+                                output: Value::Null,
+                                status: StepStatus::Skipped {
+                                    reason: format!(
+                                        "a human answered this step's crash-recovery park with \
+                                         `skip`: it was interrupted mid-dispatch (found {:?}) \
+                                         and will not be re-run",
+                                        row.state
+                                    ),
+                                },
+                                // Nothing ran, so there is no output and
+                                // nothing derived from a secret in it.
+                                output_is_secret_derived: false,
+                                gate_condition_was_secret_derived: false,
+                            };
+                            self.record(step, outcome)?;
+                            continue;
+                        }
+                        Some(CrashResolution::Fail) => {
                             let outcome = StepOutcome::failed(
                                 &step.id,
                                 format!(
-                                    "step was interrupted mid-dispatch (found {:?}) and its \
-                                     on_crash policy is {policy:?}: refusing to silently \
-                                     re-run an effectful step whose completion is unknown",
+                                    "a human answered this step's crash-recovery park with \
+                                     `fail`: it was interrupted mid-dispatch (found {:?}) and \
+                                     will not be re-run",
                                     row.state
                                 ),
                             );
                             self.record(step, outcome)?;
+                            // Stops the phase regardless of
+                            // `continue_on_error`, exactly as the
+                            // `CrashPolicy::Fail` arm below does:
+                            // `continue_on_error` distinguishes "the command
+                            // failed" from "the step failed" (§8.9), and this
+                            // is neither — it is a human saying the run
+                            // should not go on.
                             end = PhaseEnd::Failed;
                             stopped_at = Some(index + 1);
                             break;
                         }
+                        None => match crash_policy(step) {
+                            CrashPolicy::Rerun => {}
+                            CrashPolicy::Ask => {
+                                // §8.10's default for **every** `Effectful`
+                                // step, and Phase 8 Task 25.4 Task 5's whole
+                                // point: ask a human rather than failing the
+                                // run closed, which would mean any daemon
+                                // restart mid-`shell`/`write`/`edit`
+                                // permanently failed the run.
+                                match self.crash_recovery_park(executor, step, phase, row.state)? {
+                                    CrashPark::Parked(parked) => {
+                                        return Ok(PhaseEnd::Parked(parked))
+                                    }
+                                    CrashPark::Refused(outcome) => {
+                                        self.record(step, outcome)?;
+                                        end = PhaseEnd::Failed;
+                                        stopped_at = Some(index + 1);
+                                        break;
+                                    }
+                                }
+                            }
+                            CrashPolicy::Fail => {
+                                // The author declared `on_crash: fail`, which
+                                // is the one policy that asks for exactly
+                                // this: never re-run, never ask, end the run.
+                                let outcome = StepOutcome::failed(
+                                    &step.id,
+                                    format!(
+                                        "step was interrupted mid-dispatch (found {:?}) and its \
+                                         on_crash policy is {:?}: refusing to silently re-run an \
+                                         effectful step whose completion is unknown",
+                                        row.state,
+                                        CrashPolicy::Fail
+                                    ),
+                                );
+                                self.record(step, outcome)?;
+                                end = PhaseEnd::Failed;
+                                stopped_at = Some(index + 1);
+                                break;
+                            }
+                        },
                     }
                 }
 
@@ -1700,6 +1923,16 @@ enum CallStep {
     AwaitingWork(PendingKind),
 }
 
+/// What [`Loop::crash_recovery_park`] did.
+enum CrashPark {
+    Parked(ParkResult),
+    /// This run must not acquire a new indefinite wait on a human, so the
+    /// step fails closed instead — Task 25.3's original behaviour, kept for
+    /// exactly the two cases where parking would be wrong. The outcome
+    /// carries the reason.
+    Refused(StepOutcome),
+}
+
 impl<H: WorkflowHost> Loop<'_, H> {
     /// §8.11's park, as a step: build the [`AwaitingHuman`] the gate
     /// describes, then hand it to [`park`], which takes the implicit
@@ -1797,6 +2030,46 @@ impl<H: WorkflowHost> Loop<'_, H> {
             self.now,
             self.host,
         )?;
+        self.emit_awaiting_human(executor, &step.id, &awaiting, &parked);
+
+        // The step's row records that it is waiting, not that it finished: a
+        // `Running` row is what §8.10 tier 2 reclassifies as `Indeterminate`
+        // for an `Effectful` step after a crash, and a gate is `Idempotent`
+        // (`derive_disposition`), so re-presenting it is safe and correct.
+        self.checkpoint(step, StepRunState::Running, None, None)?;
+        Ok(GateStep::Parked(parked))
+    }
+
+    /// Puts a park's checkpoint handle and its [`AwaitingHuman`] form in the
+    /// session's log — shared by [`Self::dispatch_gate`] and
+    /// [`Self::crash_recovery_park`] rather than written twice.
+    ///
+    /// **Because otherwise nobody is ever asked.** [`park`] reads only the
+    /// wait's deadline; the title and form it is handed go nowhere, so
+    /// without this emit a parked run is a run waiting on a prompt that was
+    /// never shown. (Found by B12c's mutation sweep: removing the gate
+    /// title's redaction survived, because the redacted title reached no
+    /// observer at all.) One function, so a second park source cannot
+    /// silently ship without the prompt.
+    ///
+    /// `TaskKind::Flow`, for the reason the `emit:` arm records for its own
+    /// choice: §4.2's frozen table has no `AwaitingHuman` kind, and `Flow` is
+    /// this crate's general workflow-bookkeeping kind. Adding one is a
+    /// frozen-contract amendment, not a run loop's call.
+    ///
+    /// `AwaitingHuman` is `Serialize` and deliberately not `Deserialize`, so
+    /// that a park record cannot be stored as this struct and re-derived with
+    /// a fresh window on every resume. Serialising it *into the log for
+    /// rendering* is the sanctioned direction of that rule, not an exception
+    /// to it: what a resume reads back is the absolute
+    /// `workflow_run.awaiting_until`, never this payload.
+    fn emit_awaiting_human(
+        &self,
+        executor: &mut Executor<'_>,
+        step_id: &str,
+        awaiting: &AwaitingHuman,
+        parked: &ParkResult,
+    ) {
         executor.sink.emit(
             TaskId::new(),
             None,
@@ -1811,28 +2084,8 @@ impl<H: WorkflowHost> Loop<'_, H> {
                 })),
             },
         );
-        // §8.11's *"an `AwaitingHuman` task with a JSON-Schema form that TUI
-        // and web render from the same schema"* — put in the log, because
-        // otherwise **nobody is ever asked**. `parking::park` reads only the
-        // wait's deadline; the title and form it is handed go nowhere, so
-        // without this emit a parked run is a run waiting on a prompt that was
-        // never shown. (Found by this slice's mutation sweep: removing the
-        // title's redaction survived, because the redacted title reached no
-        // observer at all.)
-        //
-        // `TaskKind::Flow`, for the reason the `emit:` arm records for its own
-        // choice: §4.2's frozen table has no `AwaitingHuman` kind, and `Flow`
-        // is this crate's general workflow-bookkeeping kind. Adding one is a
-        // frozen-contract amendment, not a run loop's call.
-        //
-        // `AwaitingHuman` is `Serialize` and deliberately not `Deserialize`,
-        // so that a park record cannot be stored as this struct and re-derived
-        // with a fresh window on every resume. Serialising it *into the log for
-        // rendering* is the sanctioned direction of that rule, not an
-        // exception to it: what a resume reads back is the absolute
-        // `workflow_run.awaiting_until`, never this payload.
         let form_task = TaskId::new();
-        let awaiting_payload = serde_json::to_value(&awaiting).unwrap_or(Value::Null);
+        let awaiting_payload = serde_json::to_value(awaiting).unwrap_or(Value::Null);
         executor.sink.emit(
             form_task,
             None,
@@ -1843,18 +2096,108 @@ impl<H: WorkflowHost> Loop<'_, H> {
                 origin: Origin::System,
                 input: TaskInput::Json(serde_json::json!({
                     "awaiting_human": awaiting_payload,
-                    "step_id": step.id,
+                    "step_id": step_id,
                     "checkpoint": parked.checkpoint_ref.0,
                 })),
             },
         );
+    }
 
-        // The step's row records that it is waiting, not that it finished: a
-        // `Running` row is what §8.10 tier 2 reclassifies as `Indeterminate`
-        // for an `Effectful` step after a crash, and a gate is `Idempotent`
-        // (`derive_disposition`), so re-presenting it is safe and correct.
-        self.checkpoint(step, StepRunState::Running, None, None)?;
-        Ok(GateStep::Parked(parked))
+    /// §8.10 tier 2's `on_crash: ask`, as a park: the step was interrupted
+    /// mid-dispatch and nothing knows whether its effect landed, so ask a
+    /// human `rerun | skip | fail` on §8.11's one mechanism rather than
+    /// guessing — or failing the run closed, which is what this branch did
+    /// before Phase 8 Task 25.4 and which meant **any** daemon restart
+    /// mid-`shell`/`write`/`edit` permanently failed the run.
+    ///
+    /// # The two cases that refuse to park, and why they are not slack
+    ///
+    /// - **Outside `steps:`.** A park suspends the run indefinitely, and
+    ///   §8.13 requires `finally:` to run *during a cancel* — the same rule
+    ///   [`Self::dispatch_gate`] applies to a `gate:` in `catch:`/`finally:`.
+    /// - **A run already `Cancelling`.** The cooperative cancel must
+    ///   converge, and this branch runs *before* [`Self::admit`], which is
+    ///   where the loop normally observes a cancel — so the state is read
+    ///   from the row here rather than inferred. Without the read, [`park`]
+    ///   would refuse the illegal `Cancelling -> AwaitingHuman` transition
+    ///   and the refusal would surface as a whole-run
+    ///   [`RunLoopError::Park`], stranding a run that should simply finish
+    ///   draining.
+    ///
+    /// Both fall back to the fail-closed outcome, which never re-runs the
+    /// step without a human decision — the safety property that has to hold
+    /// on every path here.
+    ///
+    /// # `on_timeout` and the wait's window have no author
+    ///
+    /// Unlike a `gate:` step, which always has one. `on_timeout` is
+    /// therefore the conservative [`OnTimeout::Fail`](crate::parse::types::OnTimeout::Fail)
+    /// — an unanswered crash question must not resolve itself into
+    /// re-running an effectful step or into an approval — and the window is
+    /// §8.11's *"with no explicit gate timeout, fall back to 72h"*
+    /// ([`DEFAULT_HOLD_TTL`]). `hold_workspace` is §8.11's default, `false`:
+    /// no author asked for a hold, and the implicit checkpoint is what a
+    /// resume restores from.
+    fn crash_recovery_park(
+        &mut self,
+        executor: &mut Executor<'_>,
+        step: &StepDef,
+        phase: Phase,
+        found: StepRunState,
+    ) -> Result<CrashPark, RunLoopError> {
+        let refuse = |why: &str| {
+            CrashPark::Refused(StepOutcome::failed(
+                &step.id,
+                format!(
+                    "step was interrupted mid-dispatch (found {found:?}) and its on_crash \
+                     policy is Ask, but {why}: refusing to silently re-run an effectful step \
+                     whose completion is unknown"
+                ),
+            ))
+        };
+        if phase != Phase::Main {
+            return Ok(refuse(match phase {
+                Phase::Catch => "a `catch:` block cannot park a run that is already failing",
+                Phase::Finally => "a `finally:` block cannot park a run that is already ending",
+                // Unreachable: the guard above is `phase != Main`. Written
+                // out rather than left to a `_` arm so that a fourth phase is
+                // a compile error here, not a step failure that blames the
+                // wrong block.
+                Phase::Main => "steps:",
+            }));
+        }
+        let run_state = run_ledger(self.conn, self.run_id)?.state;
+        if run_state != RunState::Running {
+            return Ok(refuse(&format!(
+                "the run is not `Running` (currently `{run_state:?}`), and must converge rather than wait on a human"
+            )));
+        }
+
+        let awaiting = AwaitingHuman::from_crash_recovery(
+            TaskId::new(),
+            &format!(
+                "step `{}` was interrupted mid-dispatch and its completion is unknown — re-run \
+                 it, skip it, or fail the run?",
+                step.id
+            ),
+            DEFAULT_HOLD_TTL,
+            &crate::parse::types::OnTimeout::Fail,
+        )?;
+        let parked = park(
+            self.conn,
+            self.run_id,
+            &awaiting,
+            false,
+            self.now,
+            self.host,
+        )?;
+        self.emit_awaiting_human(executor, &step.id, &awaiting, &parked);
+        // The step's row is deliberately **not** rewritten. It already says
+        // `Running`, which is exactly what makes the next load reclassify it
+        // `Indeterminate` again (`durability::recover_run`) — which is how
+        // the human's answer finds the step it belongs to. Writing anything
+        // else here would lose the classification the park exists to resolve.
+        Ok(CrashPark::Parked(parked))
     }
 
     /// §8.12's `call:`, as far as one run's loop can take it: admit against

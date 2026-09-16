@@ -57,7 +57,15 @@
 //!
 //! **This crate computes and persists `awaiting_until`; the daemon — the
 //! crate §5.2 permits to depend on both — registers and cancels the
-//! deadline.**
+//! deadline.** Nothing in `roundhouse-daemon` does so today, for either kind
+//! of park: a `gate:` park's `on_timeout` has never fired, and the
+//! `HumanWaitSource::CrashRecovery` park Phase 8 Task 25.4 added **inherits
+//! that identical gap** — its `on_timeout: fail` is written to the log and
+//! is not enforced by any timer. A park of either kind therefore waits until
+//! it is answered (or until the equally-unowned 7-day reaper below has a
+//! runner). Stated rather than narrowed: the new park source neither widens
+//! nor closes this, and claiming its deadline is enforced would be a claim
+//! about a timer nothing calls.
 //!
 //! # What §8.11 asks for that is NOT built here, and who owns it
 //!
@@ -109,7 +117,8 @@
 //!   the column and [`crate::ledger::parked_runs_past_hold_cap`], the query
 //!   in `gc_eligible_blobs`'s shape. What is left really is only the timer.
 //! - **A `Duration::ZERO` screen for `timeout_after`.** No document-driven
-//!   path produces one today — [`AwaitingHuman::from_gate`] rejects it and
+//!   path produces one today — [`AwaitingHuman::from_gate`] rejects it,
+//!   [`AwaitingHuman::from_crash_recovery`] rejects it, and
 //!   `TryFrom<&UnattendedDef>` rejects it before `from_escalate` ever sees
 //!   it — and [`crate::hitl::HumanWaitSource::Elicitation`] has no
 //!   constructor at all, so
@@ -167,12 +176,22 @@ use thiserror::Error;
 
 /// §8.11: *"With no explicit gate timeout, fall back to 72h."*
 ///
-/// **Reachable only from an elicitation, not from a gate.** A `gate:` step's
-/// `timeout:` is mandatory in the wire shape (`parse::steps::GateBodyDef`
-/// has no `#[serde(default)]` on it), and `Escalate::Park` always carries a
-/// deadline, so `AwaitingHuman::timeout_after` is `None` only for
+/// **As [`resolve_hold_ttl`]'s fallback, reachable only from an elicitation,
+/// not from a gate.** A `gate:` step's `timeout:` is mandatory in the wire
+/// shape (`parse::steps::GateBodyDef` has no `#[serde(default)]` on it), and
+/// `Escalate::Park` always carries a deadline, so
+/// `AwaitingHuman::timeout_after` is `None` only for
 /// `HumanWaitSource::Elicitation` — a mid-step elicitation with no declared
-/// window. That is the one path this constant serves.
+/// window. That is the one path the `unwrap_or` in [`resolve_hold_ttl`]
+/// serves.
+///
+/// **It has a second reader since Phase 8 Task 25.4**, which is the same
+/// sentence of §8.11 applied to the one wait that has no author at all:
+/// `exec::run_loop`'s `Loop::crash_recovery_park` passes this value as the
+/// *window* of a `HumanWaitSource::CrashRecovery` wait (§8.10's `on_crash:
+/// ask`). That is a `Some`, so it does not reach the `unwrap_or` above — the
+/// paragraph before this one is still exactly true — but the constant is no
+/// longer read only there.
 pub const DEFAULT_HOLD_TTL: Duration = Duration::from_secs(72 * 3600);
 
 /// §8.11: *"a system-wide 7-day cap is enforced by a reaper regardless of

@@ -19,8 +19,8 @@
 
 use roundhouse_core::{PolicyDecision, SessionId, SuspendReason, TaskId};
 use roundhouse_flow::hitl::{
-    AwaitingHuman, Escalate, Escalation, HitlError, HumanWaitSource, RunPolicyNarrowing,
-    UncheckedOnTimeout,
+    AwaitingHuman, CrashResolution, Escalate, Escalation, HitlError, HumanWaitSource,
+    RunPolicyNarrowing, UncheckedOnTimeout,
 };
 use roundhouse_flow::parse::steps::{parse_step, StepBody};
 use roundhouse_flow::parse::types::{OnTimeout, RetryDef, UnattendedDef, UnattendedEscalate};
@@ -617,5 +617,122 @@ fn on_timeout_default_carries_its_argument_verbatim_with_evaluation_still_deferr
     assert_eq!(
         awaiting.on_timeout.as_written(),
         &OnTimeout::Default("${{ inputs.fallback }}".to_string())
+    );
+}
+
+// ---------------------------------------------------------------------------
+// §8.10's crash-recovery wait (Phase 8 Task 25.4 Task 5)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_crash_recovery_wait_is_the_same_mechanism_asking_section_8_10s_own_question() {
+    let awaiting = AwaitingHuman::from_crash_recovery(
+        TaskId::new(),
+        "step `deploy` was interrupted mid-dispatch",
+        Duration::from_secs(72 * 3600),
+        &OnTimeout::Fail,
+    )
+    .unwrap();
+
+    assert_eq!(awaiting.source, HumanWaitSource::CrashRecovery);
+    // §8.11's "one mechanism": the same JSON-Schema *object* both existing
+    // renderers already consume, produced by the same `form_schema` helper —
+    // not a fourth shape of its own.
+    assert_eq!(awaiting.form_schema["type"], "object");
+    assert_eq!(
+        awaiting.form_schema["title"],
+        "step `deploy` was interrupted mid-dispatch"
+    );
+    // §8.10's actual recovery question: `rerun | skip | fail`.
+    assert_eq!(
+        awaiting.form_schema["properties"]["resolution"],
+        serde_json::json!({ "type": "string", "enum": ["rerun", "skip", "fail"] })
+    );
+    assert_eq!(awaiting.timeout_after, Some(Duration::from_secs(72 * 3600)));
+    // A crash-triggered park has no workflow author to write `on_timeout:`,
+    // so the run loop supplies the conservative `fail` — see
+    // `Loop::crash_recovery_park`'s own construction site.
+    assert_eq!(awaiting.on_timeout.as_written(), &OnTimeout::Fail);
+}
+
+#[test]
+fn the_crash_recovery_form_cannot_drift_from_the_resolution_vocabulary_it_asks_for() {
+    // The three strings in the form's `enum` are the three `CrashResolution`
+    // variants, derived from the type rather than written out twice: a form
+    // offering an answer the resume path cannot parse is a park a human can
+    // answer and nothing can release.
+    let awaiting = AwaitingHuman::from_crash_recovery(
+        TaskId::new(),
+        "t",
+        Duration::from_secs(60),
+        &OnTimeout::Fail,
+    )
+    .unwrap();
+    let offered: Vec<String> = awaiting.form_schema["properties"]["resolution"]["enum"]
+        .as_array()
+        .expect("the resolution field offers an enum of answers")
+        .iter()
+        .map(|v| v.as_str().expect("each answer is a string").to_string())
+        .collect();
+    let known: Vec<String> = CrashResolution::ALL
+        .iter()
+        .map(|r| r.wire_name().to_string())
+        .collect();
+    assert_eq!(offered, known);
+    for name in &offered {
+        assert_eq!(
+            serde_json::from_value::<CrashResolution>(serde_json::Value::String(name.clone()))
+                .expect("every answer the form offers deserializes back into the type")
+                .wire_name(),
+            name
+        );
+    }
+}
+
+#[test]
+fn a_crash_recovery_wait_with_a_zero_window_is_rejected_exactly_as_a_gates_is() {
+    // Born already expired: it would resolve per `on_timeout` with no human
+    // able to see it, while still appearing in the run record as a
+    // configured approval. `from_gate` rejects the same shape.
+    assert_eq!(
+        AwaitingHuman::from_crash_recovery(TaskId::new(), "t", Duration::ZERO, &OnTimeout::Fail)
+            .unwrap_err(),
+        HitlError::ZeroDeadline {
+            field: "crash_recovery.timeout",
+            value: "0ns".to_string(),
+        }
+    );
+}
+
+#[test]
+fn every_human_wait_source_names_the_suspend_reason_it_records_as() {
+    // The opposite direction of
+    // `every_suspend_reason_is_classified_so_a_sixth_core_variant_breaks_the_build`,
+    // and it is what keeps `hitl.rs`'s module doc honest now that there are
+    // four sources and only three human-wait `SuspendReason`s: this `match`
+    // has no wildcard arm, so a fifth source fails to compile here rather
+    // than silently having nowhere to be recorded.
+    fn suspend_reason_name(source: HumanWaitSource) -> &'static str {
+        match source {
+            HumanWaitSource::Gate => "workflow_gate",
+            HumanWaitSource::PermissionEscalate => "awaiting_approval",
+            HumanWaitSource::Elicitation => "awaiting_elicitation",
+            // Not a fourth core variant: §8.10's crash question is asked
+            // *about a workflow step*, which is exactly what
+            // `SuspendReason::WorkflowGate { step_ref }` already says.
+            HumanWaitSource::CrashRecovery => "workflow_gate",
+        }
+    }
+    assert_eq!(
+        suspend_reason_name(HumanWaitSource::CrashRecovery),
+        suspend_reason_name(HumanWaitSource::Gate),
+    );
+    assert_eq!(
+        suspend_reason_name(HumanWaitSource::PermissionEscalate),
+        "awaiting_approval"
+    );
+    assert_eq!(
+        suspend_reason_name(HumanWaitSource::Elicitation),
+        "awaiting_elicitation"
     );
 }

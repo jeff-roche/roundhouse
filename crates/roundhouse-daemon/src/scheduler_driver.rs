@@ -57,9 +57,12 @@ use chrono::{DateTime, Utc};
 use roundhouse_bus::spawn_tree::SpawnTree;
 use roundhouse_core::{
     BindingId, CancelReason, EventPayload, JobId, OnDegrade, Origin, SessionId, SessionSpec,
-    TaskError, TaskId, TaskKind, TaskOutput, TaskRunner, Tier, Timestamp, Usage, WorkspaceId,
+    SessionState, TaskError, TaskId, TaskKind, TaskOutput, TaskRunner, Tier, Timestamp, Usage,
+    WorkspaceId,
 };
-use roundhouse_engine::workflow_dispatch::dispatch_tool_for_workflow;
+use roundhouse_engine::workflow_dispatch::{
+    dispatch_tool_for_workflow, record_workflow_task_failed, DispatchOutcome, WorkflowToolDispatch,
+};
 use roundhouse_flow::caps::ResourceCaps;
 use roundhouse_flow::durability::{
     claim_workflow_child_continuation_in_transaction,
@@ -810,6 +813,7 @@ enum RunConclusion {
 /// A child parked on a gate leaves both the child and its waiting parent
 /// nonterminal. It cannot be represented as [`RunOutcome::Parked`], because
 /// that variant describes a gate on the run being driven, not on a descendant.
+#[derive(Debug)]
 enum DrivenRun {
     Outcome(RunOutcome),
     ChildParked,
@@ -1004,9 +1008,18 @@ fn flush_task_events(
 }
 
 /// A [`WorkDone`] for a `PendingWork` this daemon cannot yet dispatch for
-/// real — no task was ever minted, so every task-identity field is `None`.
-/// See [`DeliveryExecutor::execute_pending`] for why this always answers
-/// rather than dropping the item.
+/// real, or dispatched but can prove no task was ever durably minted for —
+/// every task-identity field is `None`. Besides the `agent:`/`call:`
+/// refusals below (never dispatched at all), this is also what
+/// [`DeliveryExecutor::execute_pending`]'s filesystem-kind timeout arm falls
+/// back to when `dispatch_tool_for_workflow`'s `identity_sink` comes back
+/// empty — proof `TaskCreated` itself was never appended before the future
+/// was dropped. When identity *is* known on that arm, `execute_pending`
+/// builds its `WorkDone` directly instead of calling this, so the row can
+/// carry the real `task_id`/`first_task_seq` (see that method's own doc
+/// comment for the full account, including issue #69's original gap this
+/// closes). See [`DeliveryExecutor::execute_pending`] more generally for why
+/// this always answers rather than dropping the item.
 fn unanswerable_work(step_id: String, message: String) -> WorkDone {
     WorkDone {
         step_id,
@@ -1050,6 +1063,112 @@ impl SegmentGapGate {
 
     fn release(&self, permits: usize) {
         self.releases.add_permits(permits);
+    }
+}
+
+/// Folds a `dispatch_tool_for_workflow` outcome into the [`WorkDone`] shape
+/// [`DeliveryExecutor::execute_pending`] hands back for one `PendingKind::Tool`
+/// item — shared between its `Shell` branch (no outer timeout wrap) and its
+/// filesystem-kinds branch (wrapped in `tokio::time::timeout`), so the two
+/// only differ in how they got a `Result<WorkflowToolDispatch, String>`, not
+/// in how they interpret one.
+///
+/// Phase 8 Task 25.4 Task 4: `DispatchOutcome::Cancelled` becomes
+/// `WorkStatus::Cancelled` here — today reachable only through the `Shell`
+/// branch, whose `ToolDispatchError::ShellSessionCancelled` is the only
+/// `DispatchOutcome::Cancelled` producer inside `dispatch_tool_for_workflow`
+/// itself. The four filesystem kinds never produce it from in here; see
+/// [`DeliveryExecutor::execute_pending`]'s own doc comment for how (and why)
+/// those four are instead reclassified by the caller, after the fact.
+fn work_done_from_dispatch(
+    step_id: String,
+    dispatched: Result<WorkflowToolDispatch, String>,
+) -> WorkDone {
+    match dispatched {
+        Ok(dispatched) => {
+            let (status, output) = match dispatched.result {
+                DispatchOutcome::Completed(value) => (WorkStatus::Completed, value),
+                DispatchOutcome::Failed(message) => {
+                    (WorkStatus::Failed { message }, serde_json::Value::Null)
+                }
+                DispatchOutcome::Cancelled(reason) => {
+                    (WorkStatus::Cancelled { reason }, serde_json::Value::Null)
+                }
+            };
+            WorkDone {
+                step_id,
+                status,
+                output,
+                output_is_secret_derived: false,
+                task_id: Some(dispatched.task_id),
+                first_task_seq: Some(dispatched.first_task_seq),
+                last_task_seq: dispatched.last_task_seq,
+            }
+        }
+        Err(message) => unanswerable_work(step_id, message),
+    }
+}
+
+/// `session`'s actor's exact `SessionState` — unless it is `Created`/
+/// `Running`, in which case `None` (nothing about the run itself indicates a
+/// call dispatched under it should be reported as interrupted). Mirrors
+/// `roundhouse_engine::tool_dispatch::wait_for_session_cancel`'s own
+/// "not `Created`/`Running`" predicate exactly, and deliberately: that is
+/// the live, mid-dispatch signal `Shell` gets for free via
+/// `ToolDispatchError::ShellSessionCancelled`, and this is the same
+/// predicate applied post-hoc — see
+/// [`DeliveryExecutor::execute_pending`]'s own doc comment for both call
+/// sites and why each needs this.
+///
+/// Returning the real state (not a bare bool) is what lets
+/// [`cancel_reclassification_reason`] name what was actually observed —
+/// `Cancelling` and `Closed` are the interesting/expected cases, `Suspended`
+/// is a real but distinct one, and collapsing all three into one generic
+/// "cancelled" reason string was itself a finding (Phase 8 Task 25.4 PR #68
+/// follow-up): the state is knowable here, so the reason it produces should
+/// say which one fired rather than erase the difference.
+///
+/// A fresh [`roundhouse_engine::SessionActor::subscribe`] call returns a
+/// receiver already initialized with the channel's *current* value, so
+/// `.borrow()` on it is an immediate snapshot, not a wait: this is a
+/// **post-hoc check**, not a race.
+fn interrupting_session_state(session: &HeadlessSession) -> Option<SessionState> {
+    match *session.actor().subscribe().borrow() {
+        SessionState::Created | SessionState::Running => None,
+        ref other => Some(other.clone()),
+    }
+}
+
+/// The reason recorded on a `tool:` step reclassified as
+/// `WorkStatus::Cancelled` after its (uninterruptible, or already-returned)
+/// dispatch — see [`DeliveryExecutor::execute_pending`]'s own doc comment
+/// for the honest limit this names. Names the exact `state` observed rather
+/// than a generic "cancelled" — see [`interrupting_session_state`]'s own doc
+/// comment for why collapsing that distinction was itself a finding.
+fn cancel_reclassification_reason(state: &SessionState) -> String {
+    format!(
+        "the owning session was observed in state {state:?} (not `Created`/`Running`) while \
+         this tool call was in flight or about to be dispatched; the call was allowed to run \
+         to completion (or had already completed) before being reported as cancelled"
+    )
+}
+
+/// Applies [`interrupting_session_state`]'s post-hoc reclassification to
+/// `done` in place, if it fires — shared by both `execute_pending` branches
+/// that need it (`Shell` and the four filesystem kinds; see that method's
+/// own doc comment for why each does). A no-op if `session`'s state is
+/// `Created`/`Running`, or if `done` is already `WorkStatus::Cancelled`
+/// (never overwrite a real cancel — `Shell`'s own live signal via
+/// `ToolDispatchError::ShellSessionCancelled` — with this post-hoc one).
+fn reclassify_if_interrupted(done: &mut WorkDone, session: &HeadlessSession) {
+    if matches!(done.status, WorkStatus::Cancelled { .. }) {
+        return;
+    }
+    if let Some(state) = interrupting_session_state(session) {
+        done.status = WorkStatus::Cancelled {
+            reason: cancel_reclassification_reason(&state),
+        };
+        done.output = serde_json::Value::Null;
     }
 }
 
@@ -1321,12 +1440,14 @@ impl DeliveryExecutor {
     ///
     /// The one deliberate exception is [`RunConclusion::Parked`]. A parked
     /// run is *not* terminal — `roundhouse-flow` will drive it to completion
-    /// when a human answers its gate — so completing or failing the delivery
-    /// there would be a lie, and releasing the slot would let the same
-    /// binding start a second run on top of one that is still live. Nothing
-    /// in these tasks resumes a parked scheduled run, so such a delivery
-    /// holds its slot until the daemon restarts; that is a known limitation
-    /// with a named owner (human-in-the-loop resumption), not an oversight.
+    /// when a human answers the wait, whether that is a `gate:` step or
+    /// (Phase 8 Task 25.4) §8.10's `on_crash: ask` crash recovery — so
+    /// completing or failing the delivery there would be a lie, and
+    /// releasing the slot would let the same binding start a second run on
+    /// top of one that is still live. Nothing in these tasks resumes a
+    /// parked scheduled run, so such a delivery holds its slot until the
+    /// daemon restarts; that is a known limitation with a named owner
+    /// (human-in-the-loop resumption), not an oversight.
     async fn run_claimed(&self, claimed: ClaimedDelivery) {
         let ClaimedDelivery {
             delivery,
@@ -1432,7 +1553,8 @@ impl DeliveryExecutor {
             RunConclusion::Parked => {
                 tracing::info!(
                     binding_id = %binding_id,
-                    "a scheduled run parked on a human gate; its delivery stays `running`, its \
+                    "a scheduled run parked on a human wait (a `gate:` step, or §8.10's \
+                     `on_crash: ask` crash recovery); its delivery stays `running`, its \
                      admission slot stays held, and its session stays alive until the run is \
                      resumed"
                 );
@@ -1756,6 +1878,7 @@ impl DeliveryExecutor {
             workspace_root,
             run_ctx,
             now,
+            // A cold start: this delivery's run was just created.
             None,
         )
         .await
@@ -1930,12 +2053,15 @@ impl DeliveryExecutor {
             workspace_root,
             run_ctx,
             boot,
+            // The cold entry `failed_step_rows`'s argument depends on: a
+            // restart-recovery pass holds no outstanding `PendingWork`, and
+            // no human answer either.
             None,
         )
         .await
     }
 
-    /// Drives one run from `resume: None` all the way to a
+    /// Drives one run from `initial_resume` all the way to a
     /// `Terminal`/`Parked` outcome, executing every `AwaitingWork`
     /// suspension for real in between (Phase 8 Task 25.2/25.3's segmented
     /// driving loop). The workflow definition is resolved once, up front —
@@ -1961,9 +2087,29 @@ impl DeliveryExecutor {
     /// comment carries the whole argument for why an entry carrying a
     /// `Resume::Work` — which only this loop can produce — is the one entry
     /// on which a `Failed` row belongs to the drive still in progress rather
-    /// than to a dead one. Note where the loop starts every drive, including
-    /// the one [`Self::rebuild_and_drive_recovered_run`] makes after a
-    /// restart: `resume: None`, the cold entry that argument depends on.
+    /// than to a dead one. Note where both production callers start every
+    /// drive, including the one [`Self::rebuild_and_drive_recovered_run`]
+    /// makes after a restart: `initial_resume: None`, the cold entry that
+    /// argument depends on.
+    ///
+    /// # `initial_resume`, and why it is a parameter with no production caller yet
+    ///
+    /// The answer to carry into the **first** segment, for a drive that is
+    /// resuming a parked run rather than starting one: a
+    /// `Resume::Gate`/`Resume::CrashRecovery` releasing an
+    /// `AwaitingHuman` run (`roundhouse_flow`'s `run_workflow` refuses to
+    /// drive such a run without one). Every production caller passes `None`,
+    /// because nothing in this daemon resumes a parked run yet — that is the
+    /// same named-owner gap [`Self::run_claimed`]'s
+    /// `RunConclusion::Parked` arm records. It is a parameter rather than a
+    /// hardcoded `None` for the reason `SessionTree::child_terminated`'s own
+    /// doc gives for its unreached call site: whatever eventually resumes a
+    /// park inherits the segmented driving loop by construction, instead of
+    /// growing a second copy of it — and it is what lets this module's own
+    /// `a_crash_recovery_park_is_answered_and_the_write_step_really_re_dispatches`
+    /// exercise a real park-and-resume cycle through the production loop
+    /// rather than a simulation of one.
+    #[allow(clippy::too_many_arguments)]
     async fn drive_run_to_completion(
         &self,
         run_id: RunId,
@@ -2037,7 +2183,7 @@ impl DeliveryExecutor {
                         gate.enter().await;
                     }
                     match self
-                        .execute_pending(
+                        .execute_pending_with_context(
                             session,
                             session_id,
                             &spec,
@@ -2063,10 +2209,138 @@ impl DeliveryExecutor {
     /// still gets a [`WorkDone`], just a failed one, so the run is never
     /// left suspended forever waiting on an answer nothing will supply.
     ///
-    /// **Scope: `tool: read` and recursively driven `call:` children only.**
-    /// Every other `tool:` kind and every `agent:` step are refused with a
-    /// named, recorded failure — wiring them is Phase 8 Tasks 25.4/25.5.
-    async fn execute_pending(
+    /// **Scope: `tool: read|write|edit|find|shell` and recursively driven
+    /// `call:` children.** Every `agent:` step is refused with a named,
+    /// recorded failure; wiring it is Phase 8 Task 25.5.
+    ///
+    /// # `step_timeout` enforcement (Phase 8 Task 25.4 Task 3)
+    ///
+    /// Every `Tool` item's own `PendingWork.step_timeout` is passed straight
+    /// through to `dispatch_tool_for_workflow`, which threads it into
+    /// [`roundhouse_engine::tool_dispatch::execute_builtin`]'s `timeout`
+    /// parameter. For `Shell` that parameter is a real, self-contained
+    /// bound: an elapsed timeout is a process-group kill (SIGTERM
+    /// escalating to SIGKILL, confirmed) before `execute_builtin` ever
+    /// returns.
+    ///
+    /// The four filesystem kinds (`Read`/`Write`/`Edit`/`Find`) have no such
+    /// internal mechanism — their futures are simply awaited to completion
+    /// inside `execute_builtin` — so this function additionally wraps
+    /// *their* `dispatch_tool_for_workflow` call in
+    /// `tokio::time::timeout(step_timeout, ..)` as an outer safety net.
+    ///
+    /// **`Shell` deliberately does NOT get that same outer wrap, and this is
+    /// load-bearing, not an oversight.** `dispatch_tool_for_workflow` admits
+    /// the step and appends `TaskCreated`/`TaskStarted` (real store I/O)
+    /// *before* `execute_builtin`'s own `tokio::time::sleep(timeout)` timer
+    /// ever starts — so an outer timeout of the identical duration, started
+    /// at the identical instant this function calls
+    /// `dispatch_tool_for_workflow`, would *always* reach its deadline
+    /// first. `tokio::time::timeout` on the losing side drops the inner
+    /// future outright: the pre-spawned `Child` (and the still-running
+    /// process it wraps) would be dropped out from under
+    /// `run_isolated_shell_dispatch`'s `tokio::select!` before its own
+    /// timeout branch — the one that actually calls `Child::cancel` and
+    /// awaits its confirmation — ever got a chance to run. `roundhouse_sandbox::Child`
+    /// has no `Drop` impl that kills anything, so that is exactly the
+    /// "wrapped only around the outer future... merely drops that future
+    /// and leak[s] the child" failure this task's brief warns against —
+    /// reintroduced by the outer wrap it also asks for, if applied
+    /// unconditionally. So `Shell` is bounded by the inner, real mechanism
+    /// alone; the outer wrap exists only for the four kinds that have
+    /// nothing else.
+    ///
+    /// A `step_timeout` of [`Duration::ZERO`](std::time::Duration::ZERO) is
+    /// refused outright, before any dispatch is attempted (whatever the
+    /// tool kind), with a message naming it as a bug rather than a timeout —
+    /// see `roundhouse_flow::exec::run_loop::PendingWork::step_timeout`'s
+    /// own doc comment for the (today unreachable) `unwrap_or_default()`
+    /// branch that could otherwise produce one. Handing `Duration::ZERO`
+    /// straight to `tokio::time::timeout` (or to `execute_builtin`'s
+    /// `timeout`) would make every dispatch "time out" instantly and
+    /// indistinguishably from a real one, which is a worse failure mode
+    /// than refusing to guess what zero was supposed to mean.
+    ///
+    /// ## The outer timeout arm still reports real task identity (issue #69)
+    ///
+    /// The four filesystem kinds' outer `tokio::time::timeout` wrap has to
+    /// drop `dispatch_tool_for_workflow`'s future outright when it loses the
+    /// race — but that future has usually already appended
+    /// `TaskCreated`/`TaskStarted` for a real `task_id` by then. Answering
+    /// with [`unanswerable_work`] (`task_id: None`) in that case would be a
+    /// lie — the task was minted and is durably logged, just not reported —
+    /// and would leave it `Running` in the `tasks` materialized view until
+    /// the next daemon boot's recovery pass repairs it. Instead, the
+    /// `identity_sink` handed to `dispatch_tool_for_workflow` (see that
+    /// function's own doc comment) reports `(task_id, first_task_seq)` the
+    /// instant `TaskCreated` lands, race-free with respect to the future
+    /// being dropped; on `Err(_elapsed)` this function checks that channel
+    /// and, when it has an answer, itself appends a real terminal
+    /// `TaskFailed` (`record_workflow_task_failed`) and reports true
+    /// identity. Only when the channel comes back empty — proof
+    /// `TaskCreated` itself was never appended — does this fall back to
+    /// [`unanswerable_work`], which is accurate in that case.
+    ///
+    /// # §8.13 cooperative cancel (Phase 8 Task 25.4 Task 4)
+    ///
+    /// `WorkStatus::Cancelled` (`roundhouse_flow::exec::run_loop`) exists so
+    /// a step the run's own cancel interrupted is told apart from one that
+    /// merely failed; this function is its first, and so far only,
+    /// producer.
+    ///
+    /// **`Shell` gets real mid-dispatch cancellation for (mostly) free.**
+    /// `dispatch_tool_for_workflow` already threads
+    /// `Some(session.actor().subscribe())` into `execute_builtin`, which is
+    /// already consumed by `run_isolated_shell_dispatch`'s own
+    /// `tokio::select!` — a cancel observed there is a real
+    /// SIGTERM→SIGKILL-and-confirm, exactly like a timeout, and is reported
+    /// back as `ToolDispatchError::ShellSessionCancelled`
+    /// (`roundhouse_engine::tool_dispatch`), which
+    /// `dispatch_tool_for_workflow` folds into `DispatchOutcome::Cancelled`
+    /// and [`work_done_from_dispatch`] folds into `WorkStatus::Cancelled`.
+    /// This function's own job for `Shell`'s dispatch itself is exactly what
+    /// it was before this task: await the one dispatch future to
+    /// completion, no outer race — adding one here would drop the future
+    /// holding the pre-spawned child before its own kill-and-confirm logic
+    /// could run, the identical hazard the no-outer-timeout-wrap reasoning
+    /// above already covers. What the live signal does **not** cover is a
+    /// cancel landing before `run_isolated_shell_dispatch`'s `select!` ever
+    /// starts (during `admit_task` or the child pre-spawn) — a Phase 8 Task
+    /// 25.4 PR #68 follow-up finding — so `Shell`'s branch below applies the
+    /// same post-hoc [`interrupting_session_state`] check the filesystem
+    /// kinds use, guarded so it never overwrites a real `Cancelled` the live
+    /// signal already produced.
+    ///
+    /// **The four filesystem kinds cannot be interrupted mid-call, and this
+    /// function does not pretend otherwise.** `execute_builtin`'s
+    /// `Read`/`Write`/`Edit`/`Find` arms never consult `cancel` at all —
+    /// `find` in particular runs inside `tokio::task::spawn_blocking`, whose
+    /// `JoinHandle` dropping does not stop the blocking thread, so there is
+    /// no honest way to abort one in flight. The behaviour this function
+    /// implements instead (the brief's own "allowed to finish" alternative,
+    /// deliberately chosen over "not interruptible, reports normally" so
+    /// that a cancel is never silently invisible in a step's own recorded
+    /// outcome): the call runs to completion — through Task 3's existing
+    /// outer `tokio::time::timeout` unchanged, never raced against a
+    /// separate cancel-drop that would orphan an in-flight
+    /// `TaskCreated`/`TaskStarted` pair the same way an outer timeout wrap
+    /// would for `Shell` — and once it returns,
+    /// [`interrupting_session_state`] takes a **post-hoc** snapshot of
+    /// `session.actor()`'s `SessionState` (a fresh `subscribe()` call
+    /// returns the channel's *current* value, so this is a check, not a
+    /// race) and reclassifies a `Completed`/`Failed` outcome as
+    /// `WorkStatus::Cancelled` when the session was already
+    /// cancelled/suspended/closed by the time the call returned — naming
+    /// exactly which of those three in the recorded reason
+    /// ([`cancel_reclassification_reason`]), rather than a single generic
+    /// "cancelled" string that erased the distinction (the other half of
+    /// that same follow-up finding). This does **not** distinguish
+    /// "interrupted before the call started" from "interrupted while it was
+    /// running" — both look identical from outside an uninterruptible call
+    /// — and it makes no `workspace_released`-style claim: whatever the
+    /// call actually did (wrote a file, read one) already happened by the
+    /// time it is relabelled.
+    async fn execute_pending_with_context(
         &self,
         session: &HeadlessSession,
         session_id: SessionId,
@@ -2083,33 +2357,152 @@ impl DeliveryExecutor {
                     logged_input,
                     dispatch_input,
                     ..
-                } => match dispatch_tool_for_workflow(
-                    session.actor(),
-                    task_kind,
-                    logged_input,
-                    dispatch_input,
-                )
-                .await
-                {
-                    Ok(dispatched) => {
-                        let (status, output) = match dispatched.result {
-                            Ok(value) => (WorkStatus::Completed, value),
-                            Err(message) => {
-                                (WorkStatus::Failed { message }, serde_json::Value::Null)
+                } => {
+                    let step_timeout = item.step_timeout;
+                    if step_timeout.is_zero() {
+                        unanswerable_work(
+                            item.step_id,
+                            "step_timeout was zero, which should be unreachable — refusing \
+                             rather than treating it as either \"no timeout\" or a legitimate \
+                             instant timeout"
+                                .into(),
+                        )
+                    } else if task_kind == TaskKind::Shell {
+                        // No outer wrap here — see this method's own doc
+                        // comment for why racing an identical-duration
+                        // outer timeout against Shell's inner one would
+                        // orphan the child instead of protecting anything.
+                        let dispatched = dispatch_tool_for_workflow(
+                            session.actor(),
+                            task_kind,
+                            logged_input,
+                            dispatch_input,
+                            step_timeout,
+                            None,
+                        )
+                        .await;
+                        let mut done = work_done_from_dispatch(item.step_id, dispatched);
+                        // Closes the asymmetry named by the Phase 8 Task
+                        // 25.4 PR #68 follow-up: Shell's own live signal
+                        // (`ToolDispatchError::ShellSessionCancelled`) only
+                        // covers a cancel observed *during*
+                        // `run_isolated_shell_dispatch`'s own
+                        // `tokio::select!` — a cancel landing in the
+                        // pre-dispatch window (before that select! starts,
+                        // e.g. during `admit_task` or the child pre-spawn)
+                        // surfaces as an ordinary `Failed`, not `Cancelled`.
+                        // [`reclassify_if_interrupted`]'s same post-hoc
+                        // snapshot, shared with the filesystem branch below,
+                        // closes that gap here too — its own guard against
+                        // double-wrapping an already-`Cancelled` `Shell`
+                        // result is what makes this safe to call
+                        // unconditionally.
+                        reclassify_if_interrupted(&mut done, session);
+                        done
+                    } else {
+                        // Reports `(task_id, first_task_seq)` the instant
+                        // `TaskCreated` is durably appended inside
+                        // `dispatch_tool_for_workflow`, so the `Err(_elapsed)`
+                        // arm below can still learn real task identity even
+                        // though the outer timeout drops that future before
+                        // it ever returns — see `dispatch_tool_for_workflow`'s
+                        // own doc comment on `identity_sink` for why this is
+                        // race-free, and issue #69 for the gap this closes.
+                        let (identity_tx, mut identity_rx) = tokio::sync::oneshot::channel();
+                        match tokio::time::timeout(
+                            step_timeout,
+                            dispatch_tool_for_workflow(
+                                session.actor(),
+                                task_kind,
+                                logged_input,
+                                dispatch_input,
+                                step_timeout,
+                                Some(identity_tx),
+                            ),
+                        )
+                        .await
+                        {
+                            Ok(dispatched) => {
+                                let mut done = work_done_from_dispatch(item.step_id, dispatched);
+                                // [`reclassify_if_interrupted`]'s post-hoc
+                                // reclassification — see this method's own
+                                // doc comment for the full reasoning. A
+                                // `Cancelled` status cannot reach this arm
+                                // (filesystem dispatch has no producer of
+                                // its own), but its internal guard against
+                                // double-wrapping one is what makes sharing
+                                // this helper with the `Shell` branch above
+                                // (which *can* already be `Cancelled` here)
+                                // safe.
+                                reclassify_if_interrupted(&mut done, session);
+                                done
                             }
-                        };
-                        WorkDone {
-                            step_id: item.step_id,
-                            status,
-                            output,
-                            output_is_secret_derived: false,
-                            task_id: Some(dispatched.task_id),
-                            first_task_seq: Some(dispatched.first_task_seq),
-                            last_task_seq: dispatched.last_task_seq,
+                            Err(_elapsed) => {
+                                let message = format!(
+                                    "the tool call exceeded its {step_timeout:?} step_timeout"
+                                );
+                                match identity_rx.try_recv() {
+                                    // `TaskCreated`/`TaskStarted` may already be
+                                    // durably logged for this real task_id — do
+                                    // not answer as if none was ever minted.
+                                    // Append a real terminal `TaskFailed` so the
+                                    // step's row carries true identity and the
+                                    // task doesn't sit `Running` until the next
+                                    // daemon boot's recovery pass repairs it.
+                                    Ok((task_id, first_task_seq)) => {
+                                        match record_workflow_task_failed(
+                                            session.actor(),
+                                            task_id,
+                                            "step_timeout",
+                                            message.clone(),
+                                        )
+                                        .await
+                                        {
+                                            Ok(last_task_seq) => WorkDone {
+                                                step_id: item.step_id,
+                                                status: WorkStatus::Failed { message },
+                                                output: serde_json::Value::Null,
+                                                output_is_secret_derived: false,
+                                                task_id: Some(task_id),
+                                                first_task_seq: Some(first_task_seq),
+                                                last_task_seq: Some(last_task_seq),
+                                            },
+                                            // The terminal append itself failed —
+                                            // still report the real identity we
+                                            // do have rather than claim none was
+                                            // minted; `last_task_seq: None`
+                                            // honestly reflects that no terminal
+                                            // event was confirmed, leaving this
+                                            // task for the next boot's recovery
+                                            // pass exactly as before this fix.
+                                            Err(append_err) => WorkDone {
+                                                step_id: item.step_id,
+                                                status: WorkStatus::Failed {
+                                                    message: format!(
+                                                        "{message}; additionally failed to record \
+                                                         its terminal event: {append_err}"
+                                                    ),
+                                                },
+                                                output: serde_json::Value::Null,
+                                                output_is_secret_derived: false,
+                                                task_id: Some(task_id),
+                                                first_task_seq: Some(first_task_seq),
+                                                last_task_seq: None,
+                                            },
+                                        }
+                                    }
+                                    // The channel closed with nothing ever sent:
+                                    // `dispatch_tool_for_workflow` was dropped
+                                    // before its `TaskCreated` append ever
+                                    // completed, so `unanswerable_work`'s
+                                    // "no task was ever minted" is actually true
+                                    // here.
+                                    Err(_) => unanswerable_work(item.step_id, message),
+                                }
+                            }
                         }
                     }
-                    Err(message) => unanswerable_work(item.step_id, message),
-                },
+                }
                 PendingKind::Agent { .. } => unanswerable_work(
                     item.step_id,
                     "workflow dispatch of `agent:` steps is not wired yet (Phase 8 Task 25.5)"
@@ -2209,6 +2602,47 @@ impl DeliveryExecutor {
             });
         }
         PendingExecution::Done(done)
+    }
+
+    #[cfg(test)]
+    async fn execute_pending(
+        &self,
+        session: &HeadlessSession,
+        pending: Vec<PendingWork>,
+    ) -> Vec<WorkDone> {
+        let session_spec = SessionSpec {
+            workspace: WorkspaceId::new(),
+            name: None,
+            requested_tier: Tier::Sandbox,
+            on_degrade: OnDegrade::Refuse,
+            parent: None,
+        };
+        let run_ctx = RunContext {
+            inputs: serde_json::Value::Null,
+            inputs_secret_derived: false,
+            vars: serde_json::Value::Null,
+            secrets: HashMap::new(),
+            run_id: RunId::new(),
+            previous_report: None,
+            env_allowlist: EnvAllowlist::deny_all(),
+            worktree_provider: None,
+        };
+        match self
+            .execute_pending_with_context(
+                session,
+                session.session_id(),
+                &session_spec,
+                std::path::Path::new("/"),
+                &run_ctx,
+                pending,
+            )
+            .await
+        {
+            PendingExecution::Done(done) => done,
+            PendingExecution::ChildParked => {
+                panic!("the compatibility helper only supports tool dispatch tests")
+            }
+        }
     }
 
     /// Converts one terminal child run into the terminal event for the parent
@@ -4448,8 +4882,16 @@ mod tests {
 /// [`FixedClock`] the harness injects into [`DeliveryExecutor`], and the one
 /// place a test waits (the parked case's spawned task) is driven by awaiting
 /// the call directly rather than sleeping.
+///
+/// Split out of this file into `scheduler_driver/delivery_tests.rs` (Phase 8
+/// Task 25.4 follow-up) purely to keep the production source file a
+/// manageable size — this stays a `#[cfg(test)]` submodule of
+/// `scheduler_driver`, not an integration test crate, since it reaches
+/// private items (`SegmentGapGate`, `interrupting_session_state`,
+/// `unanswerable_work`, `work_done_from_dispatch`, `DeliveryExecutor`'s
+/// private fields) that an external `tests/` binary cannot see.
 #[cfg(test)]
-mod delivery_tests {
+mod child_run_tests {
     use super::*;
     use crate::session_registry::SessionRegistry;
     use crate::test_support::{daemon_resources, daemon_resources_with_rules};
@@ -7067,7 +7509,7 @@ mod delivery_tests {
         let outcome = {
             let _guard = tracing::dispatcher::set_default(&dispatch);
             executor
-                .execute_pending(
+                .execute_pending_with_context(
                     &parent,
                     parent.session_id(),
                     &spec,
@@ -7097,7 +7539,7 @@ mod delivery_tests {
             let _guard = tracing::dispatcher::set_default(&dispatch);
             harness
                 .executor
-                .execute_pending(
+                .execute_pending_with_context(
                     &parent,
                     parent.session_id(),
                     &spec,
@@ -7137,7 +7579,7 @@ mod delivery_tests {
         let outcome = {
             let _guard = tracing::dispatcher::set_default(&dispatch);
             executor
-                .execute_pending(
+                .execute_pending_with_context(
                     &parent,
                     parent.session_id(),
                     &spec,
@@ -8321,3 +8763,6 @@ mod delivery_tests {
         }
     }
 }
+
+#[cfg(test)]
+mod delivery_tests;
