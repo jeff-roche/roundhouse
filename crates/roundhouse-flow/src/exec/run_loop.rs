@@ -503,8 +503,23 @@ pub enum PendingKind {
         dispatch_input: Value,
     },
     Agent {
+        /// `{"prompt": .., "model": ..}` — the redacted rendering of both
+        /// templated fields (ruling P33). `tools`/`output_schema` are not
+        /// templated (a tool allowlist and a JSON Schema literal, never
+        /// `${{ }}` text), so they are not duplicated here.
         logged_prompt: Value,
         dispatch_prompt: String,
+        /// The step's declared `agent.model`, interpolated — `None` when the
+        /// step didn't set one. Previously dropped entirely: `Executor::
+        /// dispatch_step`'s `StepBody::Agent { prompt, .. }` arm destructured
+        /// only `prompt`.
+        model: Option<String>,
+        /// The step's declared `agent.tools` allowlist, passed through
+        /// verbatim — a plain list of tool names, not a template.
+        tools: Vec<String>,
+        /// The step's declared `agent.output_schema`, passed through
+        /// verbatim — a JSON Schema literal, not a template.
+        output_schema: Option<Value>,
     },
     /// A `call:` child run and Session already exist (created by
     /// [`Loop::dispatch_call`]); the caller drives the child and reports its

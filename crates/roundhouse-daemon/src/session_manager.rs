@@ -266,7 +266,7 @@ pub async fn create_headless_session(
 /// directly by that function's caller. See [`create_headless_session`]'s own
 /// doc comment for why this split exists.
 async fn build_headless_session(
-    resources: &DaemonResources,
+    resources: &Arc<DaemonResources>,
     registry: &Arc<SessionRegistry>,
     session_id: SessionId,
     spec: SessionSpec,
@@ -319,6 +319,16 @@ async fn build_headless_session(
         teardown_real_session(&resources.proxy, discarded).await;
         return Err(CreateHeadlessSessionError::RegistryFull);
     };
+
+    // Phase 8 Task 25.5 (#62): a headless session is a ROOT session in the
+    // spawn-tree sense — the scheduler mints it directly, not another
+    // session's `agent` tool call — the same fact `socket_server::
+    // drive_session`'s identical call already documents for a socket client.
+    // Without this, a workflow's `agent:` step could never spawn a child:
+    // `SessionActor::sub_agent_host()` would stay `None` for every headless
+    // session, and `dispatch_agent`/`dispatch_agent_for_workflow` refuse with
+    // `sub_agent_host_unavailable` when it is.
+    crate::sub_agent_host::wire_sub_agent_host(&actor_for_reaper, resources, registry);
 
     let reaper = spawn_session_reaper(
         registry.clone(),
@@ -621,6 +631,45 @@ mod tests {
             registry.actor(session_id).is_none(),
             "HeadlessSession::teardown must remove the session from the registry"
         );
+    }
+
+    /// Phase 8 Task 25.5 (#62): a headless session is how the scheduler runs
+    /// a workflow, and a workflow `agent:` step spawns through the same
+    /// `SubAgentHost` machinery the chat path uses — but until this test's
+    /// production code lands, `wire_sub_agent_host` is called only from
+    /// `socket_server::drive_session`, so a headless session's `SessionActor`
+    /// has none registered and would refuse a spawn with
+    /// `sub_agent_host_unavailable`. See `sub_agent_host::wire_sub_agent_host`'s
+    /// own doc comment, which named this exact gap.
+    #[tokio::test]
+    async fn a_headless_session_can_spawn_sub_agents() {
+        let dir = tempfile::tempdir().unwrap();
+        let resources = resources(dir.path()).await;
+        let registry = Arc::new(SessionRegistry::new());
+        let session_id = SessionId::new();
+        let spec = test_spec(WorkspaceId::new(), &resources);
+
+        let headless = create_headless_session(
+            &resources,
+            &registry,
+            session_id,
+            spec,
+            dir.path().to_path_buf(),
+            None,
+            None,
+        )
+        .await
+        .expect("headless session construction must succeed against a working fixture");
+
+        assert!(
+            headless.actor().sub_agent_host().is_some(),
+            "a headless (scheduled/workflow) session must have a SubAgentHost registered, \
+             the same way socket_server::drive_session wires one for a chat session, so an \
+             `agent:` workflow step can spawn a real child rather than refusing with \
+             sub_agent_host_unavailable"
+        );
+
+        headless.teardown(&registry, &resources.proxy).await;
     }
 
     /// The counterpart to the assertion above: teardown must release the

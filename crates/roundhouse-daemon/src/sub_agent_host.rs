@@ -468,18 +468,17 @@ fn now_ts() -> Timestamp {
 
 /// Gives `actor` — a ROOT session — the ability to spawn sub-agents.
 ///
-/// **Exactly one production caller today: `socket_server::drive_session`,
-/// after `SessionRegistry::create` succeeds.** That is the only path in this
-/// daemon that drives `run_agent_loop`, so it is the only path where an
-/// `agent` tool call can be issued at all.
-///
-/// The headless/scheduled path (`session_manager::create_headless_session`
-/// via `scheduler_driver`) deliberately does **not** call this: those sessions
-/// run workflows, not agent loops. A scheduled session therefore cannot spawn
-/// sub-agents, and would refuse an `agent` call with a recorded
-/// `sub_agent_host_unavailable` if something ever handed it one. Whichever
-/// task first drives an agent loop from a scheduled session owns adding the
-/// call there.
+/// Two production callers: `socket_server::drive_session`, after
+/// `SessionRegistry::create` succeeds (a socket client is a human, not
+/// somebody else's child), and, as of Phase 8 Task 25.5 (#62),
+/// `session_manager::build_headless_session` (the scheduler's path via
+/// `create_headless_session`) — a scheduled workflow session is equally a
+/// ROOT session in the spawn-tree sense: the scheduler mints it directly,
+/// never another session's `agent` tool call. Before #62, only the socket
+/// path called this, so a workflow `agent:` step's spawn attempt would refuse
+/// with a recorded `sub_agent_host_unavailable`; the daemon's `agent:` step
+/// dispatch (`roundhouse-engine`'s `workflow_dispatch::dispatch_agent_for_workflow`)
+/// relies on this being wired for both.
 ///
 /// Sub-agent children never come through here — they get their host from
 /// [`DaemonSubAgentHost::create_child_session`], the only caller that knows a
