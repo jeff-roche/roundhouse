@@ -42,12 +42,25 @@
 //! - **No `SuspendReason` variant.** `roundhouse_core::SuspendReason` has
 //!   five variants, three of which are human waits — `AwaitingApproval`,
 //!   `AwaitingElicitation` and `WorkflowGate { step_ref }` — and those
-//!   three are exactly §8.11's three sources, so [`HumanWaitSource`] maps
-//!   1:1 onto types that already exist rather than adding a parallel
-//!   taxonomy. (`AwaitingReply` and `AwaitingPeer` are the messaging waits
-//!   and have no human-wait source; `tests/hitl.rs` pins the whole mapping
-//!   with an exhaustive `match`, so a sixth core variant is a build break
-//!   rather than a stale comment.) The persistence side is already there.
+//!   three are exactly §8.11's three sources, so [`HumanWaitSource`]'s
+//!   first three variants map 1:1 onto types that already exist rather than
+//!   adding a parallel taxonomy. (`AwaitingReply` and `AwaitingPeer` are the
+//!   messaging waits and have no human-wait source; `tests/hitl.rs` pins the
+//!   whole mapping with an exhaustive `match`, so a sixth core variant is a
+//!   build break rather than a stale comment.) The persistence side is
+//!   already there.
+//!
+//!   **The 1:1 claim stopped being the whole story when Phase 8 Task 25.4
+//!   added [`HumanWaitSource::CrashRecovery`]** (§8.10's `on_crash: ask`),
+//!   and it is stated as four-onto-three rather than quietly left as "1:1".
+//!   A crash-recovery wait still needs **no new core variant**: the question
+//!   it asks is asked *about a workflow step* — which step was interrupted,
+//!   and what should be done about it — so `WorkflowGate { step_ref }` is
+//!   already exactly the fact to record, and it is the same fact
+//!   [`HumanWaitSource::Gate`] records. `tests/hitl.rs`'s
+//!   `every_human_wait_source_names_the_suspend_reason_it_records_as` pins
+//!   that direction with its own wildcard-free `match`, so a *fifth source*
+//!   is a build break too.
 //! - **No parking.** The implicit `checkpoint` task, `hold_workspace`'s TTL
 //!   and the 7-day reaper are Task 17's, since landed as
 //!   [`crate::parking`] — which is also where this module's relative
@@ -99,6 +112,70 @@ pub enum HumanWaitSource {
     /// that site has the same mechanism to resolve into rather than a
     /// fourth shape of its own.
     Elicitation,
+    /// §8.10 tier 2's `on_crash: ask`: an `Effectful` step found `Running`
+    /// when its run was reloaded after a daemon restart, so nothing knows
+    /// whether its real-world effect happened.
+    ///
+    /// The fourth source, and the one §8.11's sentence does not name —
+    /// §8.11 enumerates the three waits an *author or a policy* can ask for,
+    /// and this one is asked by the recovery path itself. It is here rather
+    /// than in a mechanism of its own for exactly §8.11's stated reason:
+    /// "one mechanism" is about what a human is shown and how they answer,
+    /// and a crash-recovery question is a JSON-Schema form a TUI and a web UI
+    /// must render identically just like the other three. See
+    /// [`AwaitingHuman::from_crash_recovery`], and this module's doc for why
+    /// it still needs no new `SuspendReason`.
+    CrashRecovery,
+}
+
+/// §8.10's three answers to a [`HumanWaitSource::CrashRecovery`] wait:
+/// *"`on_crash: rerun | fail | ask`"*, where `ask` is this question and
+/// `rerun`/`skip`/`fail` are what a human may answer it with.
+///
+/// Owned here rather than beside the resume path in
+/// [`crate::exec::run_loop`] so the vocabulary and the form that offers it
+/// cannot drift: [`AwaitingHuman::from_crash_recovery`]'s `resolution` field
+/// derives its JSON-Schema `enum` from [`ALL`](Self::ALL), so a form that
+/// offers an answer nothing can parse is not expressible.
+///
+/// `Deserialize` as well as `Serialize`, unlike [`AwaitingHuman`] itself:
+/// this *is* the value that comes back from a renderer, and the reason
+/// `AwaitingHuman` refuses a read-back — a relative window silently
+/// re-anchored on every resume — has no analogue for a three-word answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CrashResolution {
+    /// Re-dispatch the step, accepting at-least-once semantics for its
+    /// effect — the human has decided a duplicate is acceptable, or has
+    /// checked that the first attempt did not land.
+    Rerun,
+    /// Record the step as durably skipped and carry on: the human has
+    /// decided the effect did land, or that it no longer needs to.
+    Skip,
+    /// Fail the step, and with it the run.
+    Fail,
+}
+
+impl CrashResolution {
+    /// Every answer, in the order a renderer should offer them. The array
+    /// (rather than an iterator or a `Vec`) is what makes
+    /// [`crash_recovery_fields`] able to build the form's `enum` from the
+    /// type; adding a variant without extending this is a compile error.
+    pub const ALL: [CrashResolution; 3] = [
+        CrashResolution::Rerun,
+        CrashResolution::Skip,
+        CrashResolution::Fail,
+    ];
+
+    /// The wire spelling, identical to this type's serde form — §8.10's own
+    /// words.
+    pub fn wire_name(self) -> &'static str {
+        match self {
+            CrashResolution::Rerun => "rerun",
+            CrashResolution::Skip => "skip",
+            CrashResolution::Fail => "fail",
+        }
+    }
 }
 
 /// `on_timeout` exactly as the document wrote it, with §8.11's `approve`
@@ -248,7 +325,8 @@ pub struct AwaitingHuman {
     /// declared window.
     ///
     /// Never [`Duration::ZERO`] when the value came from a document:
-    /// [`from_gate`](Self::from_gate) rejects zero, and
+    /// [`from_gate`](Self::from_gate) rejects zero,
+    /// [`from_crash_recovery`](Self::from_crash_recovery) rejects zero, and
     /// `TryFrom<&UnattendedDef>` rejects it before it can reach
     /// [`from_escalate`](Self::from_escalate) — see
     /// [`HitlError::ZeroDeadline`]. `from_escalate` itself takes an
@@ -279,6 +357,27 @@ fn permission_approval_fields() -> serde_json::Map<String, serde_json::Value> {
     fields.insert(
         "approve".to_string(),
         serde_json::json!({ "type": "boolean" }),
+    );
+    fields
+}
+
+/// The form §8.10's crash-recovery question asks: one enumerated choice.
+///
+/// Like [`permission_approval_fields`], and for the same reason: there is no
+/// author to write a `form:` here, so the wait asks the single question the
+/// recovery path actually has. The `enum` is built from
+/// [`CrashResolution::ALL`] rather than written out as three literals, so the
+/// answers a renderer offers and the answers the resume path can parse are
+/// the same list by construction.
+fn crash_recovery_fields() -> serde_json::Map<String, serde_json::Value> {
+    let choices: Vec<serde_json::Value> = CrashResolution::ALL
+        .iter()
+        .map(|r| serde_json::Value::String(r.wire_name().to_string()))
+        .collect();
+    let mut fields = serde_json::Map::new();
+    fields.insert(
+        "resolution".to_string(),
+        serde_json::json!({ "type": "string", "enum": choices }),
     );
     fields
 }
@@ -452,6 +551,49 @@ impl AwaitingHuman {
             on_timeout: UncheckedOnTimeout::new(on_timeout.clone()),
         }
     }
+
+    /// §8.10 tier 2's `on_crash: ask`, as the same mechanism: the step was
+    /// interrupted mid-dispatch and its completion is unknown, so ask a human
+    /// whether to [`rerun`](CrashResolution::Rerun),
+    /// [`skip`](CrashResolution::Skip) or [`fail`](CrashResolution::Fail) it.
+    ///
+    /// Takes an already-parsed [`Duration`] like
+    /// [`from_escalate`](Self::from_escalate) rather than a `timeout:` string
+    /// like [`from_gate`](Self::from_gate), because there is no author and so
+    /// no text to parse: the caller
+    /// ([`crate::exec::run_loop`]'s crash-policy branch) supplies §8.11's
+    /// *"with no explicit gate timeout, fall back to 72h"* value,
+    /// [`crate::parking::DEFAULT_HOLD_TTL`].
+    ///
+    /// Fallible like [`from_gate`](Self::from_gate) and for its one surviving
+    /// reason: [`Duration::ZERO`] is refused
+    /// ([`HitlError::ZeroDeadline`]), because a wait born already expired
+    /// resolves per `on_timeout` with no human able to see it while still
+    /// appearing in the run record as a configured approval. There is no
+    /// empty-`title` check to inherit — `title` here is built in-process from
+    /// the step's own id rather than read from untrusted YAML, which makes it
+    /// the same **caller contract** [`from_escalate`](Self::from_escalate)
+    /// documents: non-empty, and naming the step being asked about.
+    pub fn from_crash_recovery(
+        task_id: TaskId,
+        title: &str,
+        timeout_after: Duration,
+        on_timeout: &OnTimeout,
+    ) -> Result<Self, HitlError> {
+        if timeout_after.is_zero() {
+            return Err(HitlError::ZeroDeadline {
+                field: "crash_recovery.timeout",
+                value: format!("{timeout_after:?}"),
+            });
+        }
+        Ok(AwaitingHuman {
+            task_id,
+            source: HumanWaitSource::CrashRecovery,
+            form_schema: form_schema(title, &crash_recovery_fields()),
+            timeout_after: Some(timeout_after),
+            on_timeout: UncheckedOnTimeout::new(on_timeout.clone()),
+        })
+    }
 }
 
 /// §8.5 point 2, evaluated: "`Escalate` is configurable per job:
@@ -606,7 +748,9 @@ pub enum HitlError {
     /// *parse* and `resolve_duration` needs `Invalid`/`Overflow`/zero kept
     /// distinct. The policy that zero is an unacceptable *configured value*
     /// belongs at each use site: `RetryPolicyError::ZeroDuration` for retry,
-    /// this variant for the two human-wait paths.
+    /// this variant for the human-wait paths — a gate's `timeout:`,
+    /// `permissions.unattended.deadline`, and (since Phase 8 Task 25.4) a
+    /// crash-recovery park's window.
     ///
     /// It matters more here than there. A zero window produces a human wait
     /// that is born already expired: it resolves per `on_timeout` with no

@@ -1292,12 +1292,14 @@ impl DeliveryExecutor {
     ///
     /// The one deliberate exception is [`RunConclusion::Parked`]. A parked
     /// run is *not* terminal — `roundhouse-flow` will drive it to completion
-    /// when a human answers its gate — so completing or failing the delivery
-    /// there would be a lie, and releasing the slot would let the same
-    /// binding start a second run on top of one that is still live. Nothing
-    /// in these tasks resumes a parked scheduled run, so such a delivery
-    /// holds its slot until the daemon restarts; that is a known limitation
-    /// with a named owner (human-in-the-loop resumption), not an oversight.
+    /// when a human answers the wait, whether that is a `gate:` step or
+    /// (Phase 8 Task 25.4) §8.10's `on_crash: ask` crash recovery — so
+    /// completing or failing the delivery there would be a lie, and
+    /// releasing the slot would let the same binding start a second run on
+    /// top of one that is still live. Nothing in these tasks resumes a
+    /// parked scheduled run, so such a delivery holds its slot until the
+    /// daemon restarts; that is a known limitation with a named owner
+    /// (human-in-the-loop resumption), not an oversight.
     async fn run_claimed(&self, claimed: ClaimedDelivery) {
         let ClaimedDelivery {
             delivery,
@@ -1402,7 +1404,8 @@ impl DeliveryExecutor {
             RunConclusion::Parked => {
                 tracing::info!(
                     binding_id = %binding_id,
-                    "a scheduled run parked on a human gate; its delivery stays `running`, its \
+                    "a scheduled run parked on a human wait (a `gate:` step, or §8.10's \
+                     `on_crash: ask` crash recovery); its delivery stays `running`, its \
                      admission slot stays held, and its session stays alive until the run is \
                      resumed"
                 );
@@ -1708,6 +1711,8 @@ impl DeliveryExecutor {
             workspace_root,
             run_ctx,
             now,
+            // A cold start: this delivery's run was just created.
+            None,
         )
         .await
     }
@@ -1880,11 +1885,15 @@ impl DeliveryExecutor {
             workspace_root,
             run_ctx,
             boot,
+            // The cold entry `failed_step_rows`'s argument depends on: a
+            // restart-recovery pass holds no outstanding `PendingWork`, and
+            // no human answer either.
+            None,
         )
         .await
     }
 
-    /// Drives one run from `resume: None` all the way to a
+    /// Drives one run from `initial_resume` all the way to a
     /// `Terminal`/`Parked` outcome, executing every `AwaitingWork`
     /// suspension for real in between (Phase 8 Task 25.2/25.3's segmented
     /// driving loop). The workflow definition is resolved once, up front —
@@ -1910,9 +1919,29 @@ impl DeliveryExecutor {
     /// comment carries the whole argument for why an entry carrying a
     /// `Resume::Work` — which only this loop can produce — is the one entry
     /// on which a `Failed` row belongs to the drive still in progress rather
-    /// than to a dead one. Note where the loop starts every drive, including
-    /// the one [`Self::rebuild_and_drive_recovered_run`] makes after a
-    /// restart: `resume: None`, the cold entry that argument depends on.
+    /// than to a dead one. Note where both production callers start every
+    /// drive, including the one [`Self::rebuild_and_drive_recovered_run`]
+    /// makes after a restart: `initial_resume: None`, the cold entry that
+    /// argument depends on.
+    ///
+    /// # `initial_resume`, and why it is a parameter with no production caller yet
+    ///
+    /// The answer to carry into the **first** segment, for a drive that is
+    /// resuming a parked run rather than starting one: a
+    /// `Resume::Gate`/`Resume::CrashRecovery` releasing an
+    /// `AwaitingHuman` run (`roundhouse_flow`'s `run_workflow` refuses to
+    /// drive such a run without one). Every production caller passes `None`,
+    /// because nothing in this daemon resumes a parked run yet — that is the
+    /// same named-owner gap [`Self::run_claimed`]'s
+    /// `RunConclusion::Parked` arm records. It is a parameter rather than a
+    /// hardcoded `None` for the reason `SessionTree::child_terminated`'s own
+    /// doc gives for its unreached call site: whatever eventually resumes a
+    /// park inherits the segmented driving loop by construction, instead of
+    /// growing a second copy of it — and it is what lets this module's own
+    /// `a_crash_recovery_park_is_answered_and_the_write_step_really_re_dispatches`
+    /// exercise a real park-and-resume cycle through the production loop
+    /// rather than a simulation of one.
+    #[allow(clippy::too_many_arguments)]
     async fn drive_run_to_completion(
         &self,
         run_id: RunId,
@@ -1922,6 +1951,7 @@ impl DeliveryExecutor {
         workspace_root: PathBuf,
         run_ctx: RunContext,
         mut now: Timestamp,
+        initial_resume: Option<Resume>,
     ) -> Result<Result<RunOutcome, roundhouse_flow::exec::run_loop::RunLoopError>, DeliveryError>
     {
         let def = {
@@ -1942,7 +1972,7 @@ impl DeliveryExecutor {
         };
 
         let runner = self.resources.runner;
-        let mut resume: Option<Resume> = None;
+        let mut resume: Option<Resume> = initial_resume;
         loop {
             let def = Arc::clone(&def);
             let run_ctx = run_ctx.clone();
@@ -3984,8 +4014,12 @@ mod delivery_tests {
     use crate::test_support::{daemon_resources, daemon_resources_with_rules};
     use crate::workspace_registry::{WorkspaceRegistration, WorkspaceRegistry};
     use roundhouse_core::{Tier, WorkspaceId};
-    use roundhouse_flow::durability::{recover_run, StepDisposition};
+    use roundhouse_flow::durability::{
+        checkpoint_step, recover_run, StepDisposition, StepRunState, WorkflowStepRun,
+    };
+    use roundhouse_flow::exec::run_loop::CrashRecoveryAnswer;
     use roundhouse_flow::exec::StepStatus;
+    use roundhouse_flow::hitl::CrashResolution;
     use roundhouse_flow::job::SessionTemplate;
     use roundhouse_flow::job_store::register_workflow_file;
     use roundhouse_policy::engine::{CompiledRule, Outcome as PolicyOutcome, Predicate, Scope};
@@ -5751,6 +5785,7 @@ mod delivery_tests {
                 workspace_root.clone(),
                 run_ctx,
                 now,
+                None,
             ),
         )
         .await
@@ -5832,6 +5867,233 @@ mod delivery_tests {
             confirmed_dead,
             "a shell step cancelled mid-dispatch must have its process actually killed \
              (SIGTERM/SIGKILL), not merely reported as cancelled while still running (pid {pid})"
+        );
+    }
+
+    /// Phase 8 Task 25.4 Task 5's daemon-level test: a real park-and-resume
+    /// cycle for §8.10's `on_crash: ask`, driven through the production
+    /// segmented loop ([`DeliveryExecutor::drive_run_to_completion`]) rather
+    /// than through `roundhouse-flow`'s own in-crate stubs.
+    ///
+    /// # What "the daemon crashed mid-dispatch" is, durably
+    ///
+    /// Exactly one thing: a `workflow_step_run` row left `running` with
+    /// `disposition = effectful`. A killed daemon writes nothing else — that
+    /// is §8.10's whole premise — so seeding that row *is* the crash, not a
+    /// stand-in for it. `recover_run` reclassifies it `Indeterminate` on the
+    /// next load, `crash_policy` resolves a `tool: write` step with no
+    /// declared `on_crash:` to `Ask`, and before this task that combination
+    /// permanently failed the run.
+    ///
+    /// # Both legs are real
+    ///
+    /// The **park** leg runs `drive_run_to_completion` with no resume, and
+    /// asserts on the durable `workflow_run` row (`awaiting_human`), not just
+    /// on the returned value. The **resume** leg feeds a real
+    /// `Resume::CrashRecovery { rerun }` into the same production loop, which
+    /// re-admits the step, hands it to [`DeliveryExecutor::execute_pending`]
+    /// as a genuine `AwaitingWork` suspension, and dispatches the `write` for
+    /// real — proven by the file's contents on disk afterwards, which nothing
+    /// but a real dispatch could have put there.
+    #[tokio::test]
+    async fn a_crash_recovery_park_is_answered_and_the_write_step_really_re_dispatches() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace_root = dir.path().canonicalize().unwrap();
+        let target = workspace_root.join("shipped.txt");
+        let target_str = target.to_string_lossy().to_string();
+
+        let workflow_yaml = format!(
+            "name: scheduled\nversion: 1\npermissions:\n  default: deny\n  unattended:\n    \
+             escalate: fail\nsteps:\n  - id: ship\n    tool: write\n    with: {{ path: {path:?}, \
+             contents: shipped-by-the-rerun }}\n",
+            path = target_str,
+        );
+        let source = workspace_root.join("workflow.yaml");
+        std::fs::write(&source, &workflow_yaml).unwrap();
+
+        let rules = vec![CompiledRule::test_new(
+            Scope::Builtin,
+            PolicyOutcome::Allow,
+            Predicate::FsExact {
+                op: FsOp::Write,
+                path: target.clone(),
+            },
+        )];
+        let (executor, session) = executor_and_session(&workspace_root, rules).await;
+        let session_id = session.session_id();
+
+        let job_id = {
+            let conn = executor.store.pool.get().await.unwrap();
+            let root = workspace_root.clone();
+            let source = source.clone();
+            conn.interact(move |connection| {
+                register_workflow_file(connection, &root, &source, template())
+                    .unwrap()
+                    .job
+                    .id()
+            })
+            .await
+            .unwrap()
+        };
+
+        let run_id = RunId::new();
+        let now = executor.now();
+        {
+            let conn = executor.store.pool.get().await.unwrap();
+            let root = workspace_root.clone();
+            conn.interact(move |connection| {
+                let resolved = resolve_latest_by_job_id(connection, &root, job_id)
+                    .unwrap()
+                    .expect("the job just registered above must resolve");
+                let version = resolved.job.latest();
+                insert_workflow_run(
+                    connection,
+                    &WorkflowRun {
+                        id: run_id,
+                        job_id,
+                        job_version: version.version(),
+                        content_hash: content_hash(version),
+                        session_id,
+                        binding_id: None,
+                        trigger_event_id: None,
+                        state: RunState::Running,
+                        parent_run_id: None,
+                        forked_from_run_id: None,
+                        awaiting_until: None,
+                        checkpoint_ref: None,
+                        checkpoint_blob_ref: None,
+                        started_at: now,
+                        ended_at: None,
+                        session_depth: Some(0),
+                        caps: Some(ResourceCaps::default()),
+                    },
+                )
+                .unwrap();
+                // The crash itself: the row a daemon killed mid-`write`
+                // leaves behind.
+                checkpoint_step(
+                    connection,
+                    &WorkflowStepRun {
+                        run_id,
+                        step_id: "ship".to_string(),
+                        attempt: 1,
+                        item_index: None,
+                        disposition: StepDisposition::Effectful,
+                        state: StepRunState::Running,
+                        first_task_seq: None,
+                        last_task_seq: None,
+                        output: None,
+                        error: None,
+                    },
+                )
+                .unwrap();
+            })
+            .await
+            .unwrap();
+        }
+
+        let spec = SessionSpec {
+            workspace: WorkspaceId::new(),
+            name: None,
+            requested_tier: Tier::Sandbox,
+            on_degrade: OnDegrade::Refuse,
+            parent: None,
+        };
+        let run_ctx = RunContext {
+            inputs: serde_json::Value::Null,
+            vars: serde_json::Value::Null,
+            secrets: HashMap::new(),
+            run_id,
+            previous_report: None,
+            env_allowlist: EnvAllowlist::deny_all(),
+            worktree_provider: Some(Arc::new(SandboxWorktreeProvider::new(
+                workspace_root.clone(),
+            ))),
+        };
+
+        // Leg 1: the restart finds the step `Indeterminate` and parks.
+        let parked = executor
+            .drive_run_to_completion(
+                run_id,
+                session_id,
+                &session,
+                spec.clone(),
+                workspace_root.clone(),
+                run_ctx.clone(),
+                now,
+                None,
+            )
+            .await
+            .expect("drive_run_to_completion's own DeliveryError path must not be reached")
+            .expect("run_workflow must not return a RunLoopError for this fixture");
+        assert!(
+            matches!(parked, RunOutcome::Parked(_)),
+            "a restart mid-`write` must ask a human rather than failing the run, got {parked:?}"
+        );
+        assert!(
+            !target.exists(),
+            "nothing may be dispatched while the run is parked"
+        );
+        assert!(
+            matches!(conclusion_for(Ok(parked)), RunConclusion::Parked),
+            "a crash-recovery park must reach the same delivery conclusion a gate park does — \
+             `conclusion_for` is source-agnostic and must stay so"
+        );
+        {
+            let conn = executor.store.pool.get().await.unwrap();
+            let row = conn
+                .interact(move |connection| recover_run(connection, run_id).unwrap().run)
+                .await
+                .unwrap();
+            assert_eq!(
+                row.state,
+                RunState::AwaitingHuman,
+                "the durable row, not the returned value, is what a restart would read back"
+            );
+            assert!(
+                row.awaiting_until.is_some(),
+                "the wait carries an absolute deadline"
+            );
+        }
+
+        // Leg 2: a human answers `rerun`, and the same production loop
+        // re-admits the step and dispatches it for real.
+        let resumed = executor
+            .drive_run_to_completion(
+                run_id,
+                session_id,
+                &session,
+                spec,
+                workspace_root.clone(),
+                run_ctx,
+                executor.now(),
+                Some(Resume::CrashRecovery(CrashRecoveryAnswer {
+                    step_id: "ship".to_string(),
+                    resolution: CrashResolution::Rerun,
+                })),
+            )
+            .await
+            .expect("drive_run_to_completion's own DeliveryError path must not be reached")
+            .expect("run_workflow must not return a RunLoopError for this fixture");
+
+        let (state, steps) = match resumed {
+            RunOutcome::Terminal { state, steps, .. } => (state, steps),
+            other => panic!("an answered park must drive to a terminal outcome, got {other:?}"),
+        };
+        assert_eq!(state, RunState::Completed);
+        let ship = steps
+            .iter()
+            .find(|s| s.step_id == "ship")
+            .expect("`rerun` re-dispatches the step, so it has an outcome on this drive");
+        assert!(
+            matches!(ship.status, StepStatus::Completed),
+            "the re-dispatched write must have completed, got {:?}",
+            ship.status
+        );
+        assert_eq!(
+            std::fs::read_to_string(&target).expect("the re-dispatched write must have run"),
+            "shipped-by-the-rerun",
+            "only a real dispatch through execute_pending could have written this"
         );
     }
 

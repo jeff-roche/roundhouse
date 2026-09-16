@@ -88,13 +88,24 @@
 //! derivation. [`CrashPolicy::Fail`], which no derivation can produce, is
 //! reachable for the first time.
 //!
-//! **What still has no owner is the recovery path that acts on it.** A killed
-//! daemon writes nothing, so re-driving an interrupted run — reading each
-//! step's policy, re-running the `Rerun`s, queueing the `Ask`s as a gate,
-//! failing the `Fail`s, and synthesising the report the run loop never got to
-//! write (ruling P112 §5) — is daemon-side work over
-//! `roundhouse_store::recover_interrupted_tasks`, and ruling P77 §C leaves that
-//! owner unassigned. Named here, not built here.
+//! **The recovery path that acts on it now exists** (it did not when the
+//! paragraph above was written, and it is stated here rather than left as a
+//! stale "unowned"). [`crash_policy`]'s one consumer is
+//! `crate::exec::run_loop`'s `Loop::run_phase` crash-policy branch, reached
+//! for every step [`recover_run`] reclassified [`StepRunState::Indeterminate`]:
+//! Phase 8 Task 25.3 wired the `Rerun` (re-dispatch) and `Fail` (fail the
+//! run) arms, and Task 25.4 Task 5 made the `Ask` arm a real park on §8.11's
+//! one mechanism — `crate::hitl::HumanWaitSource::CrashRecovery` — instead
+//! of the interim fail-closed it shipped with. §8.6's mandatory report is
+//! written by the same loop on whichever terminal path the run then reaches
+//! (ruling P112). `roundhouse-daemon`'s boot-time pass is what re-drives
+//! such a run in production.
+//!
+//! What is still unowned is narrower than "the recovery path": nothing in
+//! the daemon **answers** a park, of either kind, so a run that parks on a
+//! crash question waits for an actor that does not exist yet — the same
+//! named-owner gap `crate::parking`'s module doc records for a `gate:` park's
+//! own deadline.
 
 use crate::caps::ResourceCaps;
 use crate::exec::{RunId, StepOutcome};
@@ -637,7 +648,11 @@ pub enum CrashPolicy {
 }
 
 /// §8.10 tier 2: `Pure`/`Idempotent` steps are safely re-run; an `Effectful`
-/// step defaults to `ask` (landing in the gate queue) rather than guessing.
+/// step defaults to `ask` rather than guessing — and *"the gate queue"* it
+/// lands in is literally §8.11's one mechanism since Phase 8 Task 25.4 Task
+/// 5: `crate::exec::run_loop`'s `Loop::crash_recovery_park` builds a
+/// `crate::hitl::HumanWaitSource::CrashRecovery` wait and parks the run on
+/// it.
 ///
 /// This is the **default** half of §8.10's `on_crash: rerun | fail | ask`, and
 /// only that half. Call [`crash_policy`] instead unless you specifically want
