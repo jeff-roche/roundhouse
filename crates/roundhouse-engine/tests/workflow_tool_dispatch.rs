@@ -7,7 +7,7 @@
 use roundhouse_core::{
     EventPayload, OnDegrade, SessionId, SessionState, TaskKind, TaskRunner, Tier,
 };
-use roundhouse_engine::workflow_dispatch::dispatch_tool_for_workflow;
+use roundhouse_engine::workflow_dispatch::{dispatch_tool_for_workflow, DispatchOutcome};
 use roundhouse_engine::SessionActor;
 use roundhouse_policy::engine::{
     CompiledRule, Outcome as PolicyOutcome, PolicyEngine, Predicate, Scope,
@@ -209,6 +209,17 @@ async fn started_isolation(
         .expect("the dispatched task's own TaskStarted event must exist in the session log")
 }
 
+/// Panics with `context` naming the actual outcome unless `result` is
+/// `DispatchOutcome::Completed` — Phase 8 Task 25.4 Task 4's `DispatchOutcome`
+/// three-way replaced the old `Result<Value, String>` this file's
+/// `dispatches_through` tests used to `.unwrap_or_else` directly.
+fn expect_completed<'a>(result: &'a DispatchOutcome, context: &str) -> &'a serde_json::Value {
+    match result {
+        DispatchOutcome::Completed(value) => value,
+        other => panic!("{context}: {other:?}"),
+    }
+}
+
 /// `write` dispatches through to a real in-workspace execution (Task 2,
 /// closing Task 1's own deferred gap — see this file's own
 /// `shell_tool_dispatches_through` doc comment for why an out-of-workspace
@@ -244,10 +255,10 @@ async fn write_tool_dispatches_through() {
     .await;
 
     let dispatch = result.expect("dispatch should succeed");
-    dispatch
-        .result
-        .as_ref()
-        .unwrap_or_else(|msg| panic!("an in-workspace, allowed write must actually run: {msg}"));
+    expect_completed(
+        &dispatch.result,
+        "an in-workspace, allowed write must actually run",
+    );
 
     let isolation = started_isolation(&db_path, session_id, dispatch.task_id).await;
     assert_eq!(
@@ -292,10 +303,10 @@ async fn edit_tool_dispatches_through() {
     .await;
 
     let dispatch = result.expect("dispatch should succeed");
-    dispatch
-        .result
-        .as_ref()
-        .unwrap_or_else(|msg| panic!("an in-workspace, allowed edit must actually run: {msg}"));
+    expect_completed(
+        &dispatch.result,
+        "an in-workspace, allowed edit must actually run",
+    );
 
     let isolation = started_isolation(&db_path, session_id, dispatch.task_id).await;
     assert_eq!(
@@ -338,10 +349,10 @@ async fn find_tool_dispatches_through() {
     .await;
 
     let dispatch = result.expect("dispatch should succeed");
-    dispatch
-        .result
-        .as_ref()
-        .unwrap_or_else(|msg| panic!("an in-workspace, allowed find must actually run: {msg}"));
+    expect_completed(
+        &dispatch.result,
+        "an in-workspace, allowed find must actually run",
+    );
 
     let isolation = started_isolation(&db_path, session_id, dispatch.task_id).await;
     assert_eq!(
@@ -401,9 +412,10 @@ async fn shell_tool_dispatches_through() {
     .await
     .expect("dispatch should succeed");
 
-    let output = dispatch
-        .result
-        .unwrap_or_else(|msg| panic!("shell dispatch never reached execute_builtin: {msg}"));
+    let output = match dispatch.result {
+        DispatchOutcome::Completed(output) => output,
+        other => panic!("shell dispatch never reached execute_builtin: {other:?}"),
+    };
     let text = output["content"].as_str().unwrap_or_default();
     assert!(
         text.contains("hello-from-workflow-shell"),
@@ -501,11 +513,22 @@ async fn shell_tool_step_timeout_elapsing_kills_the_process_and_fails_the_step()
     .expect("a timed-out shell dispatch still records its own lifecycle and returns Ok(..)");
 
     match dispatch.result {
-        Ok(output) => panic!(
+        DispatchOutcome::Completed(output) => panic!(
             "a shell step whose command outlives its step_timeout must not report success, got \
              {output:?}"
         ),
-        Err(msg) => assert!(!msg.is_empty(), "a failed dispatch must carry a message"),
+        DispatchOutcome::Failed(msg) => {
+            assert!(!msg.is_empty(), "a failed dispatch must carry a message")
+        }
+        // Phase 8 Task 25.4 Task 4: a `step_timeout` elapsing with no
+        // session cancel in play is an ordinary failure, never `Cancelled`
+        // — `Cancelled` is reserved for §8.13's cooperative cancel
+        // (`ToolDispatchError::ShellSessionCancelled`), which this test
+        // never triggers.
+        DispatchOutcome::Cancelled(reason) => panic!(
+            "a step_timeout elapsing alone (no session cancel) must be reported as an ordinary \
+             failure, not Cancelled — got Cancelled({reason:?})"
+        ),
     }
 
     for _ in 0..50 {
@@ -563,13 +586,13 @@ async fn unsupported_tools_rejected() {
 
     let dispatch = result.expect("dispatch should not error");
     match dispatch.result {
-        Ok(_) => panic!("Http should be unsupported"),
-        Err(msg) => {
+        DispatchOutcome::Failed(msg) => {
             assert!(
                 msg.contains("not wired yet"),
                 "Http should be rejected as unsupported: {msg}"
             );
         }
+        other => panic!("Http should be unsupported, got {other:?}"),
     }
 }
 

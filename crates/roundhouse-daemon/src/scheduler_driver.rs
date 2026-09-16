@@ -56,10 +56,12 @@ use std::sync::{Arc, Mutex};
 use chrono::{DateTime, Utc};
 use roundhouse_bus::spawn_tree::SpawnTree;
 use roundhouse_core::{
-    BindingId, EventPayload, JobId, OnDegrade, SessionId, SessionSpec, TaskId, TaskKind,
-    TaskRunner, Tier, Timestamp, WorkspaceId,
+    BindingId, EventPayload, JobId, OnDegrade, SessionId, SessionSpec, SessionState, TaskId,
+    TaskKind, TaskRunner, Tier, Timestamp, WorkspaceId,
 };
-use roundhouse_engine::workflow_dispatch::{dispatch_tool_for_workflow, WorkflowToolDispatch};
+use roundhouse_engine::workflow_dispatch::{
+    dispatch_tool_for_workflow, DispatchOutcome, WorkflowToolDispatch,
+};
 use roundhouse_flow::caps::ResourceCaps;
 use roundhouse_flow::durability::{insert_workflow_run, RunState, WorkflowRun};
 use roundhouse_flow::exec::run_loop::{
@@ -982,6 +984,14 @@ impl SegmentGapGate {
 /// filesystem-kinds branch (wrapped in `tokio::time::timeout`), so the two
 /// only differ in how they got a `Result<WorkflowToolDispatch, String>`, not
 /// in how they interpret one.
+///
+/// Phase 8 Task 25.4 Task 4: `DispatchOutcome::Cancelled` becomes
+/// `WorkStatus::Cancelled` here — today reachable only through the `Shell`
+/// branch, whose `ToolDispatchError::ShellSessionCancelled` is the only
+/// `DispatchOutcome::Cancelled` producer inside `dispatch_tool_for_workflow`
+/// itself. The four filesystem kinds never produce it from in here; see
+/// [`DeliveryExecutor::execute_pending`]'s own doc comment for how (and why)
+/// those four are instead reclassified by the caller, after the fact.
 fn work_done_from_dispatch(
     step_id: String,
     dispatched: Result<WorkflowToolDispatch, String>,
@@ -989,8 +999,13 @@ fn work_done_from_dispatch(
     match dispatched {
         Ok(dispatched) => {
             let (status, output) = match dispatched.result {
-                Ok(value) => (WorkStatus::Completed, value),
-                Err(message) => (WorkStatus::Failed { message }, serde_json::Value::Null),
+                DispatchOutcome::Completed(value) => (WorkStatus::Completed, value),
+                DispatchOutcome::Failed(message) => {
+                    (WorkStatus::Failed { message }, serde_json::Value::Null)
+                }
+                DispatchOutcome::Cancelled(reason) => {
+                    (WorkStatus::Cancelled { reason }, serde_json::Value::Null)
+                }
             };
             WorkDone {
                 step_id,
@@ -1005,6 +1020,35 @@ fn work_done_from_dispatch(
         Err(message) => unanswerable_work(step_id, message),
     }
 }
+
+/// Whether `session`'s actor has observed §8.13 cancel — or a suspend/close,
+/// which the same underlying `SessionState` watch conflates with cancel; see
+/// `roundhouse_engine::tool_dispatch::wait_for_session_cancel`'s own doc
+/// comment, whose "not `Created`/`Running`" predicate this mirrors exactly,
+/// for why — by the time this is called.
+///
+/// A fresh [`roundhouse_engine::SessionActor::subscribe`] call returns a
+/// receiver already initialized with the channel's *current* value, so
+/// `.borrow()` on it is an immediate snapshot, not a wait: this is a
+/// **post-hoc check**, not a race. See
+/// [`DeliveryExecutor::execute_pending`]'s own doc comment for why the four
+/// filesystem kinds are checked this way rather than raced against their
+/// dispatch.
+fn cancel_observed(session: &HeadlessSession) -> bool {
+    !matches!(
+        *session.actor().subscribe().borrow(),
+        SessionState::Created | SessionState::Running
+    )
+}
+
+/// The reason recorded on a filesystem `tool:` step reclassified as
+/// `WorkStatus::Cancelled` after its (uninterruptible) dispatch already
+/// returned — see [`DeliveryExecutor::execute_pending`]'s own doc comment
+/// for the honest limit this names.
+const FS_CANCEL_OBSERVED_REASON: &str = "the owning session was cancelled/suspended/closed while \
+     this filesystem tool call was in flight; read/write/edit/find cannot be interrupted \
+     mid-dispatch, so the call was allowed to run to completion before being reported as \
+     cancelled";
 
 /// Everything one claimed delivery needs to become a real, running workflow.
 ///
@@ -2006,6 +2050,55 @@ impl DeliveryExecutor {
     /// `timeout`) would make every dispatch "time out" instantly and
     /// indistinguishably from a real one, which is a worse failure mode
     /// than refusing to guess what zero was supposed to mean.
+    ///
+    /// # §8.13 cooperative cancel (Phase 8 Task 25.4 Task 4)
+    ///
+    /// `WorkStatus::Cancelled` (`roundhouse_flow::exec::run_loop`) exists so
+    /// a step the run's own cancel interrupted is told apart from one that
+    /// merely failed; this function is its first, and so far only,
+    /// producer.
+    ///
+    /// **`Shell` gets real mid-dispatch cancellation for free, and this
+    /// function adds no new machinery for it.** `dispatch_tool_for_workflow`
+    /// already threads `Some(session.actor().subscribe())` into
+    /// `execute_builtin`, which is already consumed by
+    /// `run_isolated_shell_dispatch`'s own `tokio::select!` — a cancel
+    /// observed there is a real SIGTERM→SIGKILL-and-confirm, exactly like a
+    /// timeout, and is reported back as
+    /// `ToolDispatchError::ShellSessionCancelled`
+    /// (`roundhouse_engine::tool_dispatch`), which
+    /// `dispatch_tool_for_workflow` folds into `DispatchOutcome::Cancelled`
+    /// and [`work_done_from_dispatch`] folds into `WorkStatus::Cancelled`.
+    /// This function's own job for `Shell` is exactly what it was before
+    /// this task: await the one dispatch future to completion, no outer
+    /// race — adding one here would drop the future holding the pre-spawned
+    /// child before its own kill-and-confirm logic could run, the identical
+    /// hazard the no-outer-timeout-wrap reasoning above already covers.
+    ///
+    /// **The four filesystem kinds cannot be interrupted mid-call, and this
+    /// function does not pretend otherwise.** `execute_builtin`'s
+    /// `Read`/`Write`/`Edit`/`Find` arms never consult `cancel` at all —
+    /// `find` in particular runs inside `tokio::task::spawn_blocking`, whose
+    /// `JoinHandle` dropping does not stop the blocking thread, so there is
+    /// no honest way to abort one in flight. The behaviour this function
+    /// implements instead (the brief's own "allowed to finish" alternative,
+    /// deliberately chosen over "not interruptible, reports normally" so
+    /// that a cancel is never silently invisible in a step's own recorded
+    /// outcome): the call runs to completion — through Task 3's existing
+    /// outer `tokio::time::timeout` unchanged, never raced against a
+    /// separate cancel-drop that would orphan an in-flight
+    /// `TaskCreated`/`TaskStarted` pair the same way an outer timeout wrap
+    /// would for `Shell` — and once it returns, [`cancel_observed`] takes a
+    /// **post-hoc** snapshot of `session.actor()`'s `SessionState` (a fresh
+    /// `subscribe()` call returns the channel's *current* value, so this is
+    /// a check, not a race) and reclassifies a `Completed`/`Failed` outcome
+    /// as `WorkStatus::Cancelled` when the session was already
+    /// cancelled/suspended/closed by the time the call returned. This does
+    /// **not** distinguish "cancelled before the call started" from
+    /// "cancelled while it was running" — both look identical from outside
+    /// an uninterruptible call — and it makes no `workspace_released`-style
+    /// claim: whatever the call actually did (wrote a file, read one)
+    /// already happened by the time it is relabelled.
     async fn execute_pending(
         &self,
         session: &HeadlessSession,
@@ -2056,7 +2149,28 @@ impl DeliveryExecutor {
                         )
                         .await
                         {
-                            Ok(dispatched) => work_done_from_dispatch(item.step_id, dispatched),
+                            Ok(dispatched) => {
+                                let mut done = work_done_from_dispatch(item.step_id, dispatched);
+                                // Phase 8 Task 25.4 Task 4's post-hoc
+                                // reclassification — see this method's own
+                                // doc comment for the full reasoning. Only
+                                // `Completed`/`Failed` are eligible: a
+                                // `Cancelled` status cannot reach this arm
+                                // (filesystem dispatch has no producer of
+                                // its own), so the guard exists purely to
+                                // make "never double-wrap an already
+                                // terminal Cancelled" a property of the
+                                // code rather than an invariant to trust.
+                                if cancel_observed(session)
+                                    && !matches!(done.status, WorkStatus::Cancelled { .. })
+                                {
+                                    done.status = WorkStatus::Cancelled {
+                                        reason: FS_CANCEL_OBSERVED_REASON.to_string(),
+                                    };
+                                    done.output = serde_json::Value::Null;
+                                }
+                                done
+                            }
                             Err(_elapsed) => unanswerable_work(
                                 item.step_id,
                                 format!("the tool call exceeded its {step_timeout:?} step_timeout"),
@@ -3871,6 +3985,7 @@ mod delivery_tests {
     use crate::workspace_registry::{WorkspaceRegistration, WorkspaceRegistry};
     use roundhouse_core::{Tier, WorkspaceId};
     use roundhouse_flow::durability::{recover_run, StepDisposition};
+    use roundhouse_flow::exec::StepStatus;
     use roundhouse_flow::job::SessionTemplate;
     use roundhouse_flow::job_store::register_workflow_file;
     use roundhouse_policy::engine::{CompiledRule, Outcome as PolicyOutcome, Predicate, Scope};
@@ -4980,6 +5095,38 @@ mod delivery_tests {
     ) -> (DeliveryExecutor, HeadlessSession) {
         let resources =
             Arc::new(daemon_resources_with_rules(dir, None, Arc::new(move || rules.clone())).await);
+        executor_and_session_with_resources(dir, resources).await
+    }
+
+    /// [`executor_and_session`], but wired to
+    /// [`crate::test_support::daemon_resources_with_real_bwrap`] instead of
+    /// [`crate::test_support::daemon_resources_with_rules`] — for a test
+    /// that needs its dispatched `tool: shell` step to actually run as a
+    /// real, genuinely-killable process, which the latter's
+    /// production-install-path isolate cannot do in a dev checkout with no
+    /// vendored `bwrap`. Phase 8 Task 25.4 Task 4's §8.13 mid-dispatch
+    /// shell-cancel tests need this; every other `executor_and_session` test
+    /// in this module does not, and stays on the cheaper, always-available
+    /// isolate.
+    async fn executor_and_session_with_real_bwrap(
+        dir: &std::path::Path,
+        rules: Vec<CompiledRule>,
+    ) -> (DeliveryExecutor, HeadlessSession) {
+        let resources = Arc::new(
+            crate::test_support::daemon_resources_with_real_bwrap(
+                dir,
+                None,
+                Arc::new(move || rules.clone()),
+            )
+            .await,
+        );
+        executor_and_session_with_resources(dir, resources).await
+    }
+
+    async fn executor_and_session_with_resources(
+        dir: &std::path::Path,
+        resources: Arc<DaemonResources>,
+    ) -> (DeliveryExecutor, HeadlessSession) {
         let sessions = Arc::new(SessionRegistry::new());
         let store = roundhouse_store::open(&dir.join("events.db"))
             .await
@@ -5097,6 +5244,170 @@ mod delivery_tests {
         );
     }
 
+    /// Phase 8 Task 25.4 Task 4's filesystem-kinds half: `read`/`write`/
+    /// `edit`/`find` have no cancellation mechanism of their own (see
+    /// `DeliveryExecutor::execute_pending`'s own doc comment), so the
+    /// honest behaviour this task implements is "the in-flight call is
+    /// allowed to finish, then the result is reported as cancelled if a
+    /// cancel was observed by the time it completes." This test proves
+    /// both halves of that sentence, deterministically:
+    ///
+    /// - **"allowed to finish":** the dispatched `tool: read` targets a
+    ///   named pipe (FIFO) opened for read-only, which — real POSIX FIFO
+    ///   semantics, not a timing hack — blocks inside `open()` until a
+    ///   writer opens the other end. The cancel is sent while that read is
+    ///   *provably* still blocked (nothing has opened the write end yet),
+    ///   so there is no ambiguity about whether the call was genuinely
+    ///   in-flight when the cancel landed — no `tokio::time::sleep`
+    ///   anywhere in this test decides that ordering.
+    /// - **"reported as cancelled":** once cancelled, the test opens the
+    ///   write end and closes it (EOF), letting the blocked read complete
+    ///   normally with real content — and the returned `WorkStatus` must
+    ///   still be `Cancelled`, not `Completed`, because a cancel was
+    ///   observed by the time the call returned.
+    #[tokio::test]
+    async fn a_filesystem_read_blocked_in_flight_when_cancelled_still_completes_and_is_reported_cancelled(
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace_root = dir.path().canonicalize().unwrap();
+        let fifo_path = workspace_root.join("in.fifo");
+        let status = std::process::Command::new("mkfifo")
+            .arg(&fifo_path)
+            .status()
+            .expect("mkfifo must be on PATH in this dev/CI environment");
+        assert!(status.success(), "mkfifo must succeed against a fresh path");
+        let fifo_str = fifo_path.to_string_lossy().to_string();
+
+        let rules = vec![CompiledRule::test_new(
+            Scope::Builtin,
+            PolicyOutcome::Allow,
+            Predicate::FsExact {
+                op: FsOp::Read,
+                path: fifo_path.clone(),
+            },
+        )];
+        let (executor, session) = executor_and_session(&workspace_root, rules).await;
+        // `Arc`, not a bare value: `execute_pending` needs `&HeadlessSession`
+        // from inside the spawned task below, and this test needs its own
+        // `session.actor()` handle afterward to send the cancel — an `Arc`
+        // clone gives both without `HeadlessSession` needing to be `Clone`.
+        let session = Arc::new(session);
+        let session_id = session.session_id();
+        // Captured before `executor` moves into the spawned task below —
+        // needed afterward to poll for admission (see the comment at that
+        // poll for why it matters).
+        let store = executor.store.clone();
+
+        let pending = PendingWork {
+            run_id: RunId::new(),
+            session_id,
+            step_id: "read_fifo".to_string(),
+            attempt: 1,
+            item_index: None,
+            disposition: StepDisposition::Pure,
+            step_timeout: Duration::from_secs(30),
+            kind: PendingKind::Tool {
+                tool: "read".to_string(),
+                task_kind: TaskKind::Read,
+                logged_input: serde_json::json!({ "path": &fifo_str }),
+                dispatch_input: serde_json::json!({ "path": &fifo_str }),
+            },
+        };
+
+        let session_for_dispatch = Arc::clone(&session);
+        let dispatch = tokio::spawn(async move {
+            executor
+                .execute_pending(&session_for_dispatch, vec![pending])
+                .await
+        });
+
+        // Wait for real proof the read has cleared admission and is about
+        // to call (or already has called) `open()` on the FIFO — a
+        // `TaskStarted` event, appended by `dispatch_tool_for_workflow`
+        // only *after* `SessionActor::admit_task` succeeds and *before*
+        // `execute_builtin` is ever called. Without this, cancelling too
+        // early could win a race against admission itself
+        // (`SessionActor::admit_task`'s own allowlist refuses a
+        // non-`Created`/`Running` session), which would deny the read
+        // before it ever touched the FIFO — leaving nothing to ever open
+        // the write end below and hanging this test forever. This is a
+        // bounded poll, not a fixed sleep: it does not decide *whether* the
+        // property holds, only how promptly the test notices it already
+        // does.
+        for _ in 0..200 {
+            let events = roundhouse_store::session_events(&store, session_id)
+                .await
+                .expect("reading back this session's own event log must succeed");
+            if events
+                .iter()
+                .any(|e| matches!(e.payload, EventPayload::TaskStarted { .. }))
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        // The determinism argument proper: by this point `TaskStarted` is
+        // durably recorded, so the read is either already blocked in
+        // `open()` or is about to call it — and `read_file` never consults
+        // the cancel signal at all (see `DeliveryExecutor::execute_pending`'s
+        // own doc comment), so cancelling now cannot change whether or when
+        // it calls `open()`, only what `execute_pending` reports once that
+        // (still-uninterruptible) call eventually returns.
+        let runner = crate::test_support::runner();
+        session
+            .actor()
+            .cancel(runner, roundhouse_core::CancelReason::User)
+            .await
+            .expect("cancelling a healthy actor must succeed");
+
+        // Now let the blocked read actually complete: open the write end,
+        // write one line, and close it (EOF) — `spawn_blocking` because
+        // opening a FIFO for writing can itself block until a reader's
+        // `open()` call happens.
+        let fifo_for_write = fifo_path.clone();
+        tokio::task::spawn_blocking(move || {
+            use std::io::Write;
+            let mut writer = std::fs::OpenOptions::new()
+                .write(true)
+                .open(&fifo_for_write)
+                .expect("opening the FIFO for writing must succeed once a reader is waiting");
+            writer
+                .write_all(b"hello-from-the-fifo\n")
+                .expect("writing to the FIFO must succeed");
+            // `writer` drops here, closing the write end and sending EOF to
+            // the blocked reader.
+        })
+        .await
+        .expect("the writer thread must not panic");
+
+        let done = tokio::time::timeout(Duration::from_secs(10), dispatch)
+            .await
+            .expect(
+                "the read must actually complete once the FIFO's write end closes — if it \
+                 didn't, this test's own guard is what's failing it, not the dispatch itself",
+            )
+            .expect("the execute_pending task must not panic");
+
+        assert_eq!(done.len(), 1);
+        match &done[0].status {
+            WorkStatus::Cancelled { reason } => assert!(
+                !reason.is_empty(),
+                "a reclassified-cancelled filesystem step must carry a non-empty reason"
+            ),
+            other => panic!(
+                "a read cancelled while genuinely blocked in flight, then allowed to run to \
+                 completion, must be reported Cancelled — got {other:?}"
+            ),
+        }
+        assert_eq!(
+            done[0].output,
+            serde_json::Value::Null,
+            "a reclassified-cancelled step's output is nulled, matching every other Cancelled/\
+             Failed arm — see `work_done_from_dispatch`'s own Err arm for the precedent"
+        );
+    }
+
     /// The `Duration::ZERO` guard (this task's brief, item 3):
     /// `PendingWork::step_timeout`'s own doc names its `unwrap_or_default()`
     /// fallback as unreachable through the normal authoring path today —
@@ -5150,6 +5461,377 @@ mod delivery_tests {
             "the zero guard fires before any dispatch is attempted — no task is ever minted, \
              unlike the outer-timeout case above where a task may already be in flight when \
              the deadline is hit"
+        );
+    }
+
+    /// Phase 8 Task 25.4 Task 4, the non-conflation regression this task's
+    /// own restructuring risks: an ordinary `step_timeout` elapsing — no
+    /// §8.13 cancel anywhere in this test — must still classify as
+    /// `WorkStatus::Failed`, never `WorkStatus::Cancelled`. `Shell`'s own
+    /// `run_isolated_shell_dispatch` returns
+    /// `ToolDispatchError::ShellCancelled` (the *timeout* variant, distinct
+    /// from `ShellSessionCancelled`) for exactly this case; this test pins
+    /// that `dispatch_tool_for_workflow`/`work_done_from_dispatch` keep the
+    /// two apart rather than treating every `ShellCancelled`-shaped error as
+    /// a cancel.
+    #[tokio::test]
+    async fn a_shell_step_timeout_with_no_cancel_is_reported_failed_not_cancelled() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace_root = dir.path().canonicalize().unwrap();
+        let program_path = workspace_root.join("sleep_forever.sh");
+        std::fs::write(&program_path, "#!/bin/sh\nsleep 30\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&program_path).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&program_path, perms).unwrap();
+        }
+        let program_str = program_path.to_string_lossy().to_string();
+        let cwd_str = workspace_root.to_string_lossy().to_string();
+
+        let rules = vec![CompiledRule::test_new(
+            Scope::Builtin,
+            PolicyOutcome::Allow,
+            Predicate::program(&program_str),
+        )];
+        let (executor, session) =
+            executor_and_session_with_real_bwrap(&workspace_root, rules).await;
+
+        let pending = PendingWork {
+            run_id: RunId::new(),
+            session_id: session.session_id(),
+            step_id: "sleepy".to_string(),
+            attempt: 1,
+            item_index: None,
+            disposition: StepDisposition::Effectful,
+            step_timeout: Duration::from_millis(200),
+            kind: PendingKind::Tool {
+                tool: "shell".to_string(),
+                task_kind: TaskKind::Shell,
+                logged_input: serde_json::json!({ "program": &program_str, "argv": [], "cwd": &cwd_str }),
+                dispatch_input: serde_json::json!({ "program": &program_str, "argv": [], "cwd": &cwd_str }),
+            },
+        };
+
+        let start = std::time::Instant::now();
+        let done = tokio::time::timeout(
+            Duration::from_secs(10),
+            executor.execute_pending(&session, vec![pending]),
+        )
+        .await
+        .expect("a plain timeout, with no cancel involved, must not hang");
+        assert!(
+            start.elapsed() >= Duration::from_millis(150),
+            "a real step_timeout must actually be waited out, not resolved by some earlier, \
+             unrelated failure (e.g. isolation spawn) — elapsed {:?}",
+            start.elapsed()
+        );
+
+        assert_eq!(done.len(), 1);
+        match &done[0].status {
+            // `dispatch_tool_for_workflow` reports every ordinary
+            // `ToolDispatchError` (timeout included) with the same fixed
+            // "tool execution failed" message rather than the error's own
+            // `Display` — see `record_workflow_task_failed`'s call site for
+            // why (the detail is logged via `tracing`, not returned to the
+            // step). The property under test is the *status variant*, not
+            // this message's text.
+            WorkStatus::Failed { message } => assert_eq!(message, "tool execution failed"),
+            other => panic!(
+                "a step_timeout elapsing with no cancel signal must report Failed, not {other:?}"
+            ),
+        }
+    }
+
+    /// Phase 8 Task 25.4 Task 4's central required test: cancelling a run
+    /// while its `tool: shell` step is genuinely mid-dispatch (a real,
+    /// long-running process, killed by a real cancel) must report that
+    /// step's `WorkDone` as `Cancelled` rather than `Failed`, the run must
+    /// end `RunState::Cancelled`, and `finally:` must still run to
+    /// completion afterward — §8.13's full four clauses, exercised together.
+    ///
+    /// Drives `DeliveryExecutor::drive_run_to_completion` directly (the same
+    /// method `run_claimed_delivery` calls), bypassing only the outer
+    /// trigger/binding/delivery-leasing machinery [`harness`] sets up — this
+    /// test needs a job registered and a `workflow_run` row, not a
+    /// `trigger_delivery` to claim, and driving directly is what lets it
+    /// hold a live handle to `session.actor()` to cancel, which a claim
+    /// hidden inside `claim_and_run` would not give it.
+    ///
+    /// Uses [`executor_and_session_with_real_bwrap`]: `Shell`'s own §8.13
+    /// cancel is observed by `execute_builtin`'s real `tokio::select!`
+    /// racing the child's real completion against the actor's real
+    /// `SessionState` watch, so there has to be a real, running child to
+    /// race against — the always-available isolate cannot spawn one in this
+    /// dev checkout (see that isolate's own doc comment).
+    ///
+    /// # Why this cancels through two calls, not one
+    ///
+    /// §8.13's cancel has two independently-real, currently-unwired-to-each-
+    /// other mechanisms in this workspace (see `roundhouse_web::interaction`'s
+    /// own module doc for the fullest statement of this): `control::cancel`
+    /// marks the `workflow_run` row `Cancelling`, which is what
+    /// `run_workflow`'s own terminal-state arithmetic
+    /// (`cancelled || observed == RunState::Cancelling`) reads to decide
+    /// `RunState::Cancelled` over `RunState::Failed` — and separately,
+    /// `session.actor().cancel` flips the *session's* `SessionState`, which
+    /// is the one `execute_pending`'s dispatch (through
+    /// `dispatch_tool_for_workflow`/`execute_builtin`) actually watches
+    /// mid-call. Calling only the first would mark the run cancelled but
+    /// never touch the running shell child; calling only the second would
+    /// kill the child but leave the row `Running`, so `run_workflow` would
+    /// report `RunState::Failed` once the killed step's own resumed
+    /// `WorkStatus::Cancelled` folds into `main_failed`. This task's own
+    /// scope is the second mechanism (`execute_pending`'s missing
+    /// mid-dispatch observation); the first already existed. A real,
+    /// wired-together cancel RPC is future work this test does not claim to
+    /// provide.
+    ///
+    /// # Determinism
+    ///
+    /// The 150ms head start before the cancel fires is the same idiom
+    /// `roundhouse-engine`'s own
+    /// `execute_builtin_shell_cancels_when_the_session_leaves_running` uses:
+    /// it does not decide correctness (the outer 20s `tokio::time::timeout`
+    /// below is what fails the test if the race ever went the other way and
+    /// the run hung or ran to completion instead), it only makes the test
+    /// actually exercise the mid-dispatch path — a `sleep 30` script started
+    /// microseconds earlier is overwhelmingly certain to still be running
+    /// 150ms later, and this test also independently confirms the process
+    /// was really killed via a real OS-level liveness check afterward.
+    #[tokio::test]
+    async fn cancelling_mid_shell_dispatch_reports_cancelled_and_still_runs_finally() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace_root = dir.path().join("workspace");
+        std::fs::create_dir(&workspace_root).unwrap();
+        let workspace_root = workspace_root.canonicalize().unwrap();
+
+        let pid_file = workspace_root.join("shell.pid");
+        let program_path = workspace_root.join("sleep_and_record_pid.sh");
+        std::fs::write(
+            &program_path,
+            format!("#!/bin/sh\necho $$ > {}\nsleep 30\n", pid_file.display()),
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&program_path).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&program_path, perms).unwrap();
+        }
+        let program_str = program_path.to_string_lossy().to_string();
+        let cwd_str = workspace_root.to_string_lossy().to_string();
+
+        let workflow_yaml = format!(
+            "name: scheduled\nversion: 1\npermissions:\n  default: deny\n  unattended:\n    \
+             escalate: fail\nsteps:\n  - id: sleepy\n    tool: shell\n    with: {{ program: \
+             {prog:?}, argv: [], cwd: {cwd:?} }}\nfinally:\n  - id: cleanup\n    emit: {{ value: \
+             cleanup-ran }}\n",
+            prog = program_str,
+            cwd = cwd_str,
+        );
+        let source = workspace_root.join("workflow.yaml");
+        std::fs::write(&source, &workflow_yaml).unwrap();
+
+        let rules = vec![CompiledRule::test_new(
+            Scope::Builtin,
+            PolicyOutcome::Allow,
+            Predicate::program(&program_str),
+        )];
+        let (executor, session) =
+            executor_and_session_with_real_bwrap(&workspace_root, rules).await;
+        let session_id = session.session_id();
+
+        let job_id = {
+            let conn = executor.store.pool.get().await.unwrap();
+            let root = workspace_root.clone();
+            let source = source.clone();
+            conn.interact(move |connection| {
+                register_workflow_file(connection, &root, &source, template())
+                    .unwrap()
+                    .job
+                    .id()
+            })
+            .await
+            .unwrap()
+        };
+
+        let run_id = RunId::new();
+        // The executor's own `FixedClock` reading — not an arbitrary
+        // `Timestamp`, and specifically not epoch 0: `started_at` below and
+        // every `self.now()` `drive_run_to_completion` reads later must
+        // agree, or the finally: phase's own wall-timeout admission check
+        // (`admit_spend_during_finally`) sees a run "started" decades ago
+        // and refuses it outright before it ever gets a chance to run —
+        // exactly the failure this comment is here to prevent regressing to.
+        let now = executor.now();
+        {
+            let conn = executor.store.pool.get().await.unwrap();
+            let root = workspace_root.clone();
+            conn.interact(move |connection| {
+                let resolved = resolve_latest_by_job_id(connection, &root, job_id)
+                    .unwrap()
+                    .expect("the job just registered above must resolve");
+                let version = resolved.job.latest();
+                let run = WorkflowRun {
+                    id: run_id,
+                    job_id,
+                    job_version: version.version(),
+                    content_hash: content_hash(version),
+                    session_id,
+                    binding_id: None,
+                    trigger_event_id: None,
+                    state: RunState::Running,
+                    parent_run_id: None,
+                    forked_from_run_id: None,
+                    awaiting_until: None,
+                    checkpoint_ref: None,
+                    checkpoint_blob_ref: None,
+                    started_at: now,
+                    ended_at: None,
+                    session_depth: Some(0),
+                    caps: Some(ResourceCaps::default()),
+                };
+                insert_workflow_run(connection, &run).unwrap();
+            })
+            .await
+            .unwrap();
+        }
+
+        let spec = SessionSpec {
+            workspace: WorkspaceId::new(),
+            name: None,
+            requested_tier: Tier::Sandbox,
+            on_degrade: OnDegrade::Refuse,
+            parent: None,
+        };
+        let run_ctx = RunContext {
+            inputs: serde_json::Value::Null,
+            vars: serde_json::Value::Null,
+            secrets: HashMap::new(),
+            run_id,
+            previous_report: None,
+            env_allowlist: EnvAllowlist::deny_all(),
+            worktree_provider: Some(Arc::new(SandboxWorktreeProvider::new(
+                workspace_root.clone(),
+            ))),
+        };
+
+        let store_for_cancel = executor.store.clone();
+        let actor = Arc::clone(session.actor());
+        let runner = crate::test_support::runner();
+        let canceller = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(150)).await;
+            // Leg 1: mark the run's own row `Cancelling` — what
+            // `run_workflow`'s terminal-state arithmetic reads.
+            let conn = store_for_cancel.pool.get().await.unwrap();
+            conn.interact(move |connection| {
+                roundhouse_flow::control::cancel(connection, run_id, now)
+            })
+            .await
+            .unwrap()
+            .expect("marking a Running run Cancelling must succeed");
+            // Leg 2: flip the session actor's own `SessionState` — what
+            // `execute_pending`'s in-flight shell dispatch actually watches.
+            actor
+                .cancel(runner, roundhouse_core::CancelReason::User)
+                .await
+                .expect("cancelling a healthy actor must succeed");
+        });
+
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(20),
+            executor.drive_run_to_completion(
+                run_id,
+                session_id,
+                &session,
+                spec,
+                workspace_root.clone(),
+                run_ctx,
+                now,
+            ),
+        )
+        .await
+        .expect("a cancelled run must not hang past its own outer safety net")
+        .expect("drive_run_to_completion's own DeliveryError path must not be reached")
+        .expect("run_workflow must not return a RunLoopError for this fixture");
+
+        canceller.await.expect("the canceller task must not panic");
+
+        let (state, steps) = match outcome {
+            RunOutcome::Terminal { state, steps, .. } => (state, steps),
+            other => panic!("a cancelled run must reach a terminal outcome, got {other:?}"),
+        };
+        assert_eq!(
+            state,
+            RunState::Cancelled,
+            "a run cancelled mid-dispatch must end Cancelled, not Failed or Completed"
+        );
+
+        let sleepy = steps
+            .iter()
+            .find(|s| s.step_id == "sleepy")
+            .expect("the sleepy step must have an outcome recorded");
+        match &sleepy.status {
+            StepStatus::Failed { message } => assert!(
+                message.to_lowercase().contains("cancel"),
+                "the cancelled shell step's own recorded message should name cancellation \
+                 (WorkStatus::Cancelled folds into StepStatus::Failed{{message: reason}} — see \
+                 that conversion's own doc comment), got {message:?}"
+            ),
+            other => panic!(
+                "the cancelled shell step must be recorded as failed (with a cancellation \
+                 reason), got {other:?}"
+            ),
+        }
+
+        let cleanup = steps
+            .iter()
+            .find(|s| s.step_id == "cleanup")
+            .expect("finally: must still have run and recorded an outcome, even after a cancel");
+        assert!(
+            matches!(cleanup.status, StepStatus::Completed),
+            "finally: must run to completion on a cancelled run (§8.13), got {:?}",
+            cleanup.status
+        );
+
+        // Confirm the process was actually killed — a real OS-level
+        // liveness check, not just trusting the returned status — the same
+        // mechanism `execute_builtin_shell_timeout_parameter_is_a_real_process_group_kill`
+        // (`roundhouse-engine`) uses.
+        for _ in 0..50 {
+            if pid_file.exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let pid: i32 = std::fs::read_to_string(&pid_file)
+            .expect("the dispatched shell must have written its own pid before sleeping")
+            .trim()
+            .parse()
+            .expect("pid file must contain a valid pid");
+        let mut confirmed_dead = false;
+        for _ in 0..100 {
+            let alive = std::process::Command::new("kill")
+                .arg("-0")
+                .arg(pid.to_string())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .map(|status| status.success())
+                .unwrap_or(false);
+            if !alive {
+                confirmed_dead = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(
+            confirmed_dead,
+            "a shell step cancelled mid-dispatch must have its process actually killed \
+             (SIGTERM/SIGKILL), not merely reported as cancelled while still running (pid {pid})"
         );
     }
 

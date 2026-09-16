@@ -33,16 +33,42 @@ use roundhouse_core::{
 };
 use roundhouse_policy::TaskParams;
 
-/// What dispatching one workflow `tool:` step for real produced.
+/// The terminal shape of one dispatched workflow `tool:` call.
 ///
-/// Folds directly into `roundhouse_flow::exec::run_loop::WorkDone`: `Ok`
-/// becomes `WorkStatus::Completed` with `output` as the step's real output;
-/// `Err` becomes `WorkStatus::Failed { message }`.
+/// Three-way rather than `Result<Value, String>` since Phase 8 Task 25.4
+/// Task 4: §8.13's cooperative cancel is a distinct outcome from an
+/// ordinary tool failure at the workflow-dispatch layer too —
+/// `roundhouse_flow::exec::run_loop::WorkStatus::Cancelled` exists
+/// specifically so a caller can tell "the run was cancelled mid-dispatch"
+/// apart from "the tool call failed," and this is what
+/// `DeliveryExecutor::work_done_from_dispatch`
+/// (`roundhouse-daemon::scheduler_driver`) folds one of these into.
+#[derive(Debug, Clone)]
+pub enum DispatchOutcome {
+    /// The call completed and produced this value.
+    Completed(serde_json::Value),
+    /// An ordinary failure: a denial, an admission refusal, a tool error, a
+    /// `step_timeout` elapsing. Becomes `WorkStatus::Failed { message }`.
+    Failed(String),
+    /// §8.13's cooperative cancel was observed for this call. `Shell` is
+    /// the only kind with a producer of its own today —
+    /// `ToolDispatchError::ShellSessionCancelled`, surfaced by
+    /// `execute_builtin`'s existing session-cancel race
+    /// (`run_isolated_shell_dispatch`) — because the four filesystem kinds
+    /// have no internal cancellation mechanism to observe from inside this
+    /// function; see `DeliveryExecutor::execute_pending`'s own doc comment
+    /// for how (and why) those four are instead reclassified after the
+    /// fact, once their non-interruptible call has already returned.
+    /// Becomes `WorkStatus::Cancelled { reason }`.
+    Cancelled(String),
+}
+
+/// What dispatching one workflow `tool:` step for real produced.
 pub struct WorkflowToolDispatch {
     pub task_id: TaskId,
     pub first_task_seq: u64,
     pub last_task_seq: Option<u64>,
-    pub result: Result<serde_json::Value, String>,
+    pub result: DispatchOutcome,
 }
 
 /// Dispatches one `tool:` step for real: mints and records its full
@@ -110,7 +136,7 @@ pub async fn dispatch_tool_for_workflow(
             task_id,
             first_task_seq,
             last_task_seq: Some(last_task_seq),
-            result: Err(format!(
+            result: DispatchOutcome::Failed(format!(
                 "workflow dispatch of `{task_kind:?}` is not wired yet (Phase 8 Task 25.4)"
             )),
         });
@@ -131,7 +157,7 @@ pub async fn dispatch_tool_for_workflow(
                 task_id,
                 first_task_seq,
                 last_task_seq: Some(last_task_seq),
-                result: Err(message),
+                result: DispatchOutcome::Failed(message),
             });
         }
     };
@@ -157,7 +183,7 @@ pub async fn dispatch_tool_for_workflow(
             // `record_denial` is best-effort about its own appends (see its
             // own doc comment) and does not hand back the seq it assigned.
             last_task_seq: None,
-            result: Err(message),
+            result: DispatchOutcome::Failed(message),
         });
     }
 
@@ -182,7 +208,7 @@ pub async fn dispatch_tool_for_workflow(
                     task_id,
                     first_task_seq,
                     last_task_seq: Some(last_task_seq),
-                    result: Err("tool execution failed".into()),
+                    result: DispatchOutcome::Failed("tool execution failed".into()),
                 });
             }
         };
@@ -204,7 +230,7 @@ pub async fn dispatch_tool_for_workflow(
                     task_id,
                     first_task_seq,
                     last_task_seq: Some(last_task_seq),
-                    result: Err("tool execution failed".into()),
+                    result: DispatchOutcome::Failed("tool execution failed".into()),
                 });
             }
         }
@@ -263,7 +289,7 @@ pub async fn dispatch_tool_for_workflow(
             task_id,
             first_task_seq,
             last_task_seq: Some(last_task_seq),
-            result: Err(format!(
+            result: DispatchOutcome::Failed(format!(
                 "failed to record the dispatched tool call starting: {err}"
             )),
         });
@@ -303,17 +329,31 @@ pub async fn dispatch_tool_for_workflow(
                 task_id,
                 first_task_seq,
                 last_task_seq: Some(last_task_seq),
-                result: Ok(output),
+                result: DispatchOutcome::Completed(output),
             })
         }
         Err(tool_err) => {
-            let category = if matches!(
-                &tool_err,
-                crate::tool_dispatch::ToolDispatchError::Isolation(_)
-            ) {
-                "isolation_error"
-            } else {
-                "tool_error"
+            // Phase 8 Task 25.4 Task 4: `ShellSessionCancelled` is §8.13's
+            // cooperative cancel, observed by `execute_builtin`'s own
+            // session-cancel race (`run_isolated_shell_dispatch`) — a
+            // distinct outcome from an ordinary tool failure, and the one
+            // case this function folds into `DispatchOutcome::Cancelled`
+            // rather than `::Failed`. Every other `ToolDispatchError`
+            // (including a `ShellCancelled` *timeout*, which is an ordinary
+            // failure, not a cancel — see that variant's own doc comment)
+            // stays `::Failed`, exactly as before this task.
+            let cancelled_reason = match &tool_err {
+                crate::tool_dispatch::ToolDispatchError::ShellSessionCancelled(reason) => {
+                    Some(reason.clone())
+                }
+                _ => None,
+            };
+            let category = match &tool_err {
+                crate::tool_dispatch::ToolDispatchError::Isolation(_) => "isolation_error",
+                crate::tool_dispatch::ToolDispatchError::ShellSessionCancelled(_) => {
+                    "shell_session_cancelled"
+                }
+                _ => "tool_error",
             };
             tracing::warn!(error = %tool_err, "admitted workflow tool execution failed");
             let last_task_seq = record_workflow_task_failed(
@@ -323,11 +363,15 @@ pub async fn dispatch_tool_for_workflow(
                 "tool execution failed".into(),
             )
             .await?;
+            let result = match cancelled_reason {
+                Some(reason) => DispatchOutcome::Cancelled(reason),
+                None => DispatchOutcome::Failed("tool execution failed".into()),
+            };
             Ok(WorkflowToolDispatch {
                 task_id,
                 first_task_seq,
                 last_task_seq: Some(last_task_seq),
-                result: Err("tool execution failed".into()),
+                result,
             })
         }
     }

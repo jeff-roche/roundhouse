@@ -175,14 +175,32 @@ pub enum ToolDispatchError {
          directory"
     )]
     MissingResolvedCwd,
-    /// A dispatched shell call was cancelled — either it exceeded
-    /// [`SHELL_TIMEOUT`], or the owning session left `Created`/`Running`
-    /// while it was in flight (fix round A, finding F6). The process group
-    /// has already been signalled (SIGTERM, escalating to SIGKILL) via
+    /// A dispatched shell call exceeded its wall-clock `timeout` (fix round
+    /// A, finding F6). The process group has already been signalled
+    /// (SIGTERM, escalating to SIGKILL) via
     /// `roundhouse_tools::cancel_running_shell` by the time this is
     /// returned.
+    ///
+    /// **Distinct from [`Self::ShellSessionCancelled`]**, added by Phase 8
+    /// Task 25.4 Task 4 so a caller can tell "this step ran out of its own
+    /// declared time budget" (an ordinary failure) apart from "§8.13's
+    /// cooperative cancel was observed" (`WorkStatus::Cancelled`, not
+    /// `Failed`, at the workflow-dispatch layer —
+    /// `roundhouse_engine::workflow_dispatch::dispatch_tool_for_workflow`'s
+    /// own doc comment has the full mapping). Before Task 4 the two shared
+    /// one variant; splitting them is the minimal change that lets a caller
+    /// distinguish the two without parsing this `Display` string.
     #[error("shell command cancelled: {0}")]
     ShellCancelled(String),
+    /// A dispatched shell call was cancelled because the owning session left
+    /// `Created`/`Running` while it was in flight (fix round A, finding F6;
+    /// split out from [`Self::ShellCancelled`] by Phase 8 Task 25.4 Task 4 —
+    /// see that variant's own doc comment for why). The process group has
+    /// already been signalled (SIGTERM, escalating to SIGKILL) via
+    /// `roundhouse_tools::cancel_running_shell` by the time this is
+    /// returned.
+    #[error("shell command cancelled by session state change: {0}")]
+    ShellSessionCancelled(String),
     /// The real `roundhouse-tools` executor itself failed (I/O error,
     /// ambiguous edit match, glob error, etc.).
     #[error("{0}")]
@@ -287,6 +305,10 @@ impl ToolDispatchError {
             ),
             Self::ShellCancelled(_) => (
                 "shell_cancelled",
+                "the shell command was cancelled before it completed".to_string(),
+            ),
+            Self::ShellSessionCancelled(_) => (
+                "shell_session_cancelled",
                 "the shell command was cancelled before it completed".to_string(),
             ),
             Self::Tool(_) => (
@@ -1031,17 +1053,28 @@ async fn run_isolated_shell_dispatch(
     };
 
     let mut cancel = cancel;
-    let cancel_reason = tokio::select! {
+    // Phase 8 Task 25.4 Task 4: which branch won decides which
+    // `ToolDispatchError` variant is returned below — `ShellCancelled` for
+    // a wall-clock timeout, `ShellSessionCancelled` for §8.13's cooperative
+    // cancel — so a caller (`dispatch_tool_for_workflow`) can tell "this
+    // step ran out of its own declared time budget" apart from "a cancel
+    // was observed" without parsing free text. The `child.cancel().await`
+    // confirmation itself is identical either way, so it stays one call
+    // below rather than being duplicated per branch.
+    let (cancelled_by_session, cancel_reason) = tokio::select! {
         result = completion => return result,
         () = tokio::time::sleep(timeout) => {
-            format!("exceeded its {timeout:?} wall-clock bound")
+            (false, format!("exceeded its {timeout:?} wall-clock bound"))
         }
         () = wait_for_session_cancel(&mut cancel) => {
-            "the owning session was cancelled/suspended/closed".to_string()
+            (true, "the owning session was cancelled/suspended/closed".to_string())
         }
     };
 
     match child.cancel().await {
+        Ok(_) if cancelled_by_session => {
+            Err(ToolDispatchError::ShellSessionCancelled(cancel_reason))
+        }
         Ok(_) => Err(ToolDispatchError::ShellCancelled(cancel_reason)),
         Err(err) => Err(ToolDispatchError::Isolation(format!(
             "cancellation could not be confirmed: {err}"
@@ -1124,15 +1157,17 @@ async fn run_shell_dispatch(
         })
     };
 
-    let cancel_reason = tokio::select! {
+    // See `run_isolated_shell_dispatch`'s identical split for why the
+    // winning branch is tracked, not just its reason string.
+    let (cancelled_by_session, cancel_reason) = tokio::select! {
         result = completion => {
             return result.map_err(ToolDispatchError::Tool);
         }
         () = tokio::time::sleep(timeout) => {
-            format!("exceeded its {timeout:?} wall-clock bound")
+            (false, format!("exceeded its {timeout:?} wall-clock bound"))
         }
         () = wait_for_session_cancel(&mut cancel) => {
-            "the owning session was cancelled/suspended/closed".to_string()
+            (true, "the owning session was cancelled/suspended/closed".to_string())
         }
     };
 
@@ -1143,7 +1178,11 @@ async fn run_shell_dispatch(
     // return shape than "the tool call didn't succeed," which is all a
     // dispatched tool result can express today.
     let _ = roundhouse_tools::cancel_running_shell(&mut handle, SHELL_CANCEL_GRACE).await;
-    Err(ToolDispatchError::ShellCancelled(cancel_reason))
+    if cancelled_by_session {
+        Err(ToolDispatchError::ShellSessionCancelled(cancel_reason))
+    } else {
+        Err(ToolDispatchError::ShellCancelled(cancel_reason))
+    }
 }
 
 /// Resolves once the watched session leaves `Created`/`Running`, or never
@@ -2161,8 +2200,9 @@ mod tests {
 
         sender.await.expect("sender task must not panic");
         assert!(
-            matches!(result, Err(ToolDispatchError::ShellCancelled(_))),
-            "session cancellation must cancel the in-flight shell call, got {result:?}"
+            matches!(result, Err(ToolDispatchError::ShellSessionCancelled(_))),
+            "session cancellation must cancel the in-flight shell call and be reported as a \
+             session cancellation, not an ordinary timeout, got {result:?}"
         );
     }
 
@@ -2465,6 +2505,7 @@ mod tests {
             ToolDispatchError::ShellProgramRejected("x".into()),
             ToolDispatchError::MissingResolvedCwd,
             ToolDispatchError::ShellCancelled("x".into()),
+            ToolDispatchError::ShellSessionCancelled("x".into()),
             ToolDispatchError::Tool(roundhouse_tools::ToolError::Glob("x".into())),
         ];
 
