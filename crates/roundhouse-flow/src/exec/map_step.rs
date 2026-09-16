@@ -30,6 +30,12 @@
 //! comment makes: two independently written copies of one decision drift, and
 //! this file has already paid for that once.
 //!
+//! One decision here is deliberately *not* shared, and it is the exception
+//! that proves the rule: [`per_item_dispatch_refusal`] (Task 4) lives beside
+//! [`split_budget`], the division it enforces, but only the run-loop fan-out
+//! calls it. See the closure at [`run_map`]'s call site for why — a ceiling on
+//! stub dispatches, divided out of a placeholder ceiling, would bound nothing.
+//!
 //! # Deviations from the plan text (ruling P1)
 //!
 //! - **`on_item_error` is [`OnItemError`], not `&str`.** The plan's
@@ -274,6 +280,10 @@ pub enum ItemOutcome {
 /// this crate parses per-item `map` caps yet) would be a transfer out of
 /// this same pool, not an independent allocation, so this function is
 /// intended only for items that do not set their own caps.
+///
+/// What holds an item to the share this computes is
+/// [`per_item_dispatch_refusal`], which also records which of these fields is
+/// enforceable at all and why the rest are not.
 pub fn split_budget(total: &ResourceCaps, item_count: u32) -> ResourceCaps {
     let n = item_count.max(1) as f64;
     ResourceCaps {
@@ -287,6 +297,72 @@ pub fn split_budget(total: &ResourceCaps, item_count: u32) -> ResourceCaps {
         // resource that divides sensibly across concurrent items at all.
         ..total.clone()
     }
+}
+
+/// **[`split_budget`]'s enforcement half: one item's next real dispatch,
+/// refused once the item has spent its own share** (Phase 8 Task 25.7, #64,
+/// Task 4). `None` when the dispatch still fits.
+///
+/// # What this is, and what it deliberately is not
+///
+/// §8.9 makes an item's budget *"a transfer out of the run's remaining
+/// budget, not an independent pool"*, so this adds **no** durable accounting:
+/// [`crate::ledger::admit_spend`] stays the one place a run's ledger moves,
+/// and a `map` is still charged there exactly once, when it starts. What this
+/// adds on top is an in-memory ceiling, derived fresh on every segment from
+/// the item's own durable rows, that stops one item consuming the whole run's
+/// allowance while its siblings starve — which is a live risk only since Task
+/// 2 of the same task made a `map` item's inner steps dispatch for real: a
+/// 2,000-item `map` can otherwise issue 2,000 real dispatches against the
+/// admission of one step.
+///
+/// # Why `max_tool_calls`, and why that field alone
+///
+/// Of the four countables [`split_budget`] divides, `max_tool_calls` is the
+/// only one whose unit a `map` can observe at all. `max_cost_usd`,
+/// `max_tokens` and `max_bytes_written` are measured *outside* the run (see
+/// [`crate::ledger::Spend`]'s own doc on why this crate invents none of them),
+/// and nothing carries them back: `crate::exec::run_loop::WorkDone` — the only
+/// thing a finished dispatch hands this crate — has no field for any of the
+/// three. A ceiling on a figure that is always zero would be enforcement
+/// theatre; a ceiling on calls is the one §8.9 shares with
+/// `crate::exec::run_loop::Loop::admit`, which charges a top-level `tool:`
+/// step exactly one.
+///
+/// **Every real dispatch counts as one call, an `agent:` step included.**
+/// `Loop::admit` bills a top-level `agent:` step against `max_subagents`
+/// instead, but [`split_budget`] deliberately does not divide that field, so
+/// counting an item's agent dispatches there would bound them by the run's
+/// *whole* allowance — which is not a per-item bound at all. The question this
+/// ceiling answers is "how much real work may one item set going", and both
+/// bodies are that.
+///
+/// # Why the item `Failed` rather than `Skipped`
+///
+/// A `Skipped` item is one the fan-out never started — `fail_fast`'s fill, or
+/// (Task 5) an item the *run* ran out of budget before reaching. This item did
+/// run; it ran too much. So it takes the ordinary path any other inner-step
+/// failure takes, and `on_item_error` governs what that does to the rest of
+/// the fan-out, with the reason in the message rather than in a comment.
+pub(crate) fn per_item_dispatch_refusal(
+    map_step_id: &str,
+    inner_step_id: &str,
+    item_index: u32,
+    dispatches_so_far: u32,
+    item_caps: &ResourceCaps,
+) -> Option<ItemOutcome> {
+    let allowed = item_caps.max_tool_calls;
+    (dispatches_so_far >= allowed).then(|| {
+        ItemOutcome::Failed(format!(
+            "map step `{map_step_id}`, item {item_index}: inner step `{inner_step_id}` needs a \
+             real dispatch, and this item has already made {dispatches_so_far} of the {allowed} \
+             it is allowed — its even share of the run's remaining `max_tool_calls` at the \
+             moment this `map` started. §8.9 makes an item's budget a transfer out of the run's \
+             remaining budget rather than an independent pool, so the dispatch is refused here \
+             rather than letting one item spend the whole run's allowance while its siblings \
+             starve"
+        ))
+    })
 }
 
 /// The result of a `map` step's fan-out: the per-item outcomes (never
@@ -329,8 +405,12 @@ pub struct MapRunResult {
 /// using whatever ledger its caller threads in — "cooperative" names exactly
 /// this, the caller checking and reporting `Skipped` rather than this
 /// function silently withholding a call. `run_item` is still handed
-/// [`split_budget`]'s even-split allowance for the item, which is real and
-/// meaningful regardless (Task 8's admission ledger is what enforces it).
+/// [`split_budget`]'s even-split allowance for the item, and the closure at
+/// this function's one call site still leaves it unread — see that closure's
+/// own comment for why binding it *here* would bound stub work against a
+/// placeholder ceiling. The loop that enforces the same share for real is
+/// `crate::exec::run_loop::Loop::dispatch_map`, through
+/// [`per_item_dispatch_refusal`].
 ///
 /// `on_item_error` (finding 10's fix — previously `collect` and `continue`
 /// were indistinguishable):
@@ -1820,24 +1900,35 @@ impl<'a> Executor<'a> {
             max_parallel,
             on_item_error,
             &mut budget,
-            // **`_item_caps` is where ruling P108 §C stops being discharged,
-            // and this binding is the reason** (named here, at the site a
-            // future implementer works, not only where the value is sourced).
-            // `run_loop::run_workflow` computes a real, live
-            // `split_budget(&budget.total_remaining, n)` from the run's
-            // ledger and `run_map` hands it to this closure — and nothing
-            // reads it, so per-item *enforcement* does not exist. B12c's
-            // mutation sweep measured exactly that: the two survivors it
-            // could not kill (`M1`/`M2`) both mutate the split arithmetic,
-            // and both are `EQUIVALENT` **because of this underscore**.
+            // **`_item_caps` stays unread *here*, and that is now a statement
+            // about this loop rather than about `map`** (Phase 8 Task 25.7
+            // Task 4). Ruling P108 §C's enforcement half landed at the other
+            // fan-out loop, `run_loop::Loop::dispatch_map`, which refuses an
+            // item's next dispatch once its running tally would exceed this
+            // same `split_budget` share — see `per_item_dispatch_refusal`.
             //
-            // Phase 8 Task 25.7 Task 4 owns closing it — at **both** fan-out
-            // loops, since Task 2 of the same task gave `map` a second one
-            // (`run_loop::Loop::dispatch_map`) that is equally unenforced:
-            // bind the parameter, and admit each item's spend against it
-            // through `ledger::admit_spend` the way `run_loop::Loop::admit`
-            // does for a top-level step. Until then the sourcing is correct
-            // and the ceiling is the run-level one.
+            // It is not mirrored here because there is nothing here to refuse.
+            // Every `tool:`/`agent:` inner step this loop reaches becomes
+            // `Executor::dispatch_step_or_stub`'s fabricated `{}` (this
+            // function's caller holds no `Connection` and so has nothing to
+            // suspend into), and the budget being divided is
+            // `MapBudget::unenforced_placeholder` — a `ResourceCaps::default`
+            // that explicitly is not sourced from any run. A ceiling on stub
+            // work, derived from a number whose own constructor says it
+            // enforces nothing, would be enforcement theatre; the honest
+            // reading is that this loop has no per-item spend to bound.
+            //
+            // B12c's mutation sweep left two survivors (`M1`/`M2`), both
+            // mutations of the split arithmetic, both `EQUIVALENT` because of
+            // this underscore. The arithmetic is observable now — at the loop
+            // that dispatches for real. `tests/run_loop.rs`'s per-item
+            // admission section asserts on *which dispatches happen* rather
+            // than on the number, so a changed divisor and a changed rounding
+            // both move the wave sequence and fail:
+            // `a_per_item_cap_refuses_an_items_second_dispatch_instead_of_running_it`
+            // pins the divisor, and
+            // `an_inner_step_that_never_dispatched_does_not_spend_an_items_share`
+            // is written over an odd grant so that it pins the `ceil`.
             |item, _item_caps| {
                 let item_evaluated = over_evaluated.derive(item.clone());
                 self.ctx.set_from(as_name, &item_evaluated);

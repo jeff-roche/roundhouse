@@ -92,8 +92,8 @@ use thiserror::Error;
 
 use super::map_step::{
     fold_inner_step_outcome, map_step_outcome, nested_report_refusal, parse_map_inner_steps,
-    resolve_map_items, restore_map_roots, snapshot_map_roots, ItemErrorPolicy, ItemOutcome,
-    ItemWorktree, MapBudget, MapRunResult,
+    per_item_dispatch_refusal, resolve_map_items, restore_map_roots, snapshot_map_roots,
+    split_budget, ItemErrorPolicy, ItemOutcome, ItemWorktree, MapBudget, MapRunResult,
 };
 use super::{
     evaluate_when_gate, redact_with_needles, steps_context_entry, truncate_diagnostic, Executor,
@@ -1835,20 +1835,28 @@ impl<H: WorkflowHost> Loop<'_, H> {
                 // the run's real remaining ceiling, read at the moment the
                 // step starts — §8.9's own words for when it is taken.
                 //
-                // **Sourced, not yet enforced, and this slice's mutation
-                // sweep measured exactly that.** `map_step::run_map` computes
-                // `split_budget(&budget.total_remaining, n)` and hands the
-                // result to a closure that binds it `_item_caps`; nothing
-                // reads it. So mutating this line away survives at zero test
-                // failures, and the honest reading is that the *sourcing*
-                // half of P108 §C is done and the *enforcement* half is
-                // per-item admission. Phase 8 Task 25.7 Task 2 moved `map`'s
-                // real dispatch into this loop without changing that: an
-                // inner step is still not charged against the ledger, only
-                // the `map` step itself is. Task 4 of the same task owns
-                // binding `_item_caps` to a real per-item refusal, and Task 5
-                // owns §8.9's cooperative run-budget exhaustion. Kept rather
-                // than deleted because the value is real and correct.
+                // **Sourced *and*, since Phase 8 Task 25.7 Task 4, enforced —
+                // but only at the loop where a `map` item dispatches for
+                // real.** `Self::dispatch_map` divides this figure with
+                // `split_budget` and refuses an item's next dispatch once the
+                // item has spent its share (see `per_item_dispatch_refusal`),
+                // which is what bounds the `MAX_MAP_ITEMS` real dispatches a
+                // `map` could otherwise issue against one step's own
+                // admission — a hole Task 2 opened by making a `map` item's
+                // inner steps dispatch for real. It does not
+                // change what reaches §8.4's ledger: an inner step is still
+                // not charged there, only the `map` step itself is, once —
+                // §8.9's per-item budget is a transfer out of the run's
+                // remaining budget, not a second pool to account for. Task 5
+                // owns §8.9's cooperative run-budget exhaustion, which is the
+                // different question of an item that never got to run at all.
+                //
+                // `map_step::run_map`'s own closure still binds `_item_caps`
+                // unread, and deliberately: that loop's `tool:`/`agent:` steps
+                // are `dispatch_step_or_stub`'s stubs against a budget that is
+                // `MapBudget::unenforced_placeholder` by construction, so a
+                // refusal there would be a ceiling on nothing, derived from a
+                // number that admits it is not real.
                 //
                 // Re-read on **every** segment of a `map`'s fan-out, not only
                 // the first: `Executor` is rebuilt per entry, so a resuming
@@ -2760,13 +2768,22 @@ impl<H: WorkflowHost> Loop<'_, H> {
     /// exactly once (only the segment that finishes the map builds the
     /// outcome) rather than once per wave the item was replayed in.
     ///
+    /// # Per-item admission (Task 4), and what it is not
+    ///
+    /// An inner step is **not** charged against §8.4's ledger; the `map` step
+    /// itself is charged once, by [`Self::run_phase`], and §8.9's per-item
+    /// budget is a transfer out of the run's remaining budget rather than a
+    /// second pool to account for. What this loop adds on top is an in-memory
+    /// ceiling: [`split_budget`]'s even share, compared against a tally
+    /// re-derived from the item's own rows
+    /// ([`Self::map_item_dispatches_so_far`]) and enforced at the one seam an
+    /// inner step becomes real work (see [`per_item_dispatch_refusal`] for
+    /// which field it bounds and why that one). Cooperative run-budget
+    /// exhaustion — an item the *run* ran out of budget before reaching — is
+    /// the different question Task 5 owns.
+    ///
     /// # What this task deliberately does not do
     ///
-    /// - **Per-item admission.** An inner step is not charged against §8.4's
-    ///   ledger; the `map` step itself is charged once, by [`Self::run_phase`].
-    ///   Binding `split_budget`'s per-item share to a real refusal is Task 4's
-    ///   (`map_step.rs`'s own `_item_caps` note names the same owner), and
-    ///   cooperative run-budget exhaustion is Task 5's.
     /// - **Nested `gate:`/`call:`.** An inner step of either kind still takes
     ///   [`Executor::dispatch_step`]'s catch-all refusal, unchanged — it comes
     ///   back `Done(failed)` from the generic arm below rather than needing an
@@ -2793,6 +2810,30 @@ impl<H: WorkflowHost> Loop<'_, H> {
             Ok(inner_steps) => inner_steps,
             Err(outcome) => return Ok(MapStep::Completed(*outcome)),
         };
+
+        // §8.9's even split, and — since Task 4 — a ceiling rather than a
+        // number: see [`per_item_dispatch_refusal`], which owns both what is
+        // enforced and why only that.
+        //
+        // Taken from the [`MapBudget`] [`Self::run_phase`] re-reads before
+        // **every** segment of this fan-out, not only the first, so a resuming
+        // wave divides what the run has left now rather than what it had when
+        // the `map` began. That re-read is also what makes the figure stable
+        // across one fan-out's segments, which is what a running tally
+        // compared against it needs: nothing a `map`'s waves do spends
+        // `max_tool_calls` at the run level ([`Self::admit`] charges it for a
+        // top-level `tool:` step, and a wave after the first only observes),
+        // so the share an item is measured against does not move underneath
+        // it mid-item.
+        let run_remaining = match &executor.map_budget {
+            Some(budget) => budget.total_remaining.clone(),
+            // An [`Executor`] with no run behind it at all — see
+            // [`MapBudget::unenforced_placeholder`]. Unreachable from
+            // `run_phase`, which sets the real one immediately before
+            // dispatching a `map`, and named rather than defaulted silently.
+            None => MapBudget::unenforced_placeholder().total_remaining,
+        };
+        let per_item_caps = split_budget(&run_remaining, items.len() as u32);
 
         let snapshots = snapshot_map_roots(&executor.ctx, as_name, isolation);
         let mut any_item_secret_derived = over_evaluated.secret_derived();
@@ -2839,6 +2880,7 @@ impl<H: WorkflowHost> Loop<'_, H> {
                 item_index,
                 &item_evaluated,
                 isolation,
+                &per_item_caps,
                 &mut any_item_secret_derived,
             ) {
                 Ok(ItemAdvance::Finished(outcome)) => {
@@ -2914,6 +2956,65 @@ impl<H: WorkflowHost> Loop<'_, H> {
         })
     }
 
+    /// How many real dispatches this `map` item has already made — the running
+    /// tally [`per_item_dispatch_refusal`] compares against the item's share.
+    ///
+    /// # Re-derived every segment, from the rows alone
+    ///
+    /// Nothing in memory survives a suspension, so this is reconstructed from
+    /// [`Self::item_steps_before`] on each entry — the same durable state
+    /// [`Self::map_item_is_in_flight`] and [`Self::decided_map_item_step`]
+    /// already reconstruct an item's position from, rather than a second,
+    /// parallel mechanism.
+    ///
+    /// **The snapshot alone is complete, and that is a property of the walk
+    /// rather than luck.** `item_steps_before` is frozen at entry and not
+    /// updated by the checkpoints this segment writes, so it cannot see a
+    /// dispatch this same call made — but it does not have to. Two facts close
+    /// the gap: [`Self::advance_map_item`] returns the moment an inner step
+    /// dispatches, so one call can start at most one, and it is the last thing
+    /// that call does; and a step that suspended got its `Running` row from
+    /// [`Self::checkpoint_map_item_step_waiting`] *before* its
+    /// [`PendingWork`] was ever handed out, so the answer this segment
+    /// consumes always has a row in the snapshot already.
+    ///
+    /// # What counts
+    ///
+    /// An inner step counts when it both *would* dispatch
+    /// ([`inner_step_needs_real_dispatch`]) and has a row saying it started
+    /// ([`row_records_a_started_step`]) — so an `emit:` this crate answers
+    /// itself, and a `tool:` step its own `when:` gate skipped, spend nothing.
+    ///
+    /// The one over-count is a `tool:`/`agent:` step that failed *before*
+    /// dispatching (an uninterpolatable `with:`, an unknown tool — the
+    /// [`super::DispatchDecision::Done`] arms of `Executor::dispatch_step`):
+    /// its row is `Failed`, and this counts it. Harmless by construction
+    /// rather than by tolerance — `fold_inner_step_outcome` ends the item on
+    /// any inner-step failure, so no later step of that item ever asks.
+    ///
+    /// One deliberate strictness, though: an interrupted step whose
+    /// [`crash_policy`] is `Rerun` counts its **first**, interrupted dispatch
+    /// as well as the re-run, so an item already at its ceiling is refused
+    /// rather than handed a free extra call. That is the fail-closed reading
+    /// and the honest one — an interrupted dispatch is interrupted, not
+    /// un-made, and may well have reached a provider.
+    fn map_item_dispatches_so_far(&self, inner_steps: &[StepDef], item_index: u32) -> u32 {
+        inner_steps
+            .iter()
+            .filter(|inner| inner_step_needs_real_dispatch(&inner.body))
+            .filter(|inner| {
+                self.item_steps_before
+                    .get(&(inner.id.clone(), item_index))
+                    .is_some_and(|row| row_records_a_started_step(row.state))
+            })
+            .count()
+            .try_into()
+            // Saturating rather than wrapping: an inner-step list longer than
+            // `u32::MAX` is unreachable (`parse_map_inner_steps` bounds it),
+            // and a wrap here would read as "this item has spent nothing".
+            .unwrap_or(u32::MAX)
+    }
+
     /// Advances one `map` item as far as it goes on this segment.
     ///
     /// Each inner step is decided by the first of three things that can
@@ -2921,6 +3022,10 @@ impl<H: WorkflowHost> Loop<'_, H> {
     /// durable row an earlier segment left, or running it now. The order
     /// matters — a step that just suspended has *both* a caller-supplied
     /// answer and a `Running` row, and the answer is the one that is right.
+    ///
+    /// `per_item_caps` is this item's share of the run's remaining ceiling,
+    /// enforced at the one point an inner step becomes real work — see
+    /// [`per_item_dispatch_refusal`].
     #[allow(clippy::too_many_arguments)]
     fn advance_map_item(
         &mut self,
@@ -2930,6 +3035,7 @@ impl<H: WorkflowHost> Loop<'_, H> {
         item_index: u32,
         item_evaluated: &Evaluated,
         isolation: Option<&MapIsolationDef>,
+        per_item_caps: &ResourceCaps,
         any_item_secret_derived: &mut bool,
     ) -> Result<ItemAdvance, RunLoopError> {
         let mut last = ItemOutcome::Completed(Value::Null);
@@ -3003,6 +3109,29 @@ impl<H: WorkflowHost> Loop<'_, H> {
                     // the caller with this item's index attached, rather than
                     // `Executor::dispatch_step_or_stub`'s fabricated `{}`.
                     super::DispatchDecision::Pending(kind) => {
+                        // **Except when the item has spent its share** — the
+                        // per-item ceiling §8.9's split has always computed
+                        // and nothing ever enforced (Task 4). Checked here
+                        // because this is the one point an inner step becomes
+                        // real work, and *before* the worktree rule below
+                        // because a dispatch this item may not make at all is
+                        // refused whatever else would also have stopped it.
+                        // Nothing has been emitted or spent by the time
+                        // `dispatch_step` returns `Pending` (see its own doc
+                        // comment, "`Tool`/`Agent` return
+                        // `DispatchDecision::Pending`, and emit nothing"), so
+                        // refusing here withholds the work rather than
+                        // abandoning it half-done.
+                        if let Some(refusal) = per_item_dispatch_refusal(
+                            map_step_id,
+                            &inner.id,
+                            item_index,
+                            self.map_item_dispatches_so_far(inner_steps, item_index),
+                            per_item_caps,
+                        ) {
+                            last = refusal;
+                            break;
+                        }
                         // **Except when this item holds a worktree** — see
                         // `Self::worktree_cannot_span_a_suspend`.
                         if worktree.as_ref().is_some_and(ItemWorktree::holds_worktree) {
@@ -3310,6 +3439,51 @@ fn worktree_cannot_span_a_suspend(map_step_id: &str, inner_step_id: &str) -> Ite
          Refusing rather than re-materializing; until durable per-item worktrees land, a `map` \
          with `isolation: worktree` can only run inner steps that need no dispatch"
     ))
+}
+
+/// Whether an inner step of a `map`, when it runs, reaches **real dispatch** —
+/// the unit [`Loop::map_item_dispatches_so_far`] counts against the item's
+/// share.
+///
+/// These are exactly the two bodies [`Executor::dispatch_step`] answers with
+/// [`super::DispatchDecision::Pending`], which is what makes "a call" the same
+/// event here and at [`Loop::admit`].
+fn inner_step_needs_real_dispatch(body: &StepBody) -> bool {
+    match body {
+        StepBody::Tool { .. } | StepBody::Agent { .. } => true,
+        // Answered inside this crate, dispatching nothing: `emit:`/`report:`,
+        // and a nested `map:` (which runs its own items through
+        // `Executor::dispatch_map_step`'s in-memory loop).
+        //
+        // `gate:`/`call:` inside a `map` take `Executor::dispatch_step`'s
+        // catch-all refusal today and so dispatch nothing either. Phase 8 Task
+        // 25.7's Tasks 6 and 7 own making them real, and whichever lands first
+        // must decide this arm again — written out rather than left to a `_`
+        // so that a new `StepBody` variant is a compile error here instead of
+        // a silent hole in the ceiling.
+        StepBody::Emit { .. }
+        | StepBody::Report { .. }
+        | StepBody::Map { .. }
+        | StepBody::Gate { .. }
+        | StepBody::Call { .. } => false,
+    }
+}
+
+/// Whether a `map` item's inner-step row records a step that **started** —
+/// one whose dispatch has happened or is still outstanding.
+fn row_records_a_started_step(state: StepRunState) -> bool {
+    match state {
+        // Outstanding: [`Loop::checkpoint_map_item_step_waiting`] writes
+        // `Running` the instant the step suspends, and [`recover_run`]
+        // reclassifies an effectful one to `Indeterminate` after a crash.
+        // These are the only two writers of either state for a per-item row.
+        StepRunState::Running | StepRunState::Indeterminate => true,
+        // Settled: the answer came back, or the step failed.
+        StepRunState::Completed | StepRunState::Failed => true,
+        // Never dispatched: the step's own `when:` gate decided it
+        // (`Skipped`), or nothing has started it at all (`Pending`).
+        StepRunState::Skipped | StepRunState::Pending => false,
+    }
 }
 
 /// The child caps a `call:` asks for: the step's own `caps:` overlaid on a

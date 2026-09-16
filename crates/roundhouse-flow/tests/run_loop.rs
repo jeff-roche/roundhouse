@@ -4808,10 +4808,34 @@ fn drive_waves_with_context(
     Vec<Wave>,
     Result<RunOutcome, RunLoopError>,
 ) {
+    drive_waves_with_grant(body, failing, a_grant(), configure)
+}
+
+/// [`drive_waves_with_context`], against a run whose grant is `grant` rather
+/// than [`a_grant`]'s.
+///
+/// The per-item ceiling a `map` enforces is a *share* of what the run has
+/// left, so a test that wants a small share asks for a small grant rather than
+/// for an implausible number of items.
+fn drive_waves_with_grant(
+    body: &str,
+    failing: &[(&str, u32)],
+    grant: ResourceCaps,
+    configure: impl FnOnce(&mut RunContext),
+) -> (
+    Connection,
+    RunId,
+    RecordingSink,
+    Vec<Wave>,
+    Result<RunOutcome, RunLoopError>,
+) {
     use roundhouse_flow::exec::run_loop::{PendingKind, WorkDone, WorkStatus};
 
     let mut conn = open_test_db();
-    let (run_id, _) = seed_run(&mut conn);
+    let run_id = RunId::new();
+    let mut run = a_run(run_id, SessionId::new());
+    run.caps = Some(grant);
+    insert_workflow_run(&mut conn, &run).expect("seed the run row");
     let def = parse_workflow(&workflow(body)).expect("fixture parses");
     let mut sink = RecordingSink::default();
     let mut host = FakeHost::new();
@@ -5691,5 +5715,225 @@ fn an_items_worktree_cannot_span_a_suspend_and_says_so_rather_than_re_materializ
     assert_eq!(
         released, materialized,
         "every worktree the refusal abandoned is still released"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Per-item admission — Phase 8 Task 25.7 (#64) Task 4
+//
+// `split_budget` has computed each item's even share of the run's remaining
+// ceiling since B12c, and until this task **nothing read it** — the parameter
+// was literally named `_item_caps`, which is why that slice's mutation sweep
+// could not kill either mutant of the split arithmetic. These tests assert the
+// enforcement half, and they assert it the only way that distinguishes it from
+// arithmetic: a real dispatch that would otherwise have happened, and does
+// not.
+// ---------------------------------------------------------------------------
+
+/// [`a_grant`] with the one field the per-item ceiling is a share of set to
+/// `max_tool_calls`.
+fn a_grant_of_tool_calls(max_tool_calls: u32) -> ResourceCaps {
+    ResourceCaps {
+        max_tool_calls,
+        ..a_grant()
+    }
+}
+
+/// **The claim this task exists to make: the item's next dispatch never
+/// happens.** Two items over a run with two tool calls left is one call each
+/// (`split_budget`'s even share), so each item spends its share on `build` and
+/// its `publish` is refused — one wave, two shell tasks, and a `publish` that
+/// never reaches the caller as pending work at all.
+#[test]
+fn a_per_item_cap_refuses_an_items_second_dispatch_instead_of_running_it() {
+    let (_conn, _run_id, sink, waves, result) = drive_waves_with_grant(
+        "steps:\n\
+         \x20 - id: fan\n\
+         \x20   map:\n\
+         \x20     over: \"${{ inputs.items }}\"\n\
+         \x20     as: item\n\
+         \x20     max_parallel: 2\n\
+         \x20     on_item_error: continue\n\
+         \x20   steps:\n\
+         \x20     - id: build\n\
+         \x20       tool: shell\n\
+         \x20       with: { cmd: [echo, build] }\n\
+         \x20     - id: publish\n\
+         \x20       tool: shell\n\
+         \x20       with: { cmd: [echo, publish] }\n",
+        &[],
+        a_grant_of_tool_calls(2),
+        |run_ctx| run_ctx.inputs = serde_json::json!({ "items": map_items(2) }),
+    );
+    let outcome = result.expect("the run drives");
+
+    assert_eq!(
+        waves,
+        vec![vec![
+            ("build".to_string(), Some(0)),
+            ("build".to_string(), Some(1)),
+        ]],
+        "each item's one call is spent on `build`, so `publish` is never dispatched for \
+         either: {waves:?}"
+    );
+    assert_eq!(
+        shell_tasks(&sink),
+        2,
+        "two real dispatches reached the log, not four"
+    );
+
+    let output = map_output(&outcome, "fan");
+    let entries = output["items"].as_array().expect("one entry per item");
+    assert_eq!(entries.len(), 2, "§8.9: never drop an item");
+    for (index, entry) in entries.iter().enumerate() {
+        assert_eq!(
+            entry["status"], "failed",
+            "item {index} ran, and then ran out of its own share — it is not `skipped`: \
+             {entry:?}"
+        );
+        let error = entry["error"].as_str().unwrap_or_default();
+        assert!(
+            error.contains("publish") && error.contains("max_tool_calls"),
+            "the refusal names the step it withheld and the field that ran out: {error:?}"
+        );
+    }
+}
+
+/// **The running tally is re-derived from the durable rows on every wave.**
+/// `Loop` is rebuilt from scratch on each re-entry, so an item mid-fan-out
+/// carries nothing in memory — the tally has to be reconstructed the way
+/// `map_item_is_in_flight`/`decided_map_item_step` reconstruct everything else
+/// about an item.
+///
+/// Three inner steps against a share of two calls pins both ways that can go
+/// wrong at once: a tally reset to zero at the wave boundary would dispatch
+/// `publish` (a third wave and six shell tasks), and one that counted an
+/// in-flight step's row twice would refuse `test` (one wave and two).
+#[test]
+fn an_items_running_tally_is_re_derived_from_durable_rows_on_every_wave() {
+    let (_conn, _run_id, sink, waves, result) = drive_waves_with_grant(
+        "steps:\n\
+         \x20 - id: fan\n\
+         \x20   map:\n\
+         \x20     over: \"${{ inputs.items }}\"\n\
+         \x20     as: item\n\
+         \x20     max_parallel: 2\n\
+         \x20     on_item_error: continue\n\
+         \x20   steps:\n\
+         \x20     - id: build\n\
+         \x20       tool: shell\n\
+         \x20       with: { cmd: [echo, build] }\n\
+         \x20     - id: test\n\
+         \x20       tool: shell\n\
+         \x20       with: { cmd: [echo, test] }\n\
+         \x20     - id: publish\n\
+         \x20       tool: shell\n\
+         \x20       with: { cmd: [echo, publish] }\n",
+        &[],
+        a_grant_of_tool_calls(4),
+        |run_ctx| run_ctx.inputs = serde_json::json!({ "items": map_items(2) }),
+    );
+    let outcome = result.expect("the run drives");
+
+    assert_eq!(
+        waves,
+        vec![
+            vec![
+                ("build".to_string(), Some(0)),
+                ("build".to_string(), Some(1)),
+            ],
+            vec![("test".to_string(), Some(0)), ("test".to_string(), Some(1)),],
+        ],
+        "two calls each, spent one per wave, and then nothing: {waves:?}"
+    );
+    assert_eq!(shell_tasks(&sink), 4, "2 items x their 2 calls");
+
+    let output = map_output(&outcome, "fan");
+    let entries = output["items"].as_array().expect("one entry per item");
+    assert_eq!(
+        entries
+            .iter()
+            .map(|e| e["status"].as_str().unwrap_or("?"))
+            .collect::<Vec<_>>(),
+        vec!["failed", "failed"],
+        "both items spent their share and were refused at the third step: {entries:?}"
+    );
+}
+
+/// **Only a real dispatch spends a call.** An item's share is consumed by the
+/// inner steps that actually reach the suspend seam — not by an `emit:` this
+/// crate answers itself, and not by a `tool:` step its own `when:` gate
+/// skipped before dispatch.
+///
+/// The two items reach the same last step with different tallies, which is
+/// what makes the refusal per *item* rather than per map: `"a"`'s gate is true
+/// so it spends both its calls before `publish` and is refused, while `"b"`'s
+/// is false so `publish` still fits and the item completes.
+///
+/// The grant is **three** tool calls across two items rather than four, so
+/// that the share is `split_budget`'s `ceil(3 / 2) = 2`: a division that
+/// floored instead would hand each item one call and change every assertion
+/// below. That rounding is one of the two mutants B12c's sweep could not kill
+/// while `_item_caps` went unread.
+#[test]
+fn an_inner_step_that_never_dispatched_does_not_spend_an_items_share() {
+    let (_conn, _run_id, sink, waves, result) = drive_waves_with_grant(
+        "steps:\n\
+         \x20 - id: fan\n\
+         \x20   map:\n\
+         \x20     over: \"${{ inputs.items }}\"\n\
+         \x20     as: item\n\
+         \x20     max_parallel: 2\n\
+         \x20     on_item_error: continue\n\
+         \x20   steps:\n\
+         \x20     - id: note\n\
+         \x20       emit: { saw: \"${{ item }}\" }\n\
+         \x20     - id: build\n\
+         \x20       tool: shell\n\
+         \x20       with: { cmd: [echo, build] }\n\
+         \x20     - id: extra\n\
+         \x20       when: \"${{ item == 'a' }}\"\n\
+         \x20       tool: shell\n\
+         \x20       with: { cmd: [echo, extra] }\n\
+         \x20     - id: publish\n\
+         \x20       tool: shell\n\
+         \x20       with: { cmd: [echo, publish] }\n",
+        &[],
+        a_grant_of_tool_calls(3),
+        |run_ctx| run_ctx.inputs = serde_json::json!({ "items": ["a", "b"] }),
+    );
+    let outcome = result.expect("the run drives");
+
+    assert_eq!(
+        waves,
+        vec![
+            vec![
+                ("build".to_string(), Some(0)),
+                ("build".to_string(), Some(1)),
+            ],
+            vec![
+                ("extra".to_string(), Some(0)),
+                ("publish".to_string(), Some(1)),
+            ],
+        ],
+        "item 1 skipped `extra` without spending a call, so its `publish` still fits: {waves:?}"
+    );
+    assert_eq!(shell_tasks(&sink), 4);
+
+    let output = map_output(&outcome, "fan");
+    let entries = output["items"].as_array().expect("one entry per item");
+    assert_eq!(
+        entries
+            .iter()
+            .map(|e| e["status"].as_str().unwrap_or("?"))
+            .collect::<Vec<_>>(),
+        vec!["failed", "completed"],
+        "the ceiling is spent per item, not per map: {entries:?}"
+    );
+    assert!(
+        entries[0]["error"]
+            .as_str()
+            .is_some_and(|e| e.contains("publish")),
+        "item 0's refusal names the step it withheld: {entries:?}"
     );
 }
