@@ -771,8 +771,9 @@ const FAILING_PR: u32 = 3;
 /// Note *why* it reads that, because it is not "the item was skipped": this
 /// item's `review` and `tests` steps genuinely run and complete.
 /// `map_step::fold_inner_step_outcome` overwrites the item's running
-/// outcome with **every** inner step's status in turn, so what an item
-/// finally reports is simply its last-run inner step's status — here
+/// outcome with every inner step's status in turn — every one but a failure
+/// the step declared non-fatal, which it leaves alone — so what an item
+/// finally reports is simply its last-run inner step's status, here
 /// `post`'s. (The walk stops early only on a failure, and only one the
 /// step's own `continue_on_error:` did not declare non-fatal.) Append an
 /// unconditional step after `post` and this item would report `completed`
@@ -1312,10 +1313,10 @@ async fn a_map_dispatches_nested_agent_shell_and_gate_steps_for_real_concurrentl
                 item["status"], "skipped",
                 "an item reports its LAST-RUN inner step's status, whatever that status is — \
                  `fold_inner_step_outcome` overwrites the running outcome on every inner step \
-                 the item walks — and this item's last step (`post`) is `when:`-false, even \
-                 though its `review` and `tests` steps completed. If this ever fails because a \
-                 step was appended after `post`, the fold is what changed, not `when:` \
-                 evaluation: {item:?}"
+                 the item walks but a non-fatal failure — and this item's last step (`post`) \
+                 is `when:`-false, even though its `review` and `tests` steps completed. If \
+                 this ever fails because a step was appended after `post`, the fold is what \
+                 changed, not `when:` evaluation: {item:?}"
             );
             assert_eq!(
                 gate_rows
