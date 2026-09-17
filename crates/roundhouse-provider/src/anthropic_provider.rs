@@ -4,8 +4,9 @@
 
 use crate::audit::redact_transport_error_text;
 use crate::codec::anthropic_messages::{
-    decode_anthropic_messages_stream, encode_anthropic_messages, StreamFailure, StreamFailureKind,
+    decode_anthropic_messages_events, encode_anthropic_messages, StreamFailure, StreamFailureKind,
 };
+use futures::StreamExt;
 // Note: `Capabilities`/`ModelInfo`/`Plan`/`ProviderError`/`TokenCount` live in
 // `ir`, not in `provider_trait` — `provider_trait` re-exports nothing and
 // defines only `BoxFut` and the trait itself.
@@ -189,11 +190,54 @@ impl Provider for AnthropicMessagesProvider {
                 return Err(classify_status(response.status));
             }
 
-            let events = decode_anthropic_messages_stream(response.body)
-                .await
-                .map_err(stream_failure_to_provider_error)?;
-            let stream = ChatStream::from_events(events);
-            Ok(stream)
+            // §9.3: "streaming is the only path" -- decode incrementally
+            // (`decode_anthropic_messages_events`) and hand back a
+            // `ChatStream` as soon as its first item exists, rather than
+            // buffering the whole body first the way `stream_chat`'s own
+            // `Result` still only reports a failure that happens *before*
+            // that first item, matching every other error path in this
+            // function: once at least one item has decoded, a later
+            // mid-stream failure becomes the stream's own terminal `Err`
+            // item instead (`ChatStream`'s Task 1 fallible item type exists
+            // precisely for this).
+            //
+            // `.fuse()`: `futures::stream::unfold` (what
+            // `decode_anthropic_messages_events` is built on) panics if
+            // polled again after it has already returned `None`. Its own
+            // `done` latch already stops that within its own poll loop, but
+            // fusing the stream boxed into the returned `ChatStream` means a
+            // future `select!`/`chain`/replay wrapper built on top of it can
+            // never trigger that panic either.
+            let mut decoded: std::pin::Pin<
+                Box<
+                    dyn futures::Stream<
+                            Item = Result<crate::stream_event::StreamEvent, StreamFailure>,
+                        > + Send,
+                >,
+            > = Box::pin(decode_anthropic_messages_events(response.body).fuse());
+
+            let first = match decoded.next().await {
+                // Structurally, `decode_anthropic_messages_events` never
+                // actually produces zero items: `DecodeLoopGuard::finish`
+                // defaults to `Err(Truncated)` whenever `message_stop` was
+                // never observed, including on a body with zero frames at
+                // all, so an empty decode still yields that one terminal
+                // `Err` rather than ending with no items. Handled anyway, to
+                // preserve the pre-Task-3 buffered behavior at that boundary
+                // exactly: `decode_anthropic_messages_stream` over zero
+                // decoded items would have returned `Ok(vec![])`, i.e.
+                // `Ok(ChatStream::from_events(vec![]))`, rather than relying
+                // on "the decoder never does this" staying true forever.
+                None => return Ok(ChatStream::from_events(Vec::new())),
+                Some(Err(failure)) => return Err(stream_failure_to_provider_error(failure)),
+                Some(Ok(event)) => event,
+            };
+
+            let rest = decoded.map(|item| item.map_err(stream_failure_to_provider_error));
+            let stream =
+                futures::stream::once(futures::future::ready(Ok::<_, ProviderError>(first)))
+                    .chain(rest);
+            Ok(ChatStream(Box::pin(stream)))
         })
     }
 
@@ -220,7 +264,7 @@ impl Provider for AnthropicMessagesProvider {
 }
 
 /// Ruling R17, item 3: modeled on `codec::cohere_v2::provider`'s identical
-/// `stream_failure_to_provider_error` — `decode_anthropic_messages_stream`
+/// `stream_failure_to_provider_error` — `decode_anthropic_messages_events`
 /// now knows, at decode time, exactly which real wire condition produced a
 /// failure, so this function trusts `StreamFailure::kind` rather than
 /// re-deriving a disposition from an always-200 HTTP status.
