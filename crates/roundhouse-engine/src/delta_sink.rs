@@ -44,6 +44,16 @@
 //! is no more data coming — only "don't land inside a reported match"). See
 //! [`SplitFn`]'s doc comment for the two modes' exact contracts.
 //!
+//! **Controller ruling R12 (a match wider than the size limit still wins):**
+//! within an oversized final release, a reported match can itself be wider
+//! than `BLOB_INLINE_THRESHOLD` (e.g. a registered secret whose own
+//! serialized form exceeds ~4 KiB). [`DeltaCoalescer::carve_final_chunk`]
+//! then hands back a `Delta` whose serialization reaches or exceeds
+//! `BLOB_INLINE_THRESHOLD` rather than cut the match in half across two
+//! separately redacted payloads — mirroring R3's own thinking-signature
+//! exemption: content integrity always wins over the size limit, never the
+//! reverse.
+//!
 //! **Controller ruling R3 (thinking signature vs. the size limit):** a
 //! thinking signature always rides the delta that closes its block. To keep
 //! that closing delta small, the coalescer always emits its buffered
@@ -76,6 +86,25 @@ pub const FLUSH_SIZE_THRESHOLD: usize = 2048;
 /// for enough bytes to accumulate.
 pub const FLUSH_INTERVAL: Duration = Duration::from_millis(250);
 
+/// The most a single byte's `serde_json` string escaping can multiply it by:
+/// a control character becomes `\u00XX`, six bytes for one input byte.
+/// Everything else round-trips 1:1 or, for a named escape like `\n`, 2:1 --
+/// still under this bound. Used by `should_attempt_flush` (fix round 2,
+/// finding M2) to skip a full clone-and-serialize probe whenever the
+/// pending buffer is provably too small to reach `BLOB_INLINE_THRESHOLD`
+/// even under worst-case escaping.
+const MAX_JSON_ESCAPE_INFLATION: usize = 6;
+
+/// A safe upper bound on the fixed JSON envelope (field names, braces,
+/// quotes -- everything besides the text/fragment payload itself) around
+/// any empty-text `Delta` this module ever constructs. The largest of the
+/// three is `Delta::Thinking`'s `{"Thinking":{"text":"","signature":null}}`
+/// at 41 bytes; this constant is checked against all three shapes by
+/// `envelope_overhead_upper_bound_covers_every_delta_shape_this_module_builds`
+/// below so it cannot silently go stale if `Delta`'s serde representation
+/// ever changes.
+const ENVELOPE_OVERHEAD_UPPER_BOUND: usize = 64;
+
 /// Returns a safe split point `k <= min(max, bytes.len())` for `bytes`, with
 /// two distinct contracts selected by `final_flush` (controller ruling
 /// R11 -- the third argument):
@@ -89,13 +118,22 @@ pub const FLUSH_INTERVAL: Duration = Duration::from_millis(250);
 /// - `final_flush == true` (releasing everything pending -- no more bytes
 ///   are coming for this run): the largest `k` such that no split lands
 ///   inside a reported match, with **no** holdback (there is nothing left
-///   to wait for). A conforming implementation must not return `0` when
-///   `max > 0` and `bytes` is non-empty -- a final release always makes
-///   progress. `DeltaCoalescer` does not simply trust that, though: if a
-///   `final_flush = true` call ever does return `0` anyway, it falls back
-///   to `min(max, bytes.len())` itself so a non-conforming splitter can
-///   never wedge a final release (see `DeltaCoalescer`'s `carve_final_chunk`
-///   for exactly where).
+///   to wait for). `0` is a **legitimate** answer here, not a contract
+///   violation (fix round 2, controller ruling R12 -- an earlier version of
+///   this doc comment wrongly claimed a conforming implementation "must not
+///   return 0" for a non-empty `bytes` with `max > 0`, which is false for
+///   the production primitive this wraps: `Redactor::safe_split_len`
+///   reports a match straddling `max` by returning `m.start()`, which is
+///   exactly `0` whenever a match begins at offset `0` and extends past
+///   `max`). `0` here means "no safe cut at or below `max`".
+///   `DeltaCoalescer::carve_final_chunk` handles it by re-asking with
+///   `max = bytes.len()` and using whatever comes back as-is -- even if the
+///   resulting delta then exceeds `BLOB_INLINE_THRESHOLD`, which can
+///   legitimately happen (e.g. a registered secret value, such as a PEM key
+///   or a PKCS#12 blob, whose own serialized form alone exceeds ~4 KiB --
+///   `Redactor::build` filters only empty patterns, so there is no length
+///   floor). Content integrity beats the size limit here, the same
+///   trade-off R3 already makes for an oversized thinking signature.
 ///
 /// `roundhouse_store::EventWriter` supplies the production implementation
 /// (Task 7): a single additive method computing both modes from one
@@ -144,7 +182,7 @@ struct Pending {
 }
 
 /// Pure, synchronous batcher from `BlockDelta` to `Delta`. See the module
-/// doc for the flush rules and controller rulings R1/R3/R11.
+/// doc for the flush rules and controller rulings R1/R3/R11/R12.
 pub struct DeltaCoalescer {
     splitter: SplitFn,
     pending: Option<Pending>,
@@ -211,19 +249,24 @@ impl DeltaCoalescer {
         out
     }
 
-    /// A block ended: release everything pending for it, regardless of what
-    /// the splitter would say (R1). Takes `now` for API symmetry with
-    /// `push`; a subsequent `push` starting a fresh pending run resets the
-    /// flush-interval baseline on its own regardless of this call's `now`.
+    /// A block ended: release everything pending for it via `close_pending`
+    /// (see its doc comment for exactly how R11/R12 apply to that release).
+    /// Takes `now` for API symmetry with `push`, and records it as the new
+    /// flush-interval baseline purely belt-and-braces: `self.pending` is
+    /// always `None` right after `close_pending`, so nothing reads
+    /// `last_flush` again until a subsequent `push` starts a fresh pending
+    /// run, which resets it independently regardless of what this call
+    /// wrote.
     pub fn block_stop(&mut self, now: Instant) -> Vec<Delta> {
         let out = self.close_pending();
         self.last_flush = Some(now);
         out
     }
 
-    /// The stream ended: release everything pending, regardless of what the
-    /// splitter would say (R1). No `Instant` needed -- this is a terminal
-    /// release, not a time-triggered one.
+    /// The stream ended: release everything pending via `close_pending`
+    /// (see its doc comment for exactly how R11/R12 apply to that release).
+    /// No `Instant` needed -- this is a terminal release, not a
+    /// time-triggered one.
     pub fn finish(&mut self) -> Vec<Delta> {
         self.close_pending()
     }
@@ -244,6 +287,21 @@ impl DeltaCoalescer {
         if pending.text.len() >= FLUSH_SIZE_THRESHOLD {
             return true;
         }
+        // Fix round 2, finding M2: `serde_json` cannot inflate a byte past
+        // `MAX_JSON_ESCAPE_INFLATION`x (`\u00XX`; anything that already
+        // needs no escaping is emitted as itself, at 1x). Below this bound
+        // the actual serialization is provably smaller than the threshold,
+        // so skip cloning and fully serializing the whole pending buffer
+        // just to answer "no" on every single `push` call -- this clone +
+        // serialize was the dominant cost for a typical small provider
+        // delta pushed against a buffer nowhere near the threshold (~100x
+        // write amplification measured for a 20-byte delta against a 2 KiB
+        // buffer).
+        if MAX_JSON_ESCAPE_INFLATION * pending.text.len() + ENVELOPE_OVERHEAD_UPPER_BOUND
+            < BLOB_INLINE_THRESHOLD
+        {
+            return matches!(self.last_flush, Some(last) if now.duration_since(last) >= FLUSH_INTERVAL);
+        }
         let whole = pending.kind.make(pending.text.clone());
         if serialized_len(&whole) >= BLOB_INLINE_THRESHOLD {
             return true;
@@ -257,6 +315,16 @@ impl DeltaCoalescer {
     /// through `self.splitter`, never decided locally. Returns `None` (and
     /// leaves the buffer untouched) when no trigger fired or the splitter has
     /// nothing safe to release yet.
+    ///
+    /// Unlike the final-release path (`carve_final_chunk`), a `0` from the
+    /// splitter here is simply "keep buffering" -- R12's "match wider than
+    /// the limit" exemption does not apply mid-stream: there is no urgency,
+    /// since more bytes may still arrive and the splitter may clear the
+    /// match on its own once it does.
+    ///
+    /// Every candidate `max` is clamped to `raw_k.min(max).min(text.len())`
+    /// (fix round 2, finding B1) so a splitter that ignores `max` can never
+    /// make `max` grow between iterations.
     fn attempt_nonfinal_flush(&mut self, now: Instant) -> Option<Delta> {
         if !self.should_attempt_flush(now) {
             return None;
@@ -277,30 +345,34 @@ impl DeltaCoalescer {
                 return None;
             }
             let text = &self.pending.as_ref().unwrap().text;
-            let k = floor_char_boundary(text, raw_k.min(text.len()));
+            let k = floor_char_boundary(text, raw_k.min(max).min(text.len()));
             if k == 0 {
                 return None;
             }
             let chunk = text[..k].to_string();
             let delta = kind.make(chunk.clone());
-            if serialized_len(&delta) < BLOB_INLINE_THRESHOLD {
+            let size = serialized_len(&delta);
+            if size < BLOB_INLINE_THRESHOLD {
                 let pending = self.pending.as_mut().unwrap();
                 pending.text.drain(..k);
                 self.last_flush = Some(now);
                 return Some(delta);
             }
-            // Too big once serialized: shrink the requested max by exactly
-            // one character and re-query the splitter (R1) -- never assume a
-            // smaller point inside the splitter's own chosen `k` is safe
-            // without asking again.
-            let shrunk = floor_char_boundary(&chunk, chunk.len().saturating_sub(1));
-            if shrunk == 0 || shrunk >= max {
+            // Too big once serialized: jump toward a fit using the observed
+            // inflation ratio (fix round 2, finding M1) and re-query the
+            // splitter (R1) -- never assume a smaller point inside the
+            // splitter's own chosen `k` is safe without asking again.
+            let next_max = floor_char_boundary(
+                &chunk,
+                estimate_next_max(k, size).min(chunk.len().saturating_sub(1)),
+            );
+            if next_max == 0 {
                 // Cannot make further progress (a single character's own
                 // serialization should never reach BLOB_INLINE_THRESHOLD in
                 // practice, but guard against looping forever regardless).
                 return None;
             }
-            max = shrunk;
+            max = next_max;
         }
     }
 
@@ -310,7 +382,11 @@ impl DeltaCoalescer {
     /// payloads, so it still needs the splitter -- with `final_flush = true`
     /// (no holdback, since nothing more is coming for this run). Only the
     /// last chunk (or the whole thing, if it already fits) is an
-    /// unconditional "emit whatever remains".
+    /// unconditional "emit whatever remains". Controller ruling R12: an
+    /// earlier cut inside an oversized final release may itself still
+    /// exceed `BLOB_INLINE_THRESHOLD`, when the only way to keep a reported
+    /// match wholly inside one delta is to accept that delta being
+    /// oversized (see `carve_final_chunk`).
     fn close_pending(&mut self) -> Vec<Delta> {
         let Some(pending) = self.pending.take() else {
             return Vec::new();
@@ -373,39 +449,76 @@ impl DeltaCoalescer {
     /// with `final_flush = true`, never decided locally (R11), mirroring
     /// `attempt_nonfinal_flush`'s shrink loop but with no holdback and no
     /// possibility of "keep buffering": a final release always makes
-    /// progress. If the splitter ever returns `0` here anyway (a contract
-    /// violation -- see `SplitFn`'s doc comment), this falls back to
-    /// `max` itself, and if flooring that to a char boundary ever collapses
-    /// to `0`, it widens back out to exactly one whole character -- so this
-    /// always returns at least one byte for non-empty `text`, regardless of
-    /// what the injected splitter does.
+    /// progress.
+    ///
+    /// `0` from the splitter is a legitimate, expected answer here (R12,
+    /// fix round 2, findings B2): it means "no safe cut at or below `max`"
+    /// -- typically a reported match starting before `max` and extending
+    /// past it. When that happens, this re-asks with `max = bytes.len()`
+    /// and uses whatever comes back as-is, even if the resulting chunk then
+    /// exceeds `BLOB_INLINE_THRESHOLD` -- content integrity beats the size
+    /// limit here, the trade-off R3 already makes for an oversized thinking
+    /// signature. Every candidate `max` this method ever asks about is
+    /// clamped to `raw_k.min(max).min(bytes.len())` (fix round 2, finding
+    /// B1) so a splitter that ignores `max` (or returns more than it was
+    /// asked for) can never make `max` grow between iterations -- without
+    /// that clamp a non-conforming splitter can wedge this in an infinite
+    /// loop. Between the B1 clamp and the B2 recovery, this always
+    /// terminates and always returns at least one byte for non-empty
+    /// `text`, regardless of what the injected splitter does.
     fn carve_final_chunk(&self, text: &str, make: &impl Fn(String) -> Delta) -> usize {
         debug_assert!(!text.is_empty());
         let bytes = text.as_bytes();
         let mut max = bytes.len();
         loop {
             let raw_k = (self.splitter)(bytes, max, true);
-            let k = if raw_k == 0 {
-                max
-            } else {
-                raw_k.min(bytes.len())
-            };
-            let k = floor_char_boundary(text, k);
+            if raw_k == 0 {
+                // R12: a match blocks every cut at or below `max` -- fall
+                // back to the widest possible ask instead of naively
+                // cutting into it. This never recurses further: a `bytes`-
+                // wide ask cannot itself straddle anything (nothing extends
+                // past the end of `bytes`), so a conforming splitter always
+                // answers `bytes.len()` here; a non-conforming one that
+                // still answers `0` is handled by taking the whole buffer.
+                let whole = (self.splitter)(bytes, bytes.len(), true);
+                let k = if whole == 0 {
+                    bytes.len()
+                } else {
+                    whole.min(bytes.len())
+                };
+                let k = floor_char_boundary(text, k);
+                return if k == 0 { first_char_len(text) } else { k };
+            }
+            let k = floor_char_boundary(text, raw_k.min(max).min(bytes.len()));
             if k == 0 {
                 return first_char_len(text);
             }
             let chunk = &text[..k];
-            if serialized_len(&make(chunk.to_string())) < BLOB_INLINE_THRESHOLD {
+            let size = serialized_len(&make(chunk.to_string()));
+            if size < BLOB_INLINE_THRESHOLD {
                 return k;
             }
-            let shrunk = floor_char_boundary(chunk, chunk.len().saturating_sub(1));
-            if shrunk == 0 {
+            // Too big once serialized: jump toward a fit using the
+            // observed inflation ratio (fix round 2, finding M1) rather
+            // than shrinking one character at a time, and re-query the
+            // splitter (R1/R11) -- never assume a smaller point inside the
+            // splitter's own chosen `k` is safe without asking again.
+            // `estimate_next_max` (clamped below `chunk.len()`) always
+            // returns something strictly less than `k <= max`, so `max`
+            // strictly decreases every iteration regardless of the
+            // estimate's accuracy -- termination does not depend on the
+            // estimate being good, only on it being smaller.
+            let next_max = floor_char_boundary(
+                chunk,
+                estimate_next_max(k, size).min(chunk.len().saturating_sub(1)),
+            );
+            if next_max == 0 {
                 // A single character's own serialization should never reach
                 // BLOB_INLINE_THRESHOLD in practice, but guarantee progress
                 // regardless of what an adversarial splitter does.
                 return first_char_len(text);
             }
-            max = shrunk;
+            max = next_max;
         }
     }
 }
@@ -414,6 +527,33 @@ fn serialized_len(delta: &Delta) -> usize {
     serde_json::to_vec(delta)
         .map(|bytes| bytes.len())
         .unwrap_or(usize::MAX)
+}
+
+/// Estimates a smaller `max` to re-query the splitter with, given that a
+/// candidate chunk of `k` bytes serialized to `size` bytes (already known to
+/// be `>= BLOB_INLINE_THRESHOLD` -- the caller only calls this once its own
+/// size check has failed). Scales `k` down by roughly the ratio that would
+/// bring `size` back under a safety margin below the threshold, converging
+/// in one or two rounds for the common case of a roughly uniform escape
+/// ratio, instead of the O(n) splitter calls (and O(n) `serde_json`
+/// serializations) a one-byte-at-a-time shrink needs -- measured at 5,918
+/// splitter calls plus 5,918 serializations to carve a single 4,083-byte
+/// chunk from a 10,000-byte buffer before this fix (fix round 2, finding
+/// M1; see also the spec's own Risks section on this path's performance).
+///
+/// This only ever *picks a candidate* to ask the splitter about -- every
+/// candidate is still verified through it by the caller, so R1/R11's "never
+/// decide a split point without asking" is unaffected. Callers additionally
+/// clamp the result below the current chunk length themselves, so this does
+/// not need to guarantee a useful (or even in-range) answer on its own --
+/// only that it is *usually* a good one.
+fn estimate_next_max(k: usize, size: usize) -> usize {
+    debug_assert!(size >= BLOB_INLINE_THRESHOLD);
+    debug_assert!(k > 0);
+    // Aim for 90% of the threshold so a roughly-uniform escape ratio fits on
+    // the very next try instead of landing just over the line again.
+    let target = BLOB_INLINE_THRESHOLD * 9 / 10;
+    ((k as u128 * target as u128) / size as u128) as usize
 }
 
 /// The largest `char`-boundary index `<= idx` in `s` (`s.len()` if
@@ -440,6 +580,7 @@ fn first_char_len(s: &str) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Arc, Mutex};
 
     fn text_of(delta: &Delta) -> &str {
         match delta {
@@ -478,6 +619,34 @@ mod tests {
     /// make progress despite it).
     fn zero_splitter() -> SplitFn {
         Box::new(|_bytes: &[u8], _max: usize, _final_flush: bool| 0)
+    }
+
+    #[test]
+    fn envelope_overhead_upper_bound_covers_every_delta_shape_this_module_builds() {
+        // Pins `ENVELOPE_OVERHEAD_UPPER_BOUND` (fix round 2, finding M2) as
+        // a genuine upper bound over every empty-text `Delta` shape this
+        // module ever constructs, so it cannot silently go stale if
+        // `Delta`'s serde representation ever changes.
+        let shapes = [
+            Delta::Text {
+                text: String::new(),
+            },
+            Delta::ToolArgs {
+                fragment: String::new(),
+            },
+            Delta::Thinking {
+                text: String::new(),
+                signature: None,
+            },
+        ];
+        for shape in &shapes {
+            let size = serialized_len(shape);
+            assert!(
+                size <= ENVELOPE_OVERHEAD_UPPER_BOUND,
+                "envelope for {shape:?} is {size} bytes, exceeding the \
+                 assumed upper bound of {ENVELOPE_OVERHEAD_UPPER_BOUND}"
+            );
+        }
     }
 
     // -------------------------------------------------------------------
@@ -559,6 +728,30 @@ mod tests {
         assert_eq!(stopped.len(), 1);
         assert!(matches!(stopped[0], Delta::ToolArgs { .. }));
         assert_eq!(text_of(&stopped[0]), "{}");
+    }
+
+    #[test]
+    fn push_can_return_a_kind_change_flush_plus_a_size_triggered_flush_of_the_new_kind() {
+        // Pins `push`'s documented "may return more than one Delta (a
+        // kind-change flush plus a size-triggered flush of the new kind,
+        // for instance)" -- fix round 2, finding m4.
+        let mut sink = DeltaCoalescer::new(identity_splitter());
+        let now = Instant::now();
+        assert!(sink.push(BlockDelta::Text("hello".into()), now).is_empty());
+
+        let new_kind_text = "a".repeat(FLUSH_SIZE_THRESHOLD);
+        let out = sink.push(BlockDelta::ToolArgsFragment(new_kind_text.clone()), now);
+
+        assert_eq!(
+            out.len(),
+            2,
+            "one delta for the kind-change flush, one for the new kind's \
+             own size-triggered flush: {out:?}"
+        );
+        assert!(matches!(out[0], Delta::Text { .. }));
+        assert_eq!(text_of(&out[0]), "hello");
+        assert!(matches!(out[1], Delta::ToolArgs { .. }));
+        assert_eq!(text_of(&out[1]), new_kind_text);
     }
 
     // -------------------------------------------------------------------
@@ -657,10 +850,25 @@ mod tests {
 
     #[test]
     fn escape_heavy_text_is_chunked_by_measured_serialized_size_at_final_release() {
-        // A splitter that always reports "nothing safely flushable yet": push
-        // must never force output mid-stream (R1), so this heavily escaped
-        // buffer accumulates in full and only `finish` releases it.
-        let mut sink = DeltaCoalescer::new(zero_splitter());
+        // Refuses every non-final ask outright (so this heavily escaped
+        // buffer accumulates in full without an intervening size-triggered
+        // flush) but is a plain identity for a final ask -- exercising
+        // `close_pending`'s own BLOB_INLINE_THRESHOLD-aware chunking
+        // specifically, not `attempt_nonfinal_flush`'s (that path has its
+        // own escape-heavy test). Not `zero_splitter`: refusing *every*
+        // final ask too would (correctly, per R12) collapse this into a
+        // single oversized delta instead of exercising the size-based
+        // multi-chunk split this test is for.
+        let splitter: SplitFn = Box::new(
+            |bytes, max, final_flush| {
+                if final_flush {
+                    max.min(bytes.len())
+                } else {
+                    0
+                }
+            },
+        );
+        let mut sink = DeltaCoalescer::new(splitter);
         let now = Instant::now();
         let text: String = "\u{0}".repeat(4000);
 
@@ -741,6 +949,112 @@ mod tests {
         );
     }
 
+    #[test]
+    fn every_shrink_boundary_in_a_non_final_flush_is_re_verified_by_the_splitter() {
+        // Fix round 2, finding M3: pins R1's "every shrink boundary
+        // re-queries the splitter" for the NON-final path specifically. A
+        // mutation that replaces `attempt_nonfinal_flush`'s shrink loop with
+        // one splitter call plus a local (splitter-oblivious) max-fit
+        // shrink -- exactly the mistake R1 exists to prevent -- passes
+        // every other test in this file while still cutting a secret in
+        // half. See the fix-round report for the RED capture against that
+        // exact mutation.
+        //
+        // Escape-heavy (NUL) content, `FLUSH_SIZE_THRESHOLD` bytes: the
+        // initial ask at max = FLUSH_SIZE_THRESHOLD is "safe" (no match
+        // anywhere near it) but oversized once serialized, so a shrink is
+        // required. A splitter-oblivious local max-fit shrink (trim from
+        // the end while oversized, checking size alone) would converge to
+        // some length purely by size; find a placement for a 20-byte
+        // plain-ASCII "secret" that that local convergence point lands
+        // strictly inside -- computed here directly (not hand-derived
+        // JSON-escape arithmetic) so the test does not depend on exact
+        // serde formatting.
+        const SECRET_LEN: usize = 20;
+        let naive_fit_len = |text: &[u8]| -> usize {
+            let mut n = 0usize;
+            while serialized_len(&Delta::Text {
+                text: String::from_utf8(text[..n + 1].to_vec()).unwrap(),
+            }) < BLOB_INLINE_THRESHOLD
+            {
+                n += 1;
+            }
+            n
+        };
+        let base_fit_len = naive_fit_len(&vec![0u8; FLUSH_SIZE_THRESHOLD]);
+
+        let mut secret_start = base_fit_len.saturating_sub(1);
+        let (secret_start, secret_end, text) = loop {
+            let mut bytes = vec![0u8; FLUSH_SIZE_THRESHOLD];
+            let secret_end = (secret_start + SECRET_LEN).min(bytes.len());
+            for b in &mut bytes[secret_start..secret_end] {
+                *b = b'Q';
+            }
+            let fit = naive_fit_len(&bytes);
+            if fit > secret_start && fit < secret_end {
+                break (secret_start, secret_end, String::from_utf8(bytes).unwrap());
+            }
+            secret_start += 1;
+            assert!(
+                secret_start + SECRET_LEN < FLUSH_SIZE_THRESHOLD,
+                "could not find a secret placement whose local fit point \
+                 lands inside it -- test construction is broken"
+            );
+        };
+        let secret = "Q".repeat(secret_end - secret_start);
+
+        // A splitter that moves any candidate landing inside the secret
+        // back to the secret's start -- exactly what
+        // `Redactor::safe_split_len` guarantees -- and is otherwise the
+        // identity.
+        let splitter: SplitFn = Box::new(move |bytes, max, _final_flush| {
+            let naive = max.min(bytes.len());
+            if naive > secret_start && naive < secret_end {
+                secret_start
+            } else {
+                naive
+            }
+        });
+        let mut sink = DeltaCoalescer::new(splitter);
+        let now = Instant::now();
+
+        let out = sink.push(BlockDelta::Text(text.clone()), now);
+        let rest = sink.finish();
+
+        // The escape-heavy leftover can still be oversized enough to need
+        // further flushing within this same `push` call (each one
+        // re-triggered by the "already oversized serialized" check), and
+        // the correct implementation may either exclude the secret from a
+        // chunk entirely or extend far enough to include all of it -- both
+        // are safe. What it must never do is cut the secret in half: any
+        // chunk touching so much as one 'Q' (the only character the secret
+        // is made of) must contain the *whole* secret, never a fragment.
+        assert!(!out.is_empty(), "the size trigger must flush at least once");
+        for d in out.iter().chain(rest.iter()) {
+            let t = text_of(d);
+            if t.contains('Q') {
+                assert!(
+                    t.contains(&secret),
+                    "a chunk contains a fragment of the secret without the \
+                     whole secret -- it was cut across a chunk boundary: {d:?}"
+                );
+            }
+        }
+        assert!(
+            out.iter()
+                .chain(rest.iter())
+                .any(|d| text_of(d).contains(&secret)),
+            "test premise: the secret must actually appear, intact, in \
+             some delta -- otherwise this test never touched the scenario \
+             it's meant to exercise"
+        );
+        assert_eq!(
+            concat_text(&out) + &concat_text(&rest),
+            text,
+            "no bytes may be lost or reordered"
+        );
+    }
+
     // -------------------------------------------------------------------
     // Controller ruling R11: a final release still needs split-safe chunk
     // boundaries -- a chunk boundary inside a final release is still a
@@ -815,24 +1129,81 @@ mod tests {
         );
     }
 
+    // -------------------------------------------------------------------
+    // Controller ruling R12 (fix round 2, finding B2): a reported match
+    // wider than BLOB_INLINE_THRESHOLD still wins over the size limit.
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn a_reported_match_wider_than_the_size_limit_is_emitted_whole_even_though_oversized() {
+        // A registered secret whose own serialized form exceeds
+        // BLOB_INLINE_THRESHOLD, starting at offset 0 -- exactly
+        // `Redactor::safe_split_len`'s `m.start() == 0` case, the scenario
+        // finding B2 identified: naively falling back to the current
+        // (shrunk) `max` on a `0` answer cuts straight through a match this
+        // wide instead of keeping it whole.
+        const SECRET_LEN: usize = 5000;
+        let splitter: SplitFn = Box::new(move |bytes, max, final_flush| {
+            if !final_flush {
+                return 0;
+            }
+            let k = max.min(bytes.len());
+            if SECRET_LEN > k {
+                0 // the match (0, SECRET_LEN) straddles this candidate
+            } else {
+                k // the match is already wholly inside [0, k)
+            }
+        });
+        let mut sink = DeltaCoalescer::new(splitter);
+        let now = Instant::now();
+
+        let mut text = "S".repeat(SECRET_LEN);
+        text.push_str("tail-after-the-secret");
+
+        assert!(
+            sink.push(BlockDelta::Text(text.clone()), now).is_empty(),
+            "the non-final splitter answer (always 0) must hold everything back"
+        );
+        let released = sink.finish();
+
+        assert_eq!(
+            released.len(),
+            1,
+            "the only way to keep the whole match in one delta is to emit \
+             everything as a single (oversized) delta: {released:?}"
+        );
+        assert_eq!(
+            concat_text(&released),
+            text,
+            "no bytes may be lost or reordered"
+        );
+        assert!(
+            text_of(&released[0]).contains(&"S".repeat(SECRET_LEN)),
+            "the whole match must land intact, not split across chunks"
+        );
+        assert!(
+            serialized_len(&released[0]) >= BLOB_INLINE_THRESHOLD,
+            "test premise: the emitted delta is expected to be oversized here"
+        );
+    }
+
     #[test]
     fn kind_change_flush_uses_final_flush_semantics_not_non_final_holdback() {
-        // A splitter that refuses every non-final ask (as if the redactor
-        // always considers something pending unsafe until it knows this is
-        // the final word on it) but answers a final-flush ask normally --
-        // so releasing the buffer at all, through a kind change, proves the
-        // kind-change flush queried with `final_flush = true`. A `push`
-        // this large would return empty forever under a real holdback if
-        // the kind-change flush ever (incorrectly) asked with `false`.
-        let splitter: SplitFn = Box::new(
-            |bytes, max, final_flush| {
-                if final_flush {
-                    max.min(bytes.len())
-                } else {
-                    0
-                }
-            },
-        );
+        // Records every (max, final_flush) ask so this test proves what its
+        // name says by direct observation of the arguments used, rather
+        // than by an emergent side effect (the raw_k == 0 fallback) that a
+        // differently-argued call could also have produced (fix round 2,
+        // finding m2).
+        let calls: Arc<Mutex<Vec<(usize, bool)>>> = Arc::new(Mutex::new(Vec::new()));
+        let recorded = Arc::clone(&calls);
+        let splitter: SplitFn = Box::new(move |bytes, max, final_flush| {
+            recorded.lock().unwrap().push((max, final_flush));
+            if final_flush {
+                max.min(bytes.len())
+            } else {
+                0
+            }
+        });
         let mut sink = DeltaCoalescer::new(splitter);
         let now = Instant::now();
 
@@ -848,11 +1219,7 @@ mod tests {
 
         let out = sink.push(BlockDelta::ToolArgsFragment("{}".into()), now);
 
-        assert!(
-            !out.is_empty(),
-            "the kind change must release the Text run despite the non-final \
-             splitter always refusing -- proving it asked with final_flush = true"
-        );
+        assert!(!out.is_empty(), "the kind change must release the Text run");
         for d in &out {
             assert!(matches!(d, Delta::Text { .. }));
             assert!(serialized_len(d) < BLOB_INLINE_THRESHOLD);
@@ -862,14 +1229,34 @@ mod tests {
             text,
             "the whole Text run must be released, not partially held back"
         );
+
+        // The direct proof: at least one recorded call was made with
+        // final_flush = true (the kind-change flush), and at least one with
+        // final_flush = false (the initial push's non-final attempt) --
+        // confirming the two paths genuinely use different arguments, not
+        // the same one throughout.
+        let calls = calls.lock().unwrap();
+        assert!(
+            calls.iter().any(|&(_, final_flush)| final_flush),
+            "the kind-change flush must have asked the splitter at least \
+             once with final_flush = true, got calls: {calls:?}"
+        );
+        assert!(
+            calls.iter().any(|&(_, final_flush)| !final_flush),
+            "the initial push's non-final flush attempt must have asked \
+             with final_flush = false, got calls: {calls:?}"
+        );
     }
 
     #[test]
     fn a_final_flush_splitter_returning_zero_still_terminates_and_makes_progress() {
-        // R11's guard: a final-flush splitter must never return 0 when
-        // max > 0 and the buffer is non-empty, but `DeltaCoalescer` does not
-        // trust that -- it must still terminate and make progress even if
-        // one does.
+        // R12: `0` from a final-flush ask is a legitimate "no safe cut"
+        // answer, not a stall. A splitter that refuses *every* ask (final or
+        // not) leaves `carve_final_chunk` nothing to work with beyond its
+        // own whole-buffer fallback -- `DeltaCoalescer` must still terminate
+        // and make progress rather than loop forever looking for a cut that
+        // never comes, by releasing the whole buffer as one delta, oversized
+        // or not.
         let mut sink = DeltaCoalescer::new(zero_splitter());
         let now = Instant::now();
         let text = "a".repeat(FLUSH_SIZE_THRESHOLD * 3);
@@ -881,14 +1268,16 @@ mod tests {
 
         let released = sink.finish();
 
-        assert!(
-            released.len() > 1,
-            "a buffer this large needs more than one final chunk"
+        assert_eq!(
+            released.len(),
+            1,
+            "a splitter that refuses every cut leaves only the whole-buffer fallback"
         );
-        for d in &released {
-            assert!(serialized_len(d) < BLOB_INLINE_THRESHOLD);
-        }
-        assert_eq!(concat_text(&released), text);
+        assert_eq!(concat_text(&released), text, "no bytes may be lost");
+        assert!(
+            serialized_len(&released[0]) >= BLOB_INLINE_THRESHOLD,
+            "test premise: the whole-buffer fallback is expected to be oversized here"
+        );
     }
 
     // -------------------------------------------------------------------
