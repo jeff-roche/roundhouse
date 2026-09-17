@@ -1635,12 +1635,19 @@ fn fold_decided_inner_step(
 ///
 /// | items | no inner step names `steps` | one reads a sibling |
 /// |---|---|---|
-/// | 100 | 9.7 ms | 22 ms |
-/// | 1,000 | 87 ms | 1.23 s |
+/// | 100 | 9.5 ms | 20 ms |
+/// | 1,000 | 88 ms | 1.01 s |
 ///
 /// The left column is the figure this same fixture measured *before* this type
 /// existed (90 ms at 1,000 items), which is what the switch buys: a `map` that
 /// cannot observe the binding is not slowed by it at all.
+///
+/// [`Self::needs_bind`] is what keeps the right-hand column from growing with
+/// the *inherited prefix* an item re-walks on every segment. Measured on a
+/// 14-segment fan-out over the same 220 KB top-level output, whose items each
+/// re-derive up to two already-decided steps before reaching a live one:
+/// **105 ms binding after every recording, 73 ms binding only where something
+/// is evaluated.**
 ///
 /// Closing the remaining factor would need an incremental root-mutation API on
 /// [`crate::expr::ExprContext`] — which would have to narrow a root's
