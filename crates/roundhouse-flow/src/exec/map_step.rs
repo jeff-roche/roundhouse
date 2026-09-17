@@ -496,6 +496,19 @@ pub(crate) fn per_item_dispatch_refusal(
 /// overspend alarm would miss exactly this case.
 ///
 /// Closing either half would need a cut-off outcome §8.9 does not define.
+///
+/// **And the count on the left of `>=` is scoped to one `map`, not the run's
+/// whole lifetime.** `crate::exec::run_loop::Loop::map_dispatches_so_far`
+/// tallies only this fan-out's own inner-step rows, and the run ledger's
+/// `max_tool_calls` is charged only for a top-level `tool:` step
+/// (`crate::exec::run_loop::Loop::admit`) — every later wave of a `map`
+/// re-enters through `crate::exec::run_loop::Loop::observe_admission`'s
+/// `Spend::ZERO`, so no inner-step dispatch is ever charged there either. A
+/// workflow with `N` sequential `map` steps therefore gets each one its own
+/// near-full run remainder `R` as an aggregate ceiling — roughly `N * R` real
+/// dispatches in total, not `R` — which §8.9's "a transfer out of the run's
+/// remaining budget, not an independent pool" model makes correct, not a bug,
+/// just a residual this doc had not named.
 pub(crate) fn run_budget_is_exhausted(
     map_dispatches_so_far: u32,
     run_remaining: &ResourceCaps,

@@ -8740,18 +8740,31 @@ fn a_nested_calls_when_gate_still_skips_it_before_anything_is_funded() {
 /// The fixture is exactly that scenario — one item at a nested `call:` and one
 /// at an ordinary `tool:`, which without the fix are dispatched in the same
 /// wave. The assertion is that **the wave never forms**: the run loop gives the
-/// child a wave of its own. Driven with the `call:` item first (where the fix
-/// is `dispatch_map` ending its walk) and last (where it is
-/// `ItemAdvance::Deferred`), because those are two different code paths.
+/// child a wave of its own. Driven with the `call:` item first and last,
+/// because walk order decides *which* of `WaveAdmission`'s two seams ends up
+/// deferring (both go through `ItemAdvance::Deferred` now; fix round 2
+/// removed the `break` that once made the "first" case a different code
+/// path). With the `call:` item first, it dispatches into an empty wave and
+/// holds it, so the `tool:` sibling walked after it defers at the
+/// `tool:`/`agent:` seam (`WaveAdmission::takes_ordinary_work`). With the
+/// `call:` item last, the `tool:` sibling claims the empty wave first and
+/// leaves it `OrdinaryWork`, which a `ChildRun` may not join, so this time it
+/// is the `call:` item's own dispatch that defers, at the *other* seam
+/// (`WaveAdmission::takes_a_child_run`).
 #[test]
 fn a_wave_that_carries_a_nested_call_carries_nothing_else() {
     // The exact wave sequence each order produces, spelled out rather than
-    // only checked for the property, because the two orders prove *different*
-    // halves and only the sequence shows which: with the `call:` item first,
-    // `dispatch_map` ends its walk after pushing the child (so the two
-    // `build`s batch together in the next wave); with it last, the item is
-    // `ItemAdvance::Deferred` and takes a wave of its own *after* the sibling
-    // it would otherwise have shared one with.
+    // only checked for the property, because the two orders defer at
+    // *different* seams and only the sequence shows which: with the `call:`
+    // item first, `sub` dispatches into the empty wave and holds it, so it is
+    // the `tool:` sibling's dispatch that defers — and once `sub` resolves,
+    // neither item's remaining dispatch conflicts, so the two `build`s land
+    // together in the following wave. With the `call:` item last, the
+    // `tool:` sibling dispatches first and leaves the wave `OrdinaryWork`,
+    // which a `ChildRun` may not join, so this time it is `sub`'s own
+    // dispatch that defers; `sub` then runs alone next segment, and its
+    // `build` runs alone the segment after that, since by then the other
+    // item has already finished — three waves, not two.
     let expected: [Vec<Wave>; 2] = [
         vec![
             vec![("sub".to_string(), Some(0))],

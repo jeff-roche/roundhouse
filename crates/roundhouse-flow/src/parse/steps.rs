@@ -941,7 +941,18 @@ enum MapIsolationWire {
 #[serde(try_from = "MapIsolationWire", into = "MapIsolationWire")]
 pub enum MapIsolationDef {
     None,
-    Worktree { base_ref: Option<String> },
+    /// **A `map` item declaring this can only run inner steps that settle
+    /// in-process** — `emit:`, or a step whose `when:` is false. Any inner
+    /// `tool:`/`agent:`/`call:`/`gate:` fails, always, on the production
+    /// execution path: the run loop is rebuilt from durable rows on every
+    /// resume, so a materialized worktree path cannot survive one, and
+    /// nothing today makes it durable. This is a permanent limitation, not a
+    /// gap slated to close — see `worktree_cannot_span_a_suspend` in
+    /// `crate::exec::run_loop` for the full explanation and what would
+    /// actually need to be built to lift it.
+    Worktree {
+        base_ref: Option<String>,
+    },
     Sandbox,
     Container,
     Remote,
