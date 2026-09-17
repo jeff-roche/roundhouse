@@ -45,6 +45,7 @@
 //! own doc comment for the full mechanism.
 
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -334,6 +335,15 @@ async fn build_headless_session(
     // `sub_agent_host_unavailable` when it is.
     crate::sub_agent_host::wire_sub_agent_host(&actor_for_reaper, resources, registry);
 
+    // Shared with the reaper below and carried on the returned
+    // `HeadlessSession` (Phase 8, T19a Task 6, fix round 1): this is what
+    // makes "exactly one real teardown" structural regardless of which of
+    // the two independent routes — this reaper, or whatever this function's
+    // caller eventually does with the handle it gets back — observes
+    // `Closed` first. See `HeadlessSession::finish_teardown`'s own doc
+    // comment.
+    let torn_down = Arc::new(AtomicBool::new(false));
+
     let reaper = spawn_session_reaper(
         registry.clone(),
         session_id,
@@ -342,6 +352,7 @@ async fn build_headless_session(
         resources.proxy.clone(),
         proxy_token_for_reaper,
         ReapAction::Teardown,
+        Arc::clone(&torn_down),
     );
 
     Ok(HeadlessSession {
@@ -350,6 +361,7 @@ async fn build_headless_session(
         mcp_host: mcp_host_for_handle,
         proxy_token: proxy_token_for_handle,
         reaper,
+        torn_down,
     })
 }
 
@@ -366,6 +378,53 @@ async fn build_headless_session(
 /// unreleased `WorkGuard`, per `close`'s own doc comment) does not block
 /// whatever caller is waiting on `close_and_teardown` — a socket connection
 /// answering a client's close request among them — indefinitely.
+///
+/// # This now bounds a whole cascade, not one session (Phase 8, T19a Task 6, fix round 1)
+///
+/// Chosen back when [`SessionActor::close`]'s step 4
+/// (`sub_agent_host().close_children`) was a no-op default, so this
+/// constant bounded exactly the ONE session's own `close()` call it
+/// wrapped. That is no longer true for a session with tracked sub-agent
+/// children: `close_and_teardown`'s `tokio::time::timeout` wraps
+/// `actor.close(outcome)`, and step 4 of THAT call recurses — through
+/// `DaemonSubAgentHost::close_children` → `SubAgentSessions::retire_child`
+/// → this session's own `close_and_teardown`, applied again to each
+/// child — into a SECOND, INDEPENDENT `tokio::time::timeout(
+/// SESSION_CLOSE_TIMEOUT, ..)` per child, nested entirely inside the first.
+/// Each individual session's own close is still bounded by exactly one
+/// `SESSION_CLOSE_TIMEOUT`, but the OUTERMOST caller's timeout now has to
+/// cover its own close PLUS however much of that nested work finishes
+/// before it elapses — so a parent with several genuinely (not
+/// pathologically, just non-trivially) slow-closing children can have its
+/// own outer timeout fire before the cascade would have finished on its
+/// own, even though no single session in it ever came close to exceeding
+/// `SESSION_CLOSE_TIMEOUT` by itself.
+///
+/// **If the outer timeout wins that race, `tokio::time::timeout` drops the
+/// nested future — see `close_and_teardown`'s own doc comment ("An
+/// abandoned close may leave the event log without its terminator") for
+/// what dropping mid-close already meant for ONE session, and
+/// `close_children`'s own doc comment for what it now additionally means
+/// for every descendant `close_children` had already `take`n out of
+/// `SubAgentSessions` but not yet finished retiring: that descendant's
+/// reaper was already aborted (`close_and_teardown`'s own step 1) and its
+/// record is already gone from the map, so nothing will ever retire it
+/// again — a genuine, permanent leak of that one session, not merely a
+/// slow one.**
+///
+/// **Not rescaled or restructured in this fix round.** A correct per-tree
+/// budget (e.g. giving the outermost call a bound that scales with how much
+/// of the tree it might have to wait for) would need either threading a
+/// remaining-budget value down through every nested `close_and_teardown`
+/// call or making `HeadlessSession`/`close_and_teardown` aware of
+/// `SubAgentSessions` at all — the latter is exactly the module-boundary
+/// `crate::sub_agent_host` was built to keep out of `session_manager`.
+/// Documented here as an accepted, known risk instead: in the ordinary
+/// case (nothing wedged anywhere) a cascade completes in milliseconds
+/// regardless of depth, since this bound only ever matters when something
+/// is ALREADY taking unusually long — the case this fix round leaves
+/// undefended is a parent whose tree has several such slow (not
+/// permanently wedged) children at once.
 const SESSION_CLOSE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Everything [`HeadlessSession::close_and_teardown`] can fail with — either
@@ -411,6 +470,10 @@ pub struct HeadlessSession {
     mcp_host: Option<Arc<McpHost>>,
     proxy_token: String,
     reaper: tokio::task::JoinHandle<()>,
+    /// Claimed exactly once, by whichever of this session's teardown routes
+    /// gets there first (Phase 8, T19a Task 6, fix round 1) — see
+    /// [`Self::finish_teardown`]'s own doc comment.
+    torn_down: Arc<AtomicBool>,
 }
 
 impl HeadlessSession {
@@ -495,8 +558,8 @@ impl HeadlessSession {
     /// child in `SubAgentSessions`, it calls this to swap in a
     /// [`ReapAction::RetireSubAgent`] reaper instead — never earlier, or the
     /// replacement could observe `Closed` and reap before there is a
-    /// `SubAgentSessions` record for it to find (see
-    /// `SubAgentSessions::take_for_reap`'s own doc comment).
+    /// `SubAgentSessions` record for `SubAgentSessions::take_for_reap` to
+    /// find, which would silently do nothing and leak the child.
     ///
     /// Aborts the old reaper before spawning the new one, for the same
     /// "exactly one teardown" reason [`Self::teardown`]'s doc comment gives:
@@ -517,6 +580,12 @@ impl HeadlessSession {
             proxy,
             self.proxy_token.clone(),
             action,
+            // The SAME flag this session was constructed with, not a fresh
+            // one — see `finish_teardown`'s own doc comment for why reusing
+            // it is what makes "exactly one real teardown" hold across the
+            // reaper this rewires away from as well as the one it rewires
+            // to.
+            Arc::clone(&self.torn_down),
         );
     }
 
@@ -612,7 +681,45 @@ impl HeadlessSession {
     /// the egress-proxy token. Deciding what happens to the reaper's own
     /// `JoinHandle` is each caller's own concern, not this one's — see
     /// their own doc comments for why they differ.
+    ///
+    /// # Exactly one real teardown, however many routes reach this session (Phase 8, T19a Task 6, fix round 1)
+    ///
+    /// This session can be torn down by more than one independent route at
+    /// once: this handle's own owner calling [`Self::teardown`]/
+    /// [`Self::close_and_teardown`] is one, and — until this task's reaper
+    /// is rewired away from it — the plain [`ReapAction::Teardown`] reaper
+    /// [`create_headless_session`] always starts a session with is another,
+    /// racing on the SAME `Closed` transition with its own independent
+    /// copies of the registry/actor/proxy handles (its `ReapAction::Teardown`
+    /// arm does not go through a `HeadlessSession` at all). Ordering
+    /// (`DaemonSubAgentHost::create_child_session` rewiring the reaper only
+    /// after `SubAgentSessions::insert`) narrows *when* that race is even
+    /// possible, but does not make it impossible on its own — the ordering
+    /// says nothing about a reaper that was ALREADY armed and watching
+    /// before the rewiring race even starts.
+    ///
+    /// `self.torn_down` is what actually makes it structural:
+    /// [`claim_teardown`] lets exactly one caller — whichever of this
+    /// method or `spawn_session_reaper`'s `ReapAction::Teardown` arm gets
+    /// there first, sharing the SAME flag (see [`build_headless_session`]
+    /// and [`Self::rewire_reaper`]) — past this guard. Every later caller,
+    /// on any route, returns immediately: no double
+    /// [`SessionActor::teardown`] (not guaranteed idempotent), no double MCP
+    /// shutdown, no double proxy deregistration. A `ReapAction::RetireSubAgent`
+    /// reaper that loses this race still runs its OWN bookkeeping
+    /// (`SubAgentSessions::take_for_reap`, `SpawnTree::remove_child`) before
+    /// reaching this method — those are unconditional, so a session that
+    /// lost the flag race here is still fully un-tracked, just not
+    /// re-torn-down.
     async fn finish_teardown(&self, registry: &SessionRegistry, proxy: &LoopbackProxy) {
+        if !claim_teardown(&self.torn_down) {
+            tracing::debug!(
+                session_id = %self.session_id,
+                "skipping this session's real resource teardown; another route already claimed \
+                 it"
+            );
+            return;
+        }
         registry.remove(self.session_id);
         self.actor.teardown().await;
         if let Some(host) = &self.mcp_host {
@@ -626,6 +733,18 @@ impl HeadlessSession {
         }
         proxy.deregister_session(&self.proxy_token);
     }
+}
+
+/// Claims the right to run one session's real resource teardown: `true` only
+/// for the first caller to observe `flag` false, atomically marking it done
+/// for every caller after that (Phase 8, T19a Task 6, fix round 1). Shared by
+/// [`HeadlessSession::finish_teardown`] and `spawn_session_reaper`'s
+/// [`ReapAction::Teardown`] arm — the one teardown path that tears real
+/// resources down without going through a `HeadlessSession` at all — so
+/// "exactly one `Isolate::teardown` per session" holds regardless of which
+/// of a session's independent teardown routes gets there first.
+fn claim_teardown(flag: &AtomicBool) -> bool {
+    !flag.swap(true, Ordering::SeqCst)
 }
 
 /// What [`spawn_session_reaper`] does with a session once it observes that
@@ -644,10 +763,9 @@ impl HeadlessSession {
 /// about `SubAgentSessions`) and is rewired to this one — via
 /// [`HeadlessSession::rewire_reaper`] — the moment, and never before, it is
 /// actually findable in [`SubAgentSessions`]
-/// (`SubAgentSessions::rewire_reaper_for_retirement`'s own doc comment
-/// explains why the ordering matters: a `RetireSubAgent` reaper that could
-/// observe `Closed` before that record exists would reap nothing and leak
-/// the session).
+/// ([`HeadlessSession::rewire_reaper`]'s own doc comment explains why the
+/// ordering matters: a `RetireSubAgent` reaper that could observe `Closed`
+/// before that record exists would reap nothing and leak the session).
 ///
 /// `pub(crate)` rather than `pub`: nothing outside this crate constructs a
 /// `ReapAction` at all, and every caller of `spawn_session_reaper` lives in
@@ -703,6 +821,13 @@ pub(crate) enum ReapAction {
 /// `action` (Phase 8, T19a Task 5) picks what happens once `Closed` is
 /// observed — see [`ReapAction`]'s own doc comment for why a plain headless
 /// root session and a tracked sub-agent child need different endings.
+///
+/// `torn_down` (Phase 8, T19a Task 6, fix round 1) is the SAME flag the
+/// `HeadlessSession` for this exact session carries — see
+/// [`HeadlessSession::finish_teardown`]'s own doc comment for why a shared
+/// flag, not spawn-then-rewire ordering alone, is what makes this reap
+/// action's own real-resource-teardown work ([`ReapAction::Teardown`]'s arm)
+/// safe to race against that handle's independent teardown routes.
 pub(crate) fn spawn_session_reaper(
     registry: Arc<SessionRegistry>,
     session_id: SessionId,
@@ -711,6 +836,7 @@ pub(crate) fn spawn_session_reaper(
     proxy: Arc<LoopbackProxy>,
     proxy_token: String,
     action: ReapAction,
+    torn_down: Arc<AtomicBool>,
 ) -> tokio::task::JoinHandle<()> {
     let mut state = actor.subscribe();
     tokio::spawn(async move {
@@ -718,6 +844,18 @@ pub(crate) fn spawn_session_reaper(
             if *state.borrow() == SessionState::Closed {
                 match action {
                     ReapAction::Teardown => {
+                        if !claim_teardown(&torn_down) {
+                            // Another route (this session's own handle
+                            // calling `teardown`/`close_and_teardown`, most
+                            // likely) already claimed the real teardown —
+                            // see `finish_teardown`'s own doc comment.
+                            tracing::debug!(
+                                session_id = %session_id,
+                                "skipping this session's real resource teardown; another route \
+                                 already claimed it"
+                            );
+                            return;
+                        }
                         // Clears the registry's own bookkeeping first, then
                         // tears down the REAL resources behind it (a real
                         // bwrap isolation handle, real MCP child processes,
@@ -1124,6 +1262,7 @@ mod tests {
             proxy.clone(),
             token.clone(),
             ReapAction::Teardown,
+            Arc::new(AtomicBool::new(false)),
         );
 
         actor
@@ -1175,6 +1314,7 @@ mod tests {
 
         let (proxy, token) = real_proxy_with_registered_token(dir.path()).await;
 
+        let torn_down = Arc::new(AtomicBool::new(false));
         let reaper = spawn_session_reaper(
             registry.clone(),
             session_id,
@@ -1183,6 +1323,7 @@ mod tests {
             proxy.clone(),
             token.clone(),
             ReapAction::Teardown,
+            Arc::clone(&torn_down),
         );
         let headless = HeadlessSession {
             session_id,
@@ -1190,6 +1331,7 @@ mod tests {
             mcp_host: None,
             proxy_token: token.clone(),
             reaper,
+            torn_down,
         };
 
         assert_eq!(
@@ -1231,6 +1373,102 @@ mod tests {
         );
     }
 
+    /// **Two independent teardown routes racing the same session tear its
+    /// real isolation handle down exactly once** (Phase 8, T19a Task 6, fix
+    /// round 1) — the structural guarantee `torn_down`/[`claim_teardown`]
+    /// exist for, proven WITHOUT the ordering `DaemonSubAgentHost::
+    /// create_child_session` relies on (rewiring only after
+    /// `SubAgentSessions::insert`): that ordering narrows *when* a race can
+    /// start, but a shared flag is what makes the race itself harmless
+    /// however it lands, which is what this test isolates.
+    ///
+    /// Route A is an extra reaper — independent of the `HeadlessSession`
+    /// below, sharing only its `torn_down` flag — modeling the plain
+    /// `ReapAction::Teardown` reaper `create_headless_session` always starts
+    /// a session with and that stays armed until something rewires or
+    /// aborts it. Route B is that `HeadlessSession`'s own explicit
+    /// `teardown`, called directly rather than waited on by anything. Both
+    /// race the SAME `Closed` transition; only one may win the flag.
+    #[tokio::test]
+    async fn two_independent_teardown_routes_racing_one_session_tear_it_down_exactly_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let teardown_calls = Arc::new(AtomicUsize::new(0));
+        let isolate: Arc<dyn Isolate> = Arc::new(CountingIsolate {
+            teardown_calls: Arc::clone(&teardown_calls),
+        });
+        let actor = actor_with_isolate(dir.path(), isolate).await;
+
+        let registry = Arc::new(SessionRegistry::new());
+        let session_id = registry
+            .register_headless(actor.clone(), None, None)
+            .expect("registering against a fresh, non-full registry must succeed");
+
+        let (proxy, token) = real_proxy_with_registered_token(dir.path()).await;
+        let torn_down = Arc::new(AtomicBool::new(false));
+
+        // Route A: an extra reaper, independent of `headless` below, sharing
+        // only the flag.
+        let extra_reaper = spawn_session_reaper(
+            registry.clone(),
+            session_id,
+            actor.clone(),
+            None,
+            proxy.clone(),
+            token.clone(),
+            ReapAction::Teardown,
+            Arc::clone(&torn_down),
+        );
+
+        // Route B: `headless`'s own reaper and explicit teardown — a second,
+        // independent handle on the same session, sharing the SAME flag.
+        let own_reaper = spawn_session_reaper(
+            registry.clone(),
+            session_id,
+            actor.clone(),
+            None,
+            proxy.clone(),
+            token.clone(),
+            ReapAction::Teardown,
+            Arc::clone(&torn_down),
+        );
+        let headless = HeadlessSession {
+            session_id,
+            actor: actor.clone(),
+            mcp_host: None,
+            proxy_token: token.clone(),
+            reaper: own_reaper,
+            torn_down,
+        };
+
+        // One real close, observed by both routes at once: Route A's extra
+        // reaper independently, and Route B's own explicit teardown below
+        // (which aborts only `headless`'s own reaper, never Route A's).
+        actor
+            .close(SessionOutcome::Completed)
+            .await
+            .expect("closing a session with no open tasks and no gate must succeed");
+
+        headless.teardown(&registry, &proxy).await;
+
+        // Let Route A's independent reaper actually run its race too.
+        // `CountingIsolate::teardown` has its own real yield point, so a
+        // reaper that reached the real work needs the runtime to poll it
+        // before this assertion could observe a wrongly-doubled count.
+        for _ in 0..1000 {
+            tokio::task::yield_now().await;
+        }
+        extra_reaper.abort();
+
+        assert_eq!(
+            teardown_calls.load(Ordering::SeqCst),
+            1,
+            "two independent teardown routes racing the same session must tear its real \
+             isolation handle down exactly once, not zero and not twice"
+        );
+        assert!(registry.actor(session_id).is_none());
+        assert!(!proxy.is_registered(&token));
+    }
+
     /// [`HeadlessSession::close_and_teardown`]'s [`SESSION_CLOSE_TIMEOUT`]
     /// bound on a wedged [`SessionActor::close`] (Phase 8, T19a Task 5, fix
     /// round 1). `close()`'s own durable `close_session` append is routed
@@ -1263,6 +1501,7 @@ mod tests {
 
         let (proxy, token) = real_proxy_with_registered_token(dir.path()).await;
 
+        let torn_down = Arc::new(AtomicBool::new(false));
         let reaper = spawn_session_reaper(
             registry.clone(),
             session_id,
@@ -1271,6 +1510,7 @@ mod tests {
             proxy.clone(),
             token.clone(),
             ReapAction::Teardown,
+            Arc::clone(&torn_down),
         );
         let headless = HeadlessSession {
             session_id,
@@ -1278,6 +1518,7 @@ mod tests {
             mcp_host: None,
             proxy_token: token.clone(),
             reaper,
+            torn_down,
         };
 
         // Never released for the rest of this test: close_session's own
@@ -1361,6 +1602,7 @@ mod tests {
         let parent = SessionId::new();
         tree.record_child(parent, session_id);
 
+        let torn_down = Arc::new(AtomicBool::new(false));
         let reaper = spawn_session_reaper(
             registry.clone(),
             session_id,
@@ -1372,6 +1614,7 @@ mod tests {
                 sub_agents: Arc::clone(&sub_agents),
                 tree: Arc::clone(&tree),
             },
+            Arc::clone(&torn_down),
         );
         let headless = HeadlessSession {
             session_id,
@@ -1379,6 +1622,7 @@ mod tests {
             mcp_host: None,
             proxy_token: token.clone(),
             reaper,
+            torn_down,
         };
         // depth 1: a direct child of `parent` (depth 0), the shallowest a
         // real tracked sub-agent is ever admitted at.
@@ -1436,6 +1680,170 @@ mod tests {
             1,
             "ReapAction::RetireSubAgent must tear the real isolation handle down exactly once"
         );
+    }
+
+    /// **A child spawned during a parent's own close is still retired**
+    /// (Phase 8, T19a Task 6, fix round 1) — `DaemonSubAgentHost::
+    /// close_children`'s single `children_of(parent)` snapshot could
+    /// otherwise miss a child admitted after that snapshot but before the
+    /// parent's own close finishes (`wait_idle` does not cover this: a
+    /// workflow `agent:` step's spawn, driven from `scheduler_driver`
+    /// through `workflow_dispatch::dispatch_agent_for_workflow`, holds no
+    /// `WorkGuard` for the parent). `close_children` now re-polls until
+    /// `children_of` returns empty, so a child recorded after the first
+    /// snapshot is still picked up by a later pass.
+    ///
+    /// C1's close is gated (real, deterministic, no sleep) so this test
+    /// controls exactly when `close_children`'s first pass — which found
+    /// only C1 — finishes and re-polls: C2 is inserted into
+    /// `SubAgentSessions` while C1's retirement is still blocked on the
+    /// gate, i.e. provably before `close_children`'s next
+    /// `children_of(parent)` call, which cannot run until C1's
+    /// `retire_child` call (awaiting the gated close) returns.
+    #[tokio::test]
+    async fn a_child_spawned_during_close_children_is_retired_by_a_later_repoll() {
+        use crate::sub_agent_host::DaemonSubAgentHost;
+        use roundhouse_engine::tools::agent_spawn_tool::SubAgentHost;
+
+        let dir = tempfile::tempdir().unwrap();
+        let resources = Arc::new(daemon_resources(dir.path(), None).await);
+        let registry = Arc::new(SessionRegistry::new());
+        let parent = SessionId::new();
+
+        // C1: a gated close, so its retirement stays in flight for exactly
+        // as long as this test wants it to.
+        let c1_teardown_calls = Arc::new(AtomicUsize::new(0));
+        let c1_isolate: Arc<dyn Isolate> = Arc::new(CountingIsolate {
+            teardown_calls: Arc::clone(&c1_teardown_calls),
+        });
+        let c1_store = roundhouse_store::open(&dir.path().join("c1-events.db"))
+            .await
+            .unwrap();
+        let gate = roundhouse_store::test_util::CloseGate::new();
+        let c1_writer =
+            roundhouse_store::test_util::spawn_gated_writer(c1_store, Arc::clone(&gate)).await;
+        let c1_actor = actor_with_isolate_and_writer(dir.path(), c1_isolate, c1_writer).await;
+        let c1_id = registry
+            .register_headless(c1_actor.clone(), None, None)
+            .expect("registering against a fresh, non-full registry must succeed");
+        let c1_proxy_handle = resources
+            .proxy
+            .register_session(
+                c1_id,
+                EgressPolicy {
+                    allowed_hosts: vec![],
+                },
+            )
+            .unwrap();
+        let c1_token = c1_proxy_handle.token().to_string();
+        let c1_torn_down = Arc::new(AtomicBool::new(false));
+        let c1_reaper = spawn_session_reaper(
+            registry.clone(),
+            c1_id,
+            c1_actor.clone(),
+            None,
+            resources.proxy.clone(),
+            c1_token.clone(),
+            ReapAction::Teardown,
+            Arc::clone(&c1_torn_down),
+        );
+        resources.sub_agents.insert_for_test(
+            c1_id,
+            parent,
+            1,
+            HeadlessSession {
+                session_id: c1_id,
+                actor: c1_actor.clone(),
+                mcp_host: None,
+                proxy_token: c1_token,
+                reaper: c1_reaper,
+                torn_down: c1_torn_down,
+            },
+        );
+        resources.spawn_tree.record_child(parent, c1_id);
+
+        gate.hold().await;
+
+        let host: Arc<dyn SubAgentHost> = Arc::new(DaemonSubAgentHost::for_root_session(
+            Arc::clone(&resources),
+            Arc::clone(&registry),
+            parent,
+        ));
+        let closing = {
+            let host = Arc::clone(&host);
+            tokio::spawn(async move { host.close_children(parent).await })
+        };
+
+        // C2: an ordinary, ungated child, inserted only now — strictly after
+        // close_children's first snapshot (which could only have found C1)
+        // and strictly before its next one (blocked on `gate` until this
+        // test releases it below).
+        let c2_teardown_calls = Arc::new(AtomicUsize::new(0));
+        let c2_isolate: Arc<dyn Isolate> = Arc::new(CountingIsolate {
+            teardown_calls: Arc::clone(&c2_teardown_calls),
+        });
+        let c2_actor = actor_with_isolate(dir.path(), c2_isolate).await;
+        let c2_id = registry
+            .register_headless(c2_actor.clone(), None, None)
+            .expect("registering against a fresh, non-full registry must succeed");
+        let c2_proxy_handle = resources
+            .proxy
+            .register_session(
+                c2_id,
+                EgressPolicy {
+                    allowed_hosts: vec![],
+                },
+            )
+            .unwrap();
+        let c2_token = c2_proxy_handle.token().to_string();
+        let c2_torn_down = Arc::new(AtomicBool::new(false));
+        let c2_reaper = spawn_session_reaper(
+            registry.clone(),
+            c2_id,
+            c2_actor.clone(),
+            None,
+            resources.proxy.clone(),
+            c2_token.clone(),
+            ReapAction::Teardown,
+            Arc::clone(&c2_torn_down),
+        );
+        resources.sub_agents.insert_for_test(
+            c2_id,
+            parent,
+            1,
+            HeadlessSession {
+                session_id: c2_id,
+                actor: c2_actor.clone(),
+                mcp_host: None,
+                proxy_token: c2_token,
+                reaper: c2_reaper,
+                torn_down: c2_torn_down,
+            },
+        );
+        resources.spawn_tree.record_child(parent, c2_id);
+
+        // Let C1's gated close proceed now that C2 is in place.
+        gate.release().await;
+
+        closing
+            .await
+            .expect("close_children's own task must not panic");
+
+        assert_eq!(
+            c1_teardown_calls.load(Ordering::SeqCst),
+            1,
+            "the child found by the first snapshot must still be retired"
+        );
+        assert_eq!(
+            c2_teardown_calls.load(Ordering::SeqCst),
+            1,
+            "a child inserted only after the first snapshot must be retired by a later \
+             re-poll, not left tracked forever"
+        );
+        assert!(resources.sub_agents.is_empty());
+        assert_eq!(resources.spawn_tree.direct_children(parent), 0);
+        assert!(registry.actor(c1_id).is_none());
+        assert!(registry.actor(c2_id).is_none());
     }
 
     #[tokio::test]

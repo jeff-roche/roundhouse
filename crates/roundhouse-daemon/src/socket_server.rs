@@ -15,6 +15,7 @@ use roundhouse_proto::{ApiVersion, ClientEvent, ClientRequest};
 use std::io::ErrorKind;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::Path;
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::AsyncWriteExt;
@@ -1280,6 +1281,12 @@ pub async fn drive_session(
                 resources.proxy.clone(),
                 proxy_token_for_reaper,
                 ReapAction::Teardown,
+                // A socket-connected session has no other teardown route —
+                // this reaper is the only thing that ever tears one down —
+                // so a freshly minted flag, never shared, is all this needs
+                // (contrast `HeadlessSession::finish_teardown`'s own doc
+                // comment, where a caller-held handle is a second route).
+                Arc::new(AtomicBool::new(false)),
             );
             let created = ClientEvent::TaskEvent {
                 session_id,
@@ -2097,6 +2104,7 @@ mod session_reaper_tests {
             proxy.clone(),
             token.clone(),
             ReapAction::Teardown,
+            Arc::new(AtomicBool::new(false)),
         );
 
         let reaped = tokio::time::timeout(std::time::Duration::from_secs(2), async {
@@ -2141,6 +2149,7 @@ mod session_reaper_tests {
             proxy.clone(),
             token.clone(),
             ReapAction::Teardown,
+            Arc::new(AtomicBool::new(false)),
         );
 
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
