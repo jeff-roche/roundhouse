@@ -9072,3 +9072,116 @@ fn a_failed_inner_step_declaring_continue_on_error_lets_its_item_go_on() {
         "the step after the failure really ran"
     );
 }
+
+/// The three-inner-step fixture the two sibling-reading tests below share:
+/// two `tool:` steps that really suspend, then an `emit:` that reads both of
+/// their outputs back through `${{ steps.* }}`, and a **top-level** step after
+/// the `map` that reads the same name.
+///
+/// `drive_waves` answers every dispatch with `{ "dispatched": <item index> }`,
+/// so every value read below names the item it came from — which is what makes
+/// "item 1 did not see item 0's answer" an assertion rather than a hope.
+fn map_reading_its_own_siblings() -> String {
+    "steps:\n\
+     \x20 - id: fan\n\
+     \x20   map:\n\
+     \x20     over: \"${{ inputs.items }}\"\n\
+     \x20     as: item\n\
+     \x20     max_parallel: 1\n\
+     \x20   steps:\n\
+     \x20     - id: build\n\
+     \x20       tool: shell\n\
+     \x20       with: { cmd: [echo, build] }\n\
+     \x20     - id: publish\n\
+     \x20       tool: shell\n\
+     \x20       with: { cmd: [echo, publish] }\n\
+     \x20     - id: read\n\
+     \x20       emit:\n\
+     \x20         from_build: \"${{ steps.build.output.dispatched }}\"\n\
+     \x20         from_publish: \"${{ steps.publish.output.dispatched }}\"\n\
+     \x20 - id: after\n\
+     \x20   emit: { saw: \"${{ steps.build.output }}\" }\n"
+        .to_string()
+}
+
+/// **An item's later inner step reads a sibling its own earlier *segment*
+/// decided** — the case a same-segment fixture cannot reach, and the one a
+/// partial fix fails silently.
+///
+/// `max_parallel: 1` and two `tool:` steps put every item through three
+/// segments, so by the time `read` evaluates, `build`'s outcome is no longer
+/// an answer this entry carries: it has to come back off `build`'s own durable
+/// row, through `Loop::decided_map_item_step`, exactly as it would after a
+/// daemon restart. `publish`'s outcome — the answer this entry *does* carry —
+/// is read in the same expression, so a fix that seeded only one of the two
+/// routes fails here rather than passing on the easy half.
+///
+/// The per-item values are what make it a scoping test as well: each item
+/// reads its **own** index back, never its predecessor's.
+#[test]
+fn an_items_later_inner_step_reads_a_sibling_decided_in_an_earlier_segment() {
+    let (_conn, _run_id, _sink, waves, result) = drive_waves(
+        &map_reading_its_own_siblings(),
+        serde_json::json!({ "items": map_items(2) }),
+        &[],
+    );
+    let outcome = result.expect("the run drives");
+
+    assert_eq!(
+        waves,
+        vec![
+            vec![("build".to_string(), Some(0))],
+            vec![("publish".to_string(), Some(0))],
+            vec![("build".to_string(), Some(1))],
+            vec![("publish".to_string(), Some(1))],
+        ],
+        "each item spans three segments, so its `read` step evaluates in a segment that \
+         carries no answer for `build` at all: {waves:?}"
+    );
+    let output = map_output(&outcome, "fan");
+    let entries = output["items"].as_array().expect("one entry per item");
+    assert_eq!(
+        entries[0]["output"],
+        serde_json::json!({ "from_build": "0", "from_publish": "0" }),
+        "item 0's `read` must see both siblings — `build` reconstructed from its durable row, \
+         `publish` from the answer this segment carries: {entries:?}"
+    );
+    assert_eq!(
+        entries[1]["output"],
+        serde_json::json!({ "from_build": "1", "from_publish": "1" }),
+        "and item 1 must see its OWN siblings, not the values item 0 left bound: {entries:?}"
+    );
+}
+
+/// **An item's inner steps are visible to that item and to nothing else.** The
+/// binding is opened and closed around one item's walk, so the run's own
+/// `${{ steps.* }}` surface — which a top-level step after the `map` reads —
+/// never acquires a bare `build` key from inside it.
+///
+/// The same fixture as above, read from the other side: `after` is a top-level
+/// step naming an id that only exists as a `map` inner step, and `null` is the
+/// correct answer for it both before this task and after.
+#[test]
+fn a_map_items_inner_step_is_not_visible_to_a_top_level_step_after_the_map() {
+    let (_conn, _run_id, _sink, _waves, result) = drive_waves(
+        &map_reading_its_own_siblings(),
+        serde_json::json!({ "items": map_items(2) }),
+        &[],
+    );
+    let outcome = result.expect("the run drives");
+
+    let RunOutcome::Terminal { steps, .. } = &outcome else {
+        panic!("the run must reach a terminal state, got {outcome:?}");
+    };
+    let after = steps
+        .iter()
+        .find(|s| s.step_id == "after")
+        .expect("the step after the map ran");
+    assert_eq!(
+        after.output,
+        serde_json::json!({ "saw": "null" }),
+        "a `map` item's inner step is not a step of the run, so nothing outside the item that \
+         owns it may read one under its bare id: {:?}",
+        after.output
+    );
+}

@@ -14,20 +14,20 @@
 //!    and
 //!    [`the_frozen_reference_workflows_map_refuses_every_worktree_isolated_item`]
 //!    pin what the **frozen fixture itself** does today — unmodified, and
-//!    modified in exactly one named place, respectively — joined by
-//!    [`a_map_inner_step_reads_a_siblings_output_as_null_today`], which pins
-//!    a mechanism the fixture's `map` body depends on and that is not
-//!    there. All three are characterization tests: their assertions are a
-//!    record of real behaviour, not of intended behaviour.
+//!    modified in exactly one named place, respectively. Both are
+//!    characterization tests: their assertions are a record of real
+//!    behaviour, not of intended behaviour.
 //! 2. [`a_map_dispatches_nested_agent_shell_and_gate_steps_for_real_concurrently_and_resumably`]
 //!    proves the integration those cannot: a `map` fanning out to several
 //!    items that each nest a real `agent:` step, a real `tool: shell` step,
 //!    a real `gate:` park/resume, and a real follow-up `tool:` step —
 //!    concurrently, and across two full park/resume cycles.
-//! 3. [`a_failed_map_inner_step_declaring_continue_on_error_does_not_stop_its_item`]
-//!    is the one test here that asserts *intended* behaviour: it started
-//!    life in group 1, pinning a gap this drive found, and Phase 8 Task
-//!    25.7 Task 10 closed the gap and flipped the assertion.
+//! 3. [`a_map_inner_step_reads_a_siblings_real_output`] and
+//!    [`a_failed_map_inner_step_declaring_continue_on_error_does_not_stop_its_item`]
+//!    assert *intended* behaviour, which is what makes them the odd ones
+//!    out here. Both started life in group 1, pinning a gap this drive
+//!    found in the two mechanisms §8.9's own `map` body is built on; Phase
+//!    8 Task 25.7 Task 10 closed both gaps and flipped both assertions.
 //!
 //! # What driving the frozen fixture turned up
 //!
@@ -47,15 +47,25 @@
 //! 3. **`tool: shell` takes `{ program, argv, cwd }`**, not §8.9's
 //!    `cmd: [...]`, so both of the fixture's shell steps would be rejected
 //!    before admission.
-//! 4. **A `map` inner step cannot read a sibling's output.** §8.9's map
+//! 4. **A `map` inner step could not read a sibling's output.** §8.9's map
 //!    gates on `${{ len(steps.review.output.findings) > 0 }}` and then on
-//!    `${{ steps.gate.output.approve }}`; both evaluate to `null`.
+//!    `${{ steps.gate.output.approve }}`; both evaluated to `null`.
+//!    **Closed by Phase 8 Task 25.7 Task 10** — `Loop::advance_map_item`
+//!    now binds an item-scoped `steps` object around each item's walk (see
+//!    `run_loop`'s `ItemStepsContext`), so an item's later inner step reads
+//!    its own earlier ones and nothing else reads either. One reference in
+//!    the fixture's `map` body is still `null` and is a different gap:
+//!    `post`'s `--body-file ${{ steps.review.artifact }}`, because
+//!    `exec::steps_context_entry` records `output`/`status`/`error` for
+//!    every step in the run and no `artifact` field for any of them.
 //! 5. **`continue_on_error:` was ignored on a `map` inner step**, so §8.9's
 //!    `tests` step failed its whole item rather than letting it continue.
-//!    **Closed by Phase 8 Task 25.7 Task 10**, which is why the test that
-//!    pinned it now asserts the opposite — see group 3 above and
+//!    **Closed by the same task** — see
 //!    `map_step::fold_inner_step_outcome`, the one place both fan-out loops
 //!    decide whether an inner step's failure ends its item.
+//!
+//! Both of those are why the tests that pinned them now assert the
+//! opposite; see group 3 above.
 //!
 //! Separately, and *not* a divergence but the accepted limitation that
 //! `run_loop`'s `worktree_cannot_span_a_suspend` documents in full: the
@@ -202,13 +212,14 @@ impl Fixture {
     /// by item index.
     ///
     /// These rows are the only place a `map` item's inner-step outcome is
-    /// observable at all: nothing rebinds an inner step's output into
-    /// `${{ steps.* }}` for the item's own later steps (see
-    /// [`live_map_workflow`]'s doc comment), and the `map` step's own output
+    /// observable **from outside the item**: the `map` step's own output
     /// carries one aggregate entry per item rather than a per-inner-step
-    /// breakdown. So a test that wants to know how one item's `gate:` was
-    /// answered, or whether one item's `tool: shell` step really ran, has to
-    /// read the rows.
+    /// breakdown, and the item-scoped `${{ steps.* }}` binding Phase 8 Task
+    /// 25.7 Task 10 added is deliberately scoped to the item's own walk (see
+    /// `run_loop`'s `ItemStepsContext`), so a test — or a top-level step —
+    /// standing outside that walk cannot read one. So a test that wants to
+    /// know how one item's `gate:` was answered, or whether one item's
+    /// `tool: shell` step really ran, has to read the rows.
     ///
     /// Keyed by item index alone, which the durable key is **not**: that is
     /// `(step_id, attempt, item_index)`, so a step that ran twice has two
@@ -970,19 +981,19 @@ fn posted_path(root: &Path, pr: u32) -> PathBuf {
 ///    for what `worktree` does instead, and `run_loop`'s
 ///    `worktree_cannot_span_a_suspend` for why.
 /// 2. **Every `when:` reads the item binding (`${{ pr.* }}`), never a
-///    sibling inner step's output.** §8.9's map gates on
-///    `${{ len(steps.review.output.findings) > 0 }}` and then on
-///    `${{ steps.gate.output.approve }}`, and **neither resolves today**: a
-///    `map` item's inner-step outputs are keyed `"<step_id>#<item_index>"`
-///    in the loop's `steps` context and nothing rebinds them to the bare id
-///    while an item is walked, so a sibling reference evaluates to `null`.
-///    `Loop::seed_context_from_checkpoints` says exactly this in its own
-///    comment ("a `map` inner step cannot read a sibling inner step's
-///    output through `${{ steps.* }}` today, at either fan-out loop"); this
-///    workflow is written to the mechanism that exists rather than around
-///    the one that does not. That the human's answer really does reach the
-///    right item is asserted instead against the item's own durable
-///    `workflow_step_run` row, which *does* carry it.
+///    sibling inner step's output.** Not because it could not: §8.9's own
+///    `${{ len(steps.review.output.findings) > 0 }}` resolves since Phase 8
+///    Task 25.7 Task 10 (see
+///    [`a_map_inner_step_reads_a_siblings_real_output`]), and this
+///    substitution predates it. It is kept because gating on the item's own
+///    data is what gives this one fan-out all three of §8.9's item outcomes
+///    — every non-failing item's `review` answer carries a finding, so
+///    §8.9's own condition would be true for all of them and no item would
+///    reach [`SKIPPED_PR`]'s shape. Which answer reached which item is
+///    asserted against the item's own durable `workflow_step_run` row rather
+///    than through `${{ steps.gate.output }}`, for the reason
+///    [`Fixture::item_step_rows`] gives: that binding is scoped to the item's
+///    own walk, and this test stands outside it.
 /// 3. **`tests` uses `{ program, argv, cwd }`**, which is what
 ///    `roundhouse_engine::tool_dispatch::task_params_for_in_workspace`
 ///    requires, rather than §8.9's `cmd: [...]`.
@@ -1160,9 +1171,11 @@ fn live_map_rules(workspace_root: &Path, tests_script: &Path) -> Vec<CompiledRul
 ///   naming the item it is about via `ParkResult::item_index`, and each
 ///   answer lands on **that item's own** durable `workflow_step_run` row.
 ///   The row is where this is checked rather than a downstream `${{
-///   steps.gate.output.* }}` reference, because that reference does not
-///   resolve inside a `map` today — see [`live_map_workflow`]'s doc comment
-///   for the mechanism and where it is already written down.
+///   steps.gate.output.* }}` reference, because that reference resolves only
+///   *inside* the item that owns the gate and this assertion stands outside
+///   the fan-out — see [`Fixture::item_step_rows`] for the scope, and
+///   [`live_map_workflow`]'s doc comment for why this fixture's `when:`
+///   conditions read the item binding instead.
 /// - **`finally:`**: a `report:` step carrying §8.6's five core fields
 ///   validates, so the run's report is authored rather than synthesised.
 #[tokio::test]
@@ -1334,8 +1347,9 @@ async fn a_map_dispatches_nested_agent_shell_and_gate_steps_for_real_concurrentl
                 ),
                 serde_json::json!({ "approve": true, "note": format!("ship-{pr}") }),
                 "item {index}'s gate row must hold the answer given for THAT item — the thing a \
-                 fan-out can most easily cross-wire, and the one place it is observable while \
-                 `${{ steps.gate.output }}` does not resolve inside a map"
+                 fan-out can most easily cross-wire, and the one place it is observable from \
+                 outside the item's own walk, which is where `${{ steps.gate.output }}` \
+                 resolves and this assertion does not stand"
             );
         }
     }
@@ -1375,32 +1389,44 @@ async fn a_map_dispatches_nested_agent_shell_and_gate_steps_for_real_concurrentl
     );
 }
 
-/// **Why [`live_map_workflow`] cannot use §8.9's own `when:` conditions**,
-/// pinned as behaviour rather than left as a claim in a doc comment.
+// ────────── 3. the inner-step mechanics §8.9's `map` body needs ──────────
+//
+// Both of these started life in section 1, pinning a gap this module's own
+// drive of the frozen fixture found; Phase 8 Task 25.7 Task 10 closed both
+// and flipped their assertions. They stay here, driven through the real
+// daemon, because that is where the gaps were found and because §8.9's
+// reference workflow is built entirely on the two mechanisms they cover.
+
+/// **§8.9's own two inner-step idioms, evaluated for real**: an inner step
+/// gating on a sibling's output (`when: "${{ len(steps.review.output.findings)
+/// > 0 }}"`) and then reading it.
 ///
-/// A `map` item's inner step reads `${{ steps.<sibling>.output }}` as
-/// `null`, even for a sibling that completed a moment earlier in the same
-/// item walk, because per-item outputs are keyed `"<step_id>#<item_index>"`
-/// in the loop's `steps` context and nothing rebinds them to the bare id
-/// while the item runs. `Loop::seed_context_from_checkpoints` states this
-/// in its own comment; this asserts it, so that the day someone closes the
-/// gap, [`live_map_workflow`]'s work-around is pointed at rather than
-/// silently kept.
+/// Both read `null` until Phase 8 Task 25.7 Task 10, because a `map` item's
+/// inner-step outputs are keyed `"<step_id>#<item_index>"` in the loop's
+/// `steps` context and nothing bound them under the bare id an expression
+/// actually names. `Loop::advance_map_item` now opens an item-scoped `steps`
+/// binding around each item's walk, so a sibling that completed a moment
+/// earlier — in this segment or an earlier one — is readable by exactly the
+/// item that owns it.
 ///
-/// Both inner steps are `emit:`, so neither leaves the run loop: this is
-/// not a resume artefact, it is how a sibling reference resolves at its
-/// most favourable.
+/// Both inner steps here are `emit:`, so neither leaves the run loop: this
+/// is the same-segment case, at its most favourable. The resumed case, where
+/// the sibling's output has to come back off its durable row, is
+/// `roundhouse-flow`'s own
+/// `an_items_later_inner_step_reads_a_sibling_decided_in_an_earlier_segment`.
 ///
-/// It also pins the half that *does* work, in the same item's output: the
-/// `as:` binding (`${{ it }}`) resolves. The failure is specific to
-/// `${{ steps.* }}`, not to expressions inside a `map`.
+/// It also keeps the half that always worked, in the same item's output: the
+/// `as:` binding (`${{ it }}`) resolves, so a regression here would be
+/// attributable to `${{ steps.* }}` specifically rather than to expressions
+/// inside a `map` generally.
 #[tokio::test]
-async fn a_map_inner_step_reads_a_siblings_output_as_null_today() {
+async fn a_map_inner_step_reads_a_siblings_real_output() {
     let yaml = "name: sibling-probe\nversion: 1\npermissions:\n  default: deny\n  \
                 unattended: { escalate: fail }\nsteps:\n  - id: m\n    map:\n      \
                 over: \"${{ [1] }}\"\n      as: it\n      isolation: none\n    steps:\n      \
                 - id: a\n        emit: { findings: [\"x\"] }\n      - id: b\n        \
-                emit: { saw: \"${{ steps.a.output }}\", item: \"${{ it }}\" }\n";
+                when: \"${{ len(steps.a.output.findings) > 0 }}\"\n        \
+                emit: { saw: \"${{ steps.a.output.findings[0] }}\", item: \"${{ it }}\" }\n";
     let f = fixture(
         |_root| (yaml.to_string(), vec![]),
         Arc::new(crate::test_support::NoopProvider),
@@ -1423,15 +1449,16 @@ async fn a_map_inner_step_reads_a_siblings_output_as_null_today() {
     assert_eq!(state, RunState::Completed);
     let items = map_items(step(&steps, "m"));
     assert_eq!(
-        items[0]["output"],
-        serde_json::json!({ "saw": "null", "item": "1" }),
-        "`${{ steps.a.output }}` must still read `null` inside a `map` item, while the item's \
-         own `as:` binding resolves — if this ever changes, `live_map_workflow` should go back \
-         to §8.9's own `when:` conditions"
+        items[0],
+        serde_json::json!({
+            "status": "completed",
+            "output": { "saw": "x", "item": "1" },
+        }),
+        "`b` must be reached at all — its `when:` reads its sibling's output, so a `null` \
+         there skips it — and must read that sibling's real value alongside the item's own \
+         `as:` binding"
     );
 }
-
-// ────────── 3. the inner-step mechanics §8.9's `map` body needs ──────────
 
 /// **A failed `map` inner step that declared `continue_on_error: true` does
 /// not stop its item** — so §8.9's own `tests` step (`tool: shell` with

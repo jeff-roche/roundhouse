@@ -38,6 +38,21 @@
 //! [`Executor::dispatch_step_or_stub`]'s stub, so there is no per-item spend
 //! here for a ceiling to bound.
 //!
+//! **One capability is likewise the run loop's alone, and this one is a real
+//! difference in what a workflow can express** (Phase 8 Task 25.7 Task 10):
+//! an inner step reading a *sibling* inner step's output through
+//! `${{ steps.<id>.output }}`. `crate::exec::run_loop::ItemStepsContext` binds
+//! an item-scoped `steps` object around each item's walk, and this loop has
+//! no counterpart — there is nothing here to bind. `crate::exec::Executor`'s
+//! own `steps` root is folded by
+//! [`Executor::run_to_completion`] from the outcomes of **top-level** steps,
+//! and a `map` item's inner steps never enter it (the item's whole fan-out is
+//! one step to that loop), so a sibling reference here still reads `null`. A
+//! workflow that depends on one — §8.9's reference workflow does — therefore
+//! behaves differently under the in-memory sequencer, which is a test/example
+//! harness (see [`MapBudget::unenforced_placeholder`] for the same split), not
+//! a path a real run takes.
+//!
 //! # Deviations from the plan text (ruling P1)
 //!
 //! - **`on_item_error` is [`OnItemError`], not `&str`.** The plan's
