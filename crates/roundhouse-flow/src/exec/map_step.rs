@@ -1022,8 +1022,10 @@ pub(crate) fn nested_report_refusal(inner: &StepDef) -> Option<ItemOutcome> {
 /// the continuing step was its first), and an item allowed to continue is not
 /// a *failed item* at all: [`ItemErrorPolicy`] neither collects its message nor
 /// lets it trip `fail_fast`. Measured in `tests/run_loop.rs`:
-/// `a_continuing_failure_as_an_items_last_step_does_not_stop_the_fan_out` and
-/// `a_continuing_failure_as_an_items_last_step_is_not_collected`.
+/// `a_continuing_failure_as_an_items_last_step_does_not_stop_the_fan_out`,
+/// `a_continuing_failure_as_an_items_last_step_is_not_collected`, and — for
+/// the parenthetical, an item whose continuing failure is also its first step —
+/// `an_items_only_inner_step_failing_non_fatally_leaves_a_null_output`.
 ///
 /// **This changes what the item reports, never what is on the record.** The
 /// step's own durable `workflow_step_run` row still says `Failed`, with its

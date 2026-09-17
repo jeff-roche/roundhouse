@@ -9078,6 +9078,12 @@ fn a_failed_inner_step_declaring_continue_on_error_lets_its_item_go_on() {
 /// be silently ignored in, because nothing ran afterwards to move the item's
 /// running outcome off the failure.
 ///
+/// `review` is an `emit:` with a value naming itself, rather than a second
+/// `tool:` step: `drive_waves` answers every dispatch with the same
+/// `{ "dispatched": <item index> }` shape, so two dispatched steps would leave
+/// an item's outcome indistinguishable between them and "the item kept
+/// `review`'s outcome" would rest on the `status` field alone.
+///
 /// `max_parallel: 1` so the wave sequence says, unambiguously, whether the
 /// fan-out went on to start the next item.
 fn map_with_a_continuing_final_failure(on_item_error: &str) -> String {
@@ -9091,8 +9097,7 @@ fn map_with_a_continuing_final_failure(on_item_error: &str) -> String {
          \x20     on_item_error: {on_item_error}\n\
          \x20   steps:\n\
          \x20     - id: review\n\
-         \x20       tool: shell\n\
-         \x20       with: {{ cmd: [echo, review] }}\n\
+         \x20       emit: {{ reviewed: \"${{{{ item }}}}\" }}\n\
          \x20     - id: notify\n\
          \x20       tool: shell\n\
          \x20       with: {{ cmd: [echo, notify] }}\n\
@@ -9122,9 +9127,7 @@ fn a_continuing_failure_as_an_items_last_step_does_not_stop_the_fan_out() {
     assert_eq!(
         waves,
         vec![
-            vec![("review".to_string(), Some(0))],
             vec![("notify".to_string(), Some(0))],
-            vec![("review".to_string(), Some(1))],
             vec![("notify".to_string(), Some(1))],
         ],
         "item 1 must still be started: `fail_fast` stops the fan-out when an ITEM fails, and \
@@ -9134,9 +9137,10 @@ fn a_continuing_failure_as_an_items_last_step_does_not_stop_the_fan_out() {
     let entries = output["items"].as_array().expect("one entry per item");
     assert_eq!(
         entries[0],
-        serde_json::json!({ "status": "completed", "output": { "dispatched": 0 } }),
-        "the item keeps the outcome it had before the non-fatal failure — `review`'s — rather \
-         than reporting a failure that was declared not to matter: {entries:?}"
+        serde_json::json!({ "status": "completed", "output": { "reviewed": "0" } }),
+        "the item keeps the outcome it had before the non-fatal failure — `review`'s own \
+         value, which nothing else in this fixture produces — rather than reporting a failure \
+         that was declared not to matter: {entries:?}"
     );
     assert_eq!(
         entries[1]["status"], "completed",
@@ -9188,6 +9192,66 @@ fn a_continuing_failure_as_an_items_last_step_is_not_collected() {
             .collect::<Vec<_>>(),
         vec!["completed", "completed"],
         "{entries:?}"
+    );
+}
+
+/// **An item whose *only* inner step fails non-fatally reports what it started
+/// with**, which is `walk_map_item`'s initial `ItemOutcome::Completed(Null)`.
+///
+/// The other two tests in this section each have a step *after* the continuing
+/// failure, so the item's outcome is that step's and this case — the one where
+/// there is nothing before it either — is never observed. It is the second half
+/// of the same rule: a failure the author declared non-fatal does not write
+/// itself into the item's outcome at all, so an item that did nothing else has
+/// nothing else to report.
+///
+/// **The message is not lost with it, and where it survives is the difference
+/// between the two fan-out loops.** Here it is on the step's own
+/// `workflow_step_run` row, asserted below. The in-memory sequencer
+/// (`Executor::dispatch_map_step`) writes no rows at all, so there the same
+/// declaration really does discard the message — see
+/// `map_step::fold_inner_step_outcome`'s own doc comment, which records that as
+/// the cost of the flag in a loop with no durable record.
+#[test]
+fn an_items_only_inner_step_failing_non_fatally_leaves_a_null_output() {
+    let (conn, run_id, _sink, _waves, result) = drive_waves(
+        "steps:\n\
+         \x20 - id: fan\n\
+         \x20   map:\n\
+         \x20     over: \"${{ inputs.items }}\"\n\
+         \x20     as: item\n\
+         \x20     on_item_error: continue\n\
+         \x20   steps:\n\
+         \x20     - id: notify\n\
+         \x20       tool: shell\n\
+         \x20       with: { cmd: [echo, notify] }\n\
+         \x20       continue_on_error: true\n",
+        serde_json::json!({ "items": map_items(1) }),
+        &[("notify", 0)],
+    );
+    let outcome = result.expect("the run drives");
+
+    let output = map_output(&outcome, "fan");
+    let entries = output["items"].as_array().expect("one entry per item");
+    assert_eq!(
+        entries[0],
+        serde_json::json!({ "status": "completed", "output": null }),
+        "the item reports the outcome its walk began with, because nothing the walk did was \
+         allowed to change it: {entries:?}"
+    );
+    let (state, error) = item_step_row(&conn, run_id, "notify", 0)
+        .expect("the failed inner step still gets its own durable row");
+    assert_eq!(
+        state,
+        StepRunState::Failed,
+        "the item completing is not the failure being swallowed — the row is where a \
+         non-fatal failure is kept, and it must still say so"
+    );
+    assert!(
+        error
+            .unwrap_or_default()
+            .contains("could not be dispatched"),
+        "with its real message, not an empty or synthesised one"
     );
 }
 
