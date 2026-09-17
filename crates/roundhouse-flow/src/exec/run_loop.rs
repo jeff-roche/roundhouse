@@ -1658,11 +1658,11 @@ struct ItemStepsContext {
     /// ([`inner_steps_may_read_steps`]).
     ///
     /// **When false this whole type is inert** — `steps` is empty, `record`
-    /// and `bind` return immediately, and [`Loop::advance_map_item`] takes no
-    /// snapshot (which would itself deep-clone the bound root). A fan-out that
-    /// cannot observe the binding therefore pays nothing for it, which is the
-    /// difference the table above measures. Every `map` written before this
-    /// mechanism existed is in that class, by construction.
+    /// and `bind_if_stale` return immediately, and [`Loop::advance_map_item`]
+    /// takes no snapshot (which would itself deep-clone the bound root). A
+    /// fan-out that cannot observe the binding therefore pays nothing for it,
+    /// which is the difference the table above measures. Every `map` written
+    /// before this mechanism existed is in that class, by construction.
     may_be_read: bool,
     /// Whether [`Self::steps`] has changed since it was last bound — true on
     /// arrival (nothing is bound yet) and set again by every [`Self::record`].
@@ -1675,8 +1675,12 @@ struct ItemStepsContext {
     /// inherited prefix on *every* segment, and [`Loop::dispatch_map`] re-walks
     /// every unfinished item, so the waste is (prefix length x items x
     /// segments). Binding at the one seam that does evaluate — where the step
-    /// is about to run — costs one clone per item per segment instead,
-    /// whatever the prefix.
+    /// is about to run — costs one clone per inner step the item **actually
+    /// runs** instead, whatever the prefix. That is not always one per segment:
+    /// an item that settles several live steps in one call (an `emit:`, a
+    /// `when:`-false step) re-dirties this flag and binds again for each. What
+    /// the flag removes is the *prefix* factor, which is the one that grows
+    /// with the fan-out's own history.
     needs_bind: bool,
     /// Exactly what is bound under [`STEPS_ROOT_NAME`] — empty, and never
     /// bound, when [`Self::may_be_read`] is false.

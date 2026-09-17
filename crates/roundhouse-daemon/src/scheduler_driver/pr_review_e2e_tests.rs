@@ -1313,10 +1313,10 @@ async fn a_map_dispatches_nested_agent_shell_and_gate_steps_for_real_concurrentl
                 item["status"], "skipped",
                 "an item reports its LAST-RUN inner step's status, whatever that status is — \
                  `fold_inner_step_outcome` overwrites the running outcome on every inner step \
-                 the item walks but a non-fatal failure — and this item's last step (`post`) \
-                 is `when:`-false, even though its `review` and `tests` steps completed. If \
-                 this ever fails because a step was appended after `post`, the fold is what \
-                 changed, not `when:` evaluation: {item:?}"
+                 the item walks except a failure it declared non-fatal — and this item's last \
+                 step (`post`) is `when:`-false, even though its `review` and `tests` steps \
+                 completed. If this ever fails because a step was appended after `post`, the \
+                 fold is what changed, not `when:` evaluation: {item:?}"
             );
             assert_eq!(
                 gate_rows

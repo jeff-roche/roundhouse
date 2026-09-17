@@ -1525,8 +1525,8 @@ fn step_body_kind_name(body: &StepBody) -> &'static str {
 /// would silently bind a root nothing reads: [`Executor::run_to_completion`]'s
 /// own per-step fold (the in-memory sequencer, below),
 /// `crate::exec::run_loop::Loop::bind_steps_context` (a real run's), and
-/// `crate::exec::run_loop::ItemStepsContext::bind` (one `map` item's own,
-/// Phase 8 Task 25.7 Task 10).
+/// `crate::exec::run_loop::ItemStepsContext::bind_if_stale` (one `map` item's
+/// own, Phase 8 Task 25.7 Task 10).
 pub(crate) const STEPS_ROOT_NAME: &str = "steps";
 
 /// The secret path [`ExprContext::set_with_secret_paths`] marks for one step's
