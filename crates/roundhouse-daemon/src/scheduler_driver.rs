@@ -58,9 +58,9 @@ use chrono::{DateTime, Utc};
 use futures::stream::{self, StreamExt};
 use roundhouse_bus::spawn_tree::SpawnTree;
 use roundhouse_core::{
-    BindingId, CancelReason, EventPayload, JobId, OnDegrade, Origin, SessionId, SessionSpec,
-    SessionState, TaskError, TaskId, TaskKind, TaskOutput, TaskRunner, Tier, Timestamp, Usage,
-    WorkspaceId,
+    BindingId, CancelReason, EventPayload, JobId, OnDegrade, Origin, SessionId, SessionOutcome,
+    SessionSpec, SessionState, TaskError, TaskId, TaskKind, TaskOutput, TaskRunner, Tier,
+    Timestamp, Usage, WorkspaceId,
 };
 use roundhouse_engine::workflow_dispatch::{
     dispatch_agent_for_workflow, dispatch_tool_for_workflow, record_workflow_task_completed,
@@ -3053,6 +3053,7 @@ impl DeliveryExecutor {
                 .sub_agents
                 .retire_child(
                     child_session_id,
+                    SessionOutcome::Cancelled,
                     &self.resources.spawn_tree,
                     &self.sessions,
                     &self.resources.proxy,
@@ -3131,6 +3132,7 @@ impl DeliveryExecutor {
             .sub_agents
             .retire_child(
                 child_session_id,
+                SessionOutcome::Cancelled,
                 &self.resources.spawn_tree,
                 &self.sessions,
                 &self.resources.proxy,

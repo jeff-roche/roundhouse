@@ -484,6 +484,42 @@ impl HeadlessSession {
         self.finish_teardown(registry, proxy).await;
     }
 
+    /// Replaces this session's reaper with one running a different
+    /// [`ReapAction`] (Phase 8, T19a Task 6).
+    ///
+    /// `DaemonSubAgentHost::create_child_session` is the one caller: every
+    /// session [`create_headless_session`] builds — sub-agent children
+    /// included — starts with a [`ReapAction::Teardown`] reaper, because
+    /// [`create_headless_session`] itself knows nothing about
+    /// `SubAgentSessions`. Once (and only once) that caller has recorded the
+    /// child in `SubAgentSessions`, it calls this to swap in a
+    /// [`ReapAction::RetireSubAgent`] reaper instead — never earlier, or the
+    /// replacement could observe `Closed` and reap before there is a
+    /// `SubAgentSessions` record for it to find (see
+    /// `SubAgentSessions::take_for_reap`'s own doc comment).
+    ///
+    /// Aborts the old reaper before spawning the new one, for the same
+    /// "exactly one teardown" reason [`Self::teardown`]'s doc comment gives:
+    /// leaving both running would let either observe `Closed` and race the
+    /// other to retire this session.
+    pub(crate) fn rewire_reaper(
+        &mut self,
+        registry: Arc<SessionRegistry>,
+        proxy: Arc<LoopbackProxy>,
+        action: ReapAction,
+    ) {
+        self.reaper.abort();
+        self.reaper = spawn_session_reaper(
+            registry,
+            self.session_id,
+            self.actor.clone(),
+            self.mcp_host.clone(),
+            proxy,
+            self.proxy_token.clone(),
+            action,
+        );
+    }
+
     /// Explicitly closes this session through the real, ordered
     /// [`SessionActor::close`] path — bounded by [`SESSION_CLOSE_TIMEOUT`],
     /// since `close`'s own doc comment is explicit that its `wait_idle` step
@@ -602,16 +638,21 @@ impl HeadlessSession {
 /// alongside it — ending only the session and leaving those behind would
 /// hold one of the parent's §7.7 fan-out slots forever.
 ///
-/// **`RetireSubAgent` has no production caller yet.** The real production
-/// call site for a sub-agent child's reaper is
-/// `DaemonSubAgentHost::create_child_session`, which today always builds its
-/// child's reaper with [`Self::Teardown`] (via [`create_headless_session`])
-/// — the same one a root session gets. Threading a real choice between the
-/// two through that call (and `create_headless_session`'s own signature) is
-/// a later task's job, not this one's; this variant, `spawn_session_reaper`'s
-/// dispatch on it, and `SubAgentSessions::take_for_reap` are covered directly
-/// by this module's own tests in the meantime.
-pub enum ReapAction {
+/// `DaemonSubAgentHost::create_child_session` (Phase 8, T19a Task 6) is this
+/// variant's production caller: every sub-agent child starts with
+/// [`Self::Teardown`] (via [`create_headless_session`], which knows nothing
+/// about `SubAgentSessions`) and is rewired to this one — via
+/// [`HeadlessSession::rewire_reaper`] — the moment, and never before, it is
+/// actually findable in [`SubAgentSessions`]
+/// (`SubAgentSessions::rewire_reaper_for_retirement`'s own doc comment
+/// explains why the ordering matters: a `RetireSubAgent` reaper that could
+/// observe `Closed` before that record exists would reap nothing and leak
+/// the session).
+///
+/// `pub(crate)` rather than `pub`: nothing outside this crate constructs a
+/// `ReapAction` at all, and every caller of `spawn_session_reaper` lives in
+/// `roundhouse-daemon`.
+pub(crate) enum ReapAction {
     /// Tear this session's own tracked resources down directly: the registry
     /// entry, the real isolation handle, any MCP host, and the egress-proxy
     /// token. What every headless root session's reaper does today.

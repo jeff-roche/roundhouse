@@ -31,12 +31,12 @@
 //!    (`spawn_session_reaper`'s `RetireSubAgent` reap action) that must do
 //!    so itself.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
 use roundhouse_bus::spawn_tree::SpawnTree;
 use roundhouse_bus::teams::TeamRegistry;
-use roundhouse_core::{SessionId, TeamId, Timestamp};
+use roundhouse_core::{SessionId, SessionOutcome, TeamId, Timestamp};
 use roundhouse_engine::agent_spawn::Budget;
 use roundhouse_engine::tools::agent_spawn_tool::{
     ChildSessionError, ChildSessionRequest, SubAgentHost,
@@ -45,7 +45,7 @@ use roundhouse_engine::SessionActor;
 use roundhouse_net::proxy::LoopbackProxy;
 
 use crate::session_bootstrap::DaemonResources;
-use crate::session_manager::{create_headless_session, HeadlessSession};
+use crate::session_manager::{create_headless_session, HeadlessSession, ReapAction};
 use crate::session_registry::SessionRegistry;
 
 /// The token ceiling a session starts with.
@@ -61,6 +61,15 @@ use crate::session_registry::SessionRegistry;
 /// real budget source exists.
 const UNMETERED_SESSION_BUDGET: u64 = u64::MAX;
 
+/// How far up a session's tracked parent chain
+/// [`DaemonSubAgentHost::ancestors_of`] is willing to walk before treating
+/// the chain as corrupted and giving up (Phase 8, T19a Task 6). One more
+/// than §7.7's own `MAX_DEPTH`: no LEGITIMATE tracked chain is ever longer
+/// than that, so reaching this bound is itself the signal that the tracked
+/// parent links have gone circular rather than proof that a real chain is
+/// simply long.
+const MAX_ANCESTOR_WALK: usize = roundhouse_bus::limits::MAX_DEPTH as usize + 1;
+
 /// One live sub-agent session, plus the facts needed to retire it and to
 /// remove its spawn-tree edge.
 pub struct LiveSubAgent {
@@ -73,9 +82,21 @@ pub struct LiveSubAgent {
 }
 
 impl LiveSubAgent {
-    /// Retires the child session: [`HeadlessSession::teardown`]'s exact
-    /// sequence (abort the reaper, deregister, tear down isolation, shut down
-    /// MCP, deregister the egress token).
+    /// Retires the child session: [`HeadlessSession::close_and_teardown`]'s
+    /// exact sequence (abort the reaper, durably close the child's own event
+    /// log with `outcome`, then deregister, tear down isolation, shut down
+    /// MCP, deregister the egress token) — Phase 8, T19a Task 6. Before this
+    /// task this called the durably-silent [`HeadlessSession::teardown`]
+    /// instead, which is exactly the gap
+    /// `workflow_host::reconcile_spawn_tree`'s own "KNOWN GAP" section
+    /// documented: nothing ever wrote the terminal event boot recovery's
+    /// filter was already looking for.
+    ///
+    /// A close failure (a durable store error, or `close_and_teardown`'s own
+    /// timeout) is already logged at error level by `close_and_teardown`
+    /// itself; this method has nothing further to add and does not
+    /// propagate it — a caller freeing a fan-out slot has no way to report
+    /// a per-child close failure onward either.
     ///
     /// Module-private, and it does not touch the spawn tree, because it is
     /// only half of ending a sub-agent — [`SubAgentSessions::retire_child`]
@@ -83,9 +104,17 @@ impl LiveSubAgent {
     /// caller is `DaemonSubAgentHost::create_child_session`'s compensation
     /// for a session that was built but never tracked: that child has no
     /// committed edge to drop (the engine still owns its reservation), so
-    /// teardown really is all of it there.
-    async fn retire(self, registry: &SessionRegistry, proxy: &LoopbackProxy) {
-        self.session.teardown(registry, proxy).await;
+    /// closing and tearing down really is all of it there.
+    async fn retire(
+        self,
+        outcome: SessionOutcome,
+        registry: &SessionRegistry,
+        proxy: &LoopbackProxy,
+    ) {
+        let _ = self
+            .session
+            .close_and_teardown(outcome, registry, proxy)
+            .await;
     }
 }
 
@@ -127,6 +156,53 @@ impl SubAgentSessions {
             .lock()
             .ok()
             .and_then(|guard| guard.get(&child).map(|record| record.parent))
+    }
+
+    /// Every live sub-agent tracked here whose recorded parent is `parent` —
+    /// the direct-child view of this module's `child -> parent` map, in the
+    /// other direction from [`Self::parent_of`] (Phase 8, T19a Task 6).
+    ///
+    /// A snapshot `Vec`, not a live view: `DaemonSubAgentHost::close_children`
+    /// retires each one in turn, and retiring a child awaits real teardown
+    /// work — holding `self.live`'s lock across that would block every other
+    /// caller of this map for as long as one child's isolation/MCP/proxy
+    /// teardown takes.
+    pub(crate) fn children_of(&self, parent: SessionId) -> Vec<SessionId> {
+        self.live
+            .lock()
+            .map(|guard| {
+                guard
+                    .iter()
+                    .filter(|(_, record)| record.parent == parent)
+                    .map(|(child, _)| *child)
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Rewires `child`'s reaper to [`ReapAction::RetireSubAgent`] — a no-op
+    /// if `child` is not (or is no longer) tracked here (Phase 8, T19a Task
+    /// 6). See [`crate::session_manager::HeadlessSession::rewire_reaper`]'s
+    /// own doc comment for why `DaemonSubAgentHost::create_child_session`
+    /// must call this only AFTER [`Self::insert`] has already recorded
+    /// `child`, never before.
+    pub(crate) fn rewire_reaper_for_retirement(
+        &self,
+        child: SessionId,
+        registry: Arc<SessionRegistry>,
+        proxy: Arc<LoopbackProxy>,
+        sub_agents: Arc<SubAgentSessions>,
+        tree: Arc<SpawnTree>,
+    ) {
+        if let Ok(mut guard) = self.live.lock() {
+            if let Some(record) = guard.get_mut(&child) {
+                record.session.rewire_reaper(
+                    registry,
+                    proxy,
+                    ReapAction::RetireSubAgent { sub_agents, tree },
+                );
+            }
+        }
     }
 
     /// Removes `child`'s record and hands back everything needed to retire it
@@ -191,27 +267,34 @@ impl SubAgentSessions {
     /// same child finds no record, returns `false`, and touches neither the
     /// tree nor the registry. So a duplicate termination signal cannot free a
     /// slot one of the child's live *siblings* is still holding, and cannot
-    /// run [`HeadlessSession::teardown`] twice for one session — which that
-    /// method's own doc comment explains is not safe, since
-    /// `Isolate::teardown` is not guaranteed idempotent.
+    /// run [`HeadlessSession::close_and_teardown`] twice for one session —
+    /// which would double-run [`SessionActor::close`](roundhouse_engine::SessionActor::close)
+    /// (harmless — its own `close_lock`/`AlreadyClosed` short-circuit makes a
+    /// second call a safe no-op) and, worse, double-run the real isolation
+    /// teardown behind it, which is not guaranteed idempotent.
     ///
-    /// # `SessionState::Closed` is not how this method's production caller decides to retire a child
+    /// # `outcome` and its terminal `SessionClosed`
     ///
-    /// `scheduler_driver::drive_workflow_agent_child` is this method's
-    /// production caller: it retires a workflow `agent:` step's child
-    /// unconditionally the moment driving it finishes — success, error,
-    /// timeout, or a vanished session alike — independent of whatever
-    /// `SessionState` the child's own actor is in. Nothing calls
-    /// [`SessionActor::close`](roundhouse_engine::SessionActor::close) on a
-    /// tracked child to reach `SessionState::Closed` that way.
-    /// `spawn_session_reaper`'s `RetireSubAgent` reap action (Phase 8, T19a
-    /// Task 5) exists for that OTHER way a child could end — its own actor
-    /// reaching `Closed` on its own — but nothing yet drives a tracked
-    /// child's actor there, so that reap action still has no production
-    /// caller of its own.
+    /// Phase 8, T19a Task 6: retiring a child now durably closes it — via
+    /// [`HeadlessSession::close_and_teardown`] and, underneath that,
+    /// [`SessionActor::close`](roundhouse_engine::SessionActor::close) —
+    /// with `outcome` as the terminator's own recorded outcome, before
+    /// tearing its real resources down. This is the terminal
+    /// `SessionClosed` `workflow_host::reconcile_spawn_tree`'s own boot-time
+    /// filter was already looking for and, before this task, nothing ever
+    /// wrote. Three production paths reach it: `scheduler_driver::
+    /// drive_workflow_agent_child`, which retires a workflow `agent:` step's
+    /// child unconditionally the moment driving it finishes — success,
+    /// error, timeout, or a vanished session alike; `DaemonSubAgentHost::
+    /// close_children`, which retires a closing session's own tracked
+    /// children as one step of that session's own close; and
+    /// `spawn_session_reaper`'s `RetireSubAgent` reap action, for a tracked
+    /// child whose own actor reaches `Closed` through neither of those two
+    /// (see `create_child_session`'s reaper wiring).
     pub async fn retire_child(
         &self,
         child: SessionId,
+        outcome: SessionOutcome,
         tree: &SpawnTree,
         registry: &SessionRegistry,
         proxy: &LoopbackProxy,
@@ -220,7 +303,7 @@ impl SubAgentSessions {
             return false;
         };
         tree.remove_child(record.parent, child);
-        record.retire(registry, proxy).await;
+        record.retire(outcome, registry, proxy).await;
         true
     }
 
@@ -437,12 +520,34 @@ impl SubAgentHost for DaemonSubAgentHost {
             session: headless,
         };
         if let Err(orphan) = self.resources.sub_agents.insert(req.child, record) {
-            orphan.retire(&self.registry, &self.resources.proxy).await;
+            orphan
+                .retire(
+                    SessionOutcome::Cancelled,
+                    &self.registry,
+                    &self.resources.proxy,
+                )
+                .await;
             return Err(ChildSessionError {
                 category: "sub_agent_registry_unavailable",
                 detail: "the live sub-agent map's lock is poisoned".to_string(),
             });
         }
+
+        // Only NOW — after `insert` above has made this child findable in
+        // `SubAgentSessions` — does it get a `RetireSubAgent` reaper instead
+        // of the plain `ReapAction::Teardown` one `create_headless_session`
+        // always starts a session with (Phase 8, T19a Task 6). Rewiring any
+        // earlier would let the replacement reaper observe `Closed` and
+        // reap before `SubAgentSessions::take_for_reap` has anything to
+        // find, silently doing nothing and leaking this child — see
+        // `HeadlessSession::rewire_reaper`'s own doc comment.
+        self.resources.sub_agents.rewire_reaper_for_retirement(
+            req.child,
+            Arc::clone(&self.registry),
+            Arc::clone(&self.resources.proxy),
+            Arc::clone(&self.resources.sub_agents),
+            Arc::clone(&self.resources.spawn_tree),
+        );
 
         // A sub-agent can spawn sub-agents of its own — at one greater depth,
         // and out of the budget it was actually given. Those two facts are
@@ -478,6 +583,65 @@ impl SubAgentHost for DaemonSubAgentHost {
         }
 
         Ok(())
+    }
+
+    /// Retires every session tracked in [`SubAgentSessions`] as a direct
+    /// child of `parent`, depth-first, with [`SessionOutcome::Cancelled`]
+    /// (Phase 8, T19a Task 6).
+    ///
+    /// Called by [`SessionActor::close`](roundhouse_engine::SessionActor::close)'s
+    /// own step 4, from INSIDE `parent`'s own close — so this must return
+    /// without deadlocking against it. It does, structurally: each child in
+    /// [`SubAgentSessions::children_of`] is retired via
+    /// [`SubAgentSessions::retire_child`], which durably closes that child's
+    /// own actor before this call returns — and closing a child that itself
+    /// has children recurses into THAT child's own registered host's
+    /// `close_children`, driven by that child's own `SessionActor::close`,
+    /// never by this method calling itself. This is what makes the walk
+    /// depth-first: a child's whole subtree is retired before its next
+    /// sibling is even looked at.
+    ///
+    /// # Ancestor/cycle guard
+    ///
+    /// Every genuinely retired child holds its own `close_lock`
+    /// (`SessionActor::close`'s own doc comment) for the life of its own
+    /// close — including everything this recursion does underneath it. The
+    /// spawn tree is expected to be acyclic, but if `parent` or any of its
+    /// own ancestors ever appeared among `children_of(parent)` — a
+    /// corrupted or cyclic tracked edge, never a legitimate spawn — retiring
+    /// it would try to re-enter that same session's `close_lock` from
+    /// inside the very call already holding it: a structural deadlock, not
+    /// merely a slow path. [`Self::ancestors_of`] computes exactly the set
+    /// of sessions whose `close_lock` is currently held on the stack above
+    /// this call (`parent` and everything above it in `SubAgentSessions`'
+    /// own tracked parent chain — precisely how this recursion descends in
+    /// the first place), bounded so a corrupted upward chain cannot hang
+    /// that walk either; any child found in that set is skipped and logged
+    /// rather than retired.
+    async fn close_children(&self, parent: SessionId) {
+        let ancestors = self.ancestors_of(parent);
+        for child in self.resources.sub_agents.children_of(parent) {
+            if ancestors.contains(&child) {
+                tracing::error!(
+                    parent = %parent,
+                    child = %child,
+                    "skipping a tracked sub-agent edge that would revisit an ancestor while \
+                     cascading a session close; the spawn tree is expected to be acyclic, so \
+                     this indicates corrupted tracked state rather than a real spawn chain"
+                );
+                continue;
+            }
+            self.resources
+                .sub_agents
+                .retire_child(
+                    child,
+                    SessionOutcome::Cancelled,
+                    &self.resources.spawn_tree,
+                    &self.registry,
+                    &self.resources.proxy,
+                )
+                .await;
+        }
     }
 }
 
@@ -530,6 +694,37 @@ impl DaemonSubAgentHost {
             category: "session_created_append_failed",
             detail: err.to_string(),
         })
+    }
+
+    /// `parent` and every session above it in [`SubAgentSessions`]' own
+    /// tracked `child -> parent` chain, walked upward via
+    /// [`SubAgentSessions::parent_of`] — see [`Self::close_children`]'s own
+    /// doc comment for why this set is exactly the sessions whose
+    /// `close_lock` is already held on the stack above a `close_children`
+    /// call for `parent`.
+    ///
+    /// Bounded by [`MAX_ANCESTOR_WALK`] so a corrupted, circular tracked
+    /// parent chain cannot hang this walk itself: `HashSet::insert` returning
+    /// `false` (the chain looped back on itself) or the bound being reached
+    /// both stop the walk immediately, at which point the set already
+    /// contains everything this call needs to refuse.
+    fn ancestors_of(&self, parent: SessionId) -> HashSet<SessionId> {
+        let mut ancestors = HashSet::new();
+        ancestors.insert(parent);
+        let mut current = parent;
+        for _ in 0..MAX_ANCESTOR_WALK {
+            match self.resources.sub_agents.parent_of(current) {
+                Some(next) if ancestors.insert(next) => current = next,
+                _ => return ancestors,
+            }
+        }
+        tracing::error!(
+            session_id = %parent,
+            "this session's tracked parent chain did not terminate within {MAX_ANCESTOR_WALK} \
+             hops while cascading a session close; treating the spawn tree as corrupted rather \
+             than walking it further"
+        );
+        ancestors
     }
 }
 
@@ -734,7 +929,13 @@ mod tests {
         assert!(
             resources
                 .sub_agents
-                .retire_child(child, &resources.spawn_tree, &registry, &resources.proxy)
+                .retire_child(
+                    child,
+                    SessionOutcome::Cancelled,
+                    &resources.spawn_tree,
+                    &registry,
+                    &resources.proxy
+                )
                 .await,
             "the live child must still be tracked"
         );
@@ -792,7 +993,13 @@ mod tests {
 
         resources
             .sub_agents
-            .retire_child(child, &resources.spawn_tree, &registry, &resources.proxy)
+            .retire_child(
+                child,
+                SessionOutcome::Cancelled,
+                &resources.spawn_tree,
+                &registry,
+                &resources.proxy,
+            )
             .await;
     }
 
@@ -833,7 +1040,13 @@ mod tests {
             assert!(
                 resources
                     .sub_agents
-                    .retire_child(child, &resources.spawn_tree, &registry, &resources.proxy)
+                    .retire_child(
+                        child,
+                        SessionOutcome::Cancelled,
+                        &resources.spawn_tree,
+                        &registry,
+                        &resources.proxy
+                    )
                     .await
             );
         }
@@ -929,7 +1142,13 @@ mod tests {
         for session in resources.spawn_tree.descendants(parent) {
             resources
                 .sub_agents
-                .retire_child(session, &resources.spawn_tree, &registry, &resources.proxy)
+                .retire_child(
+                    session,
+                    SessionOutcome::Cancelled,
+                    &resources.spawn_tree,
+                    &registry,
+                    &resources.proxy,
+                )
                 .await;
         }
     }
@@ -987,7 +1206,13 @@ mod tests {
         assert!(
             resources
                 .sub_agents
-                .retire_child(retired, &resources.spawn_tree, &registry, &resources.proxy)
+                .retire_child(
+                    retired,
+                    SessionOutcome::Cancelled,
+                    &resources.spawn_tree,
+                    &registry,
+                    &resources.proxy
+                )
                 .await,
             "retiring a live sub-agent reports that it found one"
         );
@@ -1020,7 +1245,13 @@ mod tests {
         assert!(
             !resources
                 .sub_agents
-                .retire_child(retired, &resources.spawn_tree, &registry, &resources.proxy)
+                .retire_child(
+                    retired,
+                    SessionOutcome::Cancelled,
+                    &resources.spawn_tree,
+                    &registry,
+                    &resources.proxy
+                )
                 .await,
             "a second retirement finds nothing to retire"
         );
@@ -1037,33 +1268,30 @@ mod tests {
         for session in resources.spawn_tree.descendants(parent) {
             resources
                 .sub_agents
-                .retire_child(session, &resources.spawn_tree, &registry, &resources.proxy)
+                .retire_child(
+                    session,
+                    SessionOutcome::Cancelled,
+                    &resources.spawn_tree,
+                    &registry,
+                    &resources.proxy,
+                )
                 .await;
         }
     }
 
-    /// **A KNOWN GAP, pinned so that closing it fails this test rather than
-    /// going unnoticed** (see `workflow_host::reconcile_spawn_tree`'s own
-    /// "KNOWN GAP" section for the full statement).
-    ///
-    /// `retire_child` ends a sub-agent child entirely in memory: it drops the
-    /// map entry, removes the `SpawnTree` edge and tears the session down, and
-    /// writes **nothing** durable. Nothing else in this workspace appends
-    /// `SessionClosed` or `SessionStateChanged { state: Closed, .. }` either.
-    /// So the only durable trace a retired sub-agent leaves is the
-    /// `SessionCreated` that spawned it — and boot recovery, reading that,
-    /// hands its parent's fan-out slot straight back to it.
-    ///
-    /// Both halves are asserted, and the second is what makes the first
-    /// falsifiable rather than a shrug: the boot-recovery filter for a closed
-    /// session **works**, over the same real store, the moment the event
-    /// exists. What is missing is a writer, not the filter.
+    /// **The gap `workflow_host::reconcile_spawn_tree`'s own "KNOWN GAP"
+    /// section named is closed (Phase 8, T19a Task 6): `retire_child` now
+    /// durably closes a retired child** (`HeadlessSession::close_and_teardown`
+    /// → `SessionActor::close` → `EventWriter::close_session`), so a single
+    /// restart's boot recovery already excludes it — no hand-written
+    /// `SessionClosed` needed, because retiring the child is what writes one
+    /// now.
     ///
     /// Every session here is real: spawned through the real `agent`
     /// dispatcher, retired through the real `retire_child`, and recovered by
     /// the real `reconcile_spawn_tree` over the real store this daemon wrote.
     #[tokio::test]
-    async fn a_retired_sub_agent_child_reappears_after_a_restart_known_gap() {
+    async fn a_retired_sub_agent_child_does_not_reappear_after_a_restart() {
         let dir = tempfile::tempdir().unwrap();
         let resources = resources_allowing_agent_spawns(dir.path()).await;
         let registry = Arc::new(SessionRegistry::new());
@@ -1091,7 +1319,13 @@ mod tests {
         assert!(
             resources
                 .sub_agents
-                .retire_child(retired, &resources.spawn_tree, &registry, &resources.proxy)
+                .retire_child(
+                    retired,
+                    SessionOutcome::Cancelled,
+                    &resources.spawn_tree,
+                    &registry,
+                    &resources.proxy
+                )
                 .await,
             "one child really is retired: in-memory, the slot is already back"
         );
@@ -1110,69 +1344,212 @@ mod tests {
             .await
             .unwrap();
 
-        let mut recovered = after_restart.descendants(parent);
-        recovered.sort_by_key(|session| session.to_string());
-        let mut both = vec![retired, live];
-        both.sort_by_key(|session| session.to_string());
         assert_eq!(
-            recovered, both,
-            "THE GAP: the retired child is back, indistinguishable from the live one, \
-             because its retirement was never written down anywhere"
-        );
-
-        // Now give the retired child the durable end signal this codebase can
-        // already express but never writes, and restart again.
-        let closed = runner().record_session_closed(
-            retired,
-            0,
-            now_ts(),
-            roundhouse_core::SessionOutcome::Completed,
-            1,
-        );
-        resources
-            .store
-            .pool
-            .get()
-            .await
-            .unwrap()
-            .interact(move |conn| {
-                let txn = roundhouse_store::begin_immediate(conn).unwrap();
-                roundhouse_store::append_event_in_transaction(
-                    &txn,
-                    &closed,
-                    &roundhouse_store::redact::Redactor::build(&[]),
-                )
-                .unwrap();
-                txn.commit().unwrap();
-            })
-            .await
-            .unwrap();
-
-        let after_second_restart = Arc::new(SpawnTree::new());
-        let tree = Arc::clone(&after_second_restart);
-        resources
-            .store
-            .pool
-            .get()
-            .await
-            .unwrap()
-            .interact(move |conn| crate::workflow_host::reconcile_spawn_tree(conn, &tree).unwrap())
-            .await
-            .unwrap();
-
-        assert_eq!(
-            after_second_restart.descendants(parent),
+            after_restart.descendants(parent),
             vec![live],
-            "with the end recorded, only the live child comes back — the filter is \
-             there, a writer for it is not"
+            "the retired child's own retire_child call already wrote its SessionClosed; only \
+             the still-live child comes back"
         );
 
-        for session in resources.spawn_tree.descendants(parent) {
+        resources
+            .sub_agents
+            .retire_child(
+                live,
+                SessionOutcome::Cancelled,
+                &resources.spawn_tree,
+                &registry,
+                &resources.proxy,
+            )
+            .await;
+    }
+
+    /// **Closing a parent cascades**: `SessionActor::close`'s own step 4
+    /// (`sub_agent_host().close_children`) reaches every real GRANDCHILD, not
+    /// just direct children, and frees every fan-out slot along the way
+    /// (Phase 8, T19a Task 6).
+    ///
+    /// This is a real two-level tree: `parent` spawns `child` through the
+    /// real `agent` dispatcher, and `child` — over the same policy that let
+    /// `parent` spawn it — spawns `grandchild` the same way. Closing only
+    /// `parent` directly (never `child`, never `grandchild`) must still
+    /// leave nothing tracked and no slot held anywhere in the tree, because
+    /// `DaemonSubAgentHost::close_children` retires `child` through the real
+    /// `retire_child` → `close_and_teardown` → `SessionActor::close` chain,
+    /// and CLOSING `child` is what recurses into `child`'s own registered
+    /// host to retire `grandchild` in turn — never a second, independent
+    /// walk over `resources.spawn_tree`.
+    #[tokio::test]
+    async fn closing_a_parent_closes_its_grandchildren_and_frees_their_slots() {
+        let dir = tempfile::tempdir().unwrap();
+        let resources = resources_allowing_agent_spawns(dir.path()).await;
+        let registry = Arc::new(SessionRegistry::new());
+        let actor = parent_actor(dir.path()).await;
+        let parent = actor.session_id();
+        wire_sub_agent_host(&actor, &resources, &registry);
+        let host = actor.sub_agent_host().unwrap();
+
+        dispatch_agent(
+            &actor,
+            actor.writer(),
+            runner(),
+            Some(&host),
+            &agent_args(),
+            TaskId::new(),
+        )
+        .await
+        .expect("the parent must be able to spawn its child");
+        let child = resources.spawn_tree.descendants(parent)[0];
+        let child_actor = registry
+            .actor(child)
+            .expect("the child must be a real, registered session");
+        let child_host = child_actor
+            .sub_agent_host()
+            .expect("a spawned child must itself be able to spawn");
+
+        dispatch_agent(
+            &child_actor,
+            child_actor.writer(),
+            runner(),
+            Some(&child_host),
+            &agent_args(),
+            TaskId::new(),
+        )
+        .await
+        .expect("the child must be able to spawn its own grandchild");
+        let grandchild = resources.spawn_tree.descendants(child)[0];
+        assert!(
+            registry.actor(grandchild).is_some(),
+            "sanity: the grandchild is a real, registered session before closing anything"
+        );
+
+        // Sanity: two tracked sub-agents, one slot held at each level.
+        assert_eq!(resources.sub_agents.len(), 2);
+        assert_eq!(resources.spawn_tree.direct_children(parent), 1);
+        assert_eq!(resources.spawn_tree.direct_children(child), 1);
+
+        actor
+            .close(roundhouse_core::SessionOutcome::Completed)
+            .await
+            .expect("closing a parent with no open tasks and no gate must succeed");
+
+        assert!(
+            resources.sub_agents.is_empty(),
+            "closing the parent must retire both the child and the grandchild"
+        );
+        assert_eq!(
+            resources.spawn_tree.direct_children(parent),
+            0,
+            "the child's slot on the parent must be freed"
+        );
+        assert_eq!(
+            resources.spawn_tree.direct_children(child),
+            0,
+            "the grandchild's slot on the child must be freed too, not just the parent's own"
+        );
+        assert!(
+            registry.actor(child).is_none(),
+            "the child's real session must be torn down"
+        );
+        assert!(
+            registry.actor(grandchild).is_none(),
+            "the grandchild's real session must be torn down, proving the cascade reached two \
+             levels deep, not just the parent's direct children"
+        );
+        assert_eq!(actor.state(), SessionState::Closed);
+    }
+
+    /// **A duplicate retirement signal for one child never frees a
+    /// still-live SIBLING's slot** (Phase 8, T19a Task 6) — the same
+    /// invariant `a_retired_sub_agent_frees_exactly_one_of_its_parents_fan_out_slots`
+    /// proves against `MAX_FAN_OUT` siblings, isolated here to two, and
+    /// against the new `outcome`-carrying `retire_child` signal a real
+    /// close now sends.
+    #[tokio::test]
+    async fn a_duplicate_retirement_signal_never_frees_a_still_live_siblings_slot() {
+        let dir = tempfile::tempdir().unwrap();
+        let resources = resources_allowing_agent_spawns(dir.path()).await;
+        let registry = Arc::new(SessionRegistry::new());
+        let actor = parent_actor(dir.path()).await;
+        let parent = actor.session_id();
+        wire_sub_agent_host(&actor, &resources, &registry);
+        let host = actor.sub_agent_host().unwrap();
+
+        for _ in 0..2 {
+            dispatch_agent(
+                &actor,
+                actor.writer(),
+                runner(),
+                Some(&host),
+                &agent_args(),
+                TaskId::new(),
+            )
+            .await
+            .expect("under the ceiling");
+        }
+        let children = resources.spawn_tree.descendants(parent);
+        assert_eq!(children.len(), 2);
+        let (signaled, sibling) = (children[0], children[1]);
+
+        assert!(
             resources
                 .sub_agents
-                .retire_child(session, &resources.spawn_tree, &registry, &resources.proxy)
-                .await;
-        }
+                .retire_child(
+                    signaled,
+                    SessionOutcome::Cancelled,
+                    &resources.spawn_tree,
+                    &registry,
+                    &resources.proxy
+                )
+                .await,
+            "the first signal finds a live child to retire"
+        );
+        assert_eq!(resources.spawn_tree.direct_children(parent), 1);
+        assert_eq!(
+            resources.sub_agents.parent_of(sibling),
+            Some(parent),
+            "the sibling must still be tracked, untouched"
+        );
+        assert!(registry.actor(sibling).is_some());
+
+        // The duplicate signal: the same child, retired again.
+        assert!(
+            !resources
+                .sub_agents
+                .retire_child(
+                    signaled,
+                    SessionOutcome::Cancelled,
+                    &resources.spawn_tree,
+                    &registry,
+                    &resources.proxy
+                )
+                .await,
+            "a duplicate signal for an already-retired child finds nothing to retire"
+        );
+        assert_eq!(
+            resources.spawn_tree.direct_children(parent),
+            1,
+            "the duplicate signal must not free the sibling's slot"
+        );
+        assert_eq!(
+            resources.sub_agents.parent_of(sibling),
+            Some(parent),
+            "the sibling must still be tracked after the duplicate signal"
+        );
+        assert!(
+            registry.actor(sibling).is_some(),
+            "the sibling's real session must still be alive after the duplicate signal"
+        );
+
+        resources
+            .sub_agents
+            .retire_child(
+                sibling,
+                SessionOutcome::Cancelled,
+                &resources.spawn_tree,
+                &registry,
+                &resources.proxy,
+            )
+            .await;
     }
 
     #[tokio::test]

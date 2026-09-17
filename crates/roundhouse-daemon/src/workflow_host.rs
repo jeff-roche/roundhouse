@@ -300,9 +300,10 @@ const SESSION_STATE_CHANGED_PAYLOAD_PREFIX: &str = r#"{"SessionStateChanged":"#;
 /// event when a sub-agent is retired — a change to the frozen event contract
 /// and its own task, not something this one invented on the side. The filter
 /// is written now so that the day such a writer lands, boot recovery is
-/// already correct; it is pinned meanwhile by
-/// `a_retired_sub_agent_child_reappears_after_a_restart_known_gap`
-/// (`sub_agent_host`), which will fail loudly when the gap closes.
+/// already correct; it was pinned meanwhile by
+/// `sub_agent_host`'s own restart test, renamed to
+/// `a_retired_sub_agent_child_does_not_reappear_after_a_restart` once a
+/// writer landed (Phase 8, T19a Task 6) and the gap closed.
 ///
 /// The workflow half has the mirror-image situation and it is *not* a gap in
 /// this function: `finish_run` really does write a terminal `workflow_run`

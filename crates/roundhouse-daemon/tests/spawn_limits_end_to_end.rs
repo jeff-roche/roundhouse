@@ -45,7 +45,9 @@ mod common;
 use std::sync::Arc;
 
 use roundhouse_bus::limits::MAX_FAN_OUT;
-use roundhouse_core::{JobId, OnDegrade, SessionId, SessionSpec, SessionState, Tier};
+use roundhouse_core::{
+    JobId, OnDegrade, SessionId, SessionOutcome, SessionSpec, SessionState, Tier,
+};
 use roundhouse_daemon::session_bootstrap::{DaemonResources, PolicyRuleSource};
 use roundhouse_daemon::session_registry::SessionRegistry;
 use roundhouse_daemon::sub_agent_host::wire_sub_agent_host;
@@ -264,7 +266,13 @@ async fn agent_and_call_children_share_one_parents_fan_out_ceiling() {
     assert!(
         resources
             .sub_agents
-            .retire_child(retired, &resources.spawn_tree, &registry, &resources.proxy)
+            .retire_child(
+                retired,
+                SessionOutcome::Cancelled,
+                &resources.spawn_tree,
+                &registry,
+                &resources.proxy
+            )
             .await,
         "retiring a live sub-agent reports that it found one"
     );
@@ -285,7 +293,13 @@ async fn agent_and_call_children_share_one_parents_fan_out_ceiling() {
     for session in resources.spawn_tree.descendants(parent) {
         resources
             .sub_agents
-            .retire_child(session, &resources.spawn_tree, &registry, &resources.proxy)
+            .retire_child(
+                session,
+                SessionOutcome::Cancelled,
+                &resources.spawn_tree,
+                &registry,
+                &resources.proxy,
+            )
             .await;
     }
 }
