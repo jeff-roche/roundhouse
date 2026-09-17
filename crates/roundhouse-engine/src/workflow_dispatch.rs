@@ -327,7 +327,7 @@ pub async fn dispatch_tool_for_workflow(
     // `record_workflow_task_failed` reaches for via `actor.writer()` on the
     // terminal-failure path. `writer.clone()` must stay a clone of THAT
     // writer for the Global Constraint to hold; see
-    // `run_isolated_shell_dispatch`'s doc comment on `completion` for the
+    // `run_isolated_shell_dispatch`'s comment on `completion` for the
     // full argument.
     let delta_sink = match &params {
         TaskParams::Shell(_) => Some(crate::tool_dispatch::ShellDeltaSink::new(

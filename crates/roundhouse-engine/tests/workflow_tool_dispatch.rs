@@ -573,8 +573,8 @@ async fn shell_tool_dispatch_streams_deltas_and_progress_before_its_terminal_eve
 /// shell step that has already produced (and streamed) real output, then
 /// has its `step_timeout` elapse mid-flight, must still have every
 /// delta/progress event it produced commit strictly before its own terminal
-/// event. See `run_isolated_shell_dispatch`'s own doc comment on
-/// `completion` for why this is guaranteed regardless of the race's outcome:
+/// event. See `run_isolated_shell_dispatch`'s own comment on `completion`
+/// for why this is guaranteed regardless of the race's outcome:
 /// `ShellDeltaSink` holds a `Clone` of the very same `EventWriter` that
 /// records the terminal event, so both enqueue onto the same writer-actor
 /// FIFO.
@@ -589,11 +589,19 @@ async fn shell_tool_dispatch_streams_deltas_and_progress_before_its_terminal_eve
 /// entering the window the Global Constraint is actually about (a
 /// `flush_stream` future dropped by the outer `select!` after its
 /// `send(...).await` returned but before the reply). The dispatched script
-/// now runs `yes` alone — genuinely unbounded output (`drain_to_end` keeps
-/// reading past `MAX_SHELL_OUTPUT_BYTES` to EOF, so it never stops on its
-/// own) — so the pump is still actively streaming, not idle, at the instant
-/// the real 300ms `step_timeout` (the parameter under test, not test-side
-/// synchronization) fires.
+/// now runs `yes` alone — the parameter under test is the real 300ms
+/// `step_timeout`, not test-side synchronization.
+///
+/// **Fix round 2, finding 1 residual:** it is the CHILD PROCESS that never
+/// stops on its own here, not the delta stream — `drain_to_end` still sends
+/// `ShellChunk::Gap(GapReason::Cap)` and drops the delta sender the instant
+/// `MAX_SHELL_OUTPUT_BYTES` is reached (measured: a `sh -c yes` child
+/// delivers that many bytes through 64 KiB reads in a few milliseconds), so
+/// past that cap the pump only outlives it for as long as its own backlog
+/// takes to flush (at most the shared 4 MiB in-flight budget, 64 KiB per
+/// flush). The 300ms timeout above may therefore land while the pump is
+/// still flushing that backlog rather than while a stream is actively
+/// arriving — either way, the ordering assertion below holds.
 #[tokio::test]
 async fn shell_tool_step_timeout_with_prior_output_commits_all_deltas_before_the_terminal_event() {
     let dir = TempDir::new().unwrap();
@@ -677,8 +685,8 @@ async fn shell_tool_step_timeout_with_prior_output_commits_all_deltas_before_the
         .collect();
     assert!(
         !delta_or_progress_seqs.is_empty(),
-        "the ~100 KiB of stdout written before the timeout must have produced at least one \
-         streamed delta/progress event — otherwise this ordering assertion is vacuous"
+        "the shell step's own stdout must have produced at least one streamed delta/progress \
+         event before the timeout — otherwise this ordering assertion is vacuous"
     );
     let max_delta_seq = *delta_or_progress_seqs.iter().max().unwrap();
     assert!(

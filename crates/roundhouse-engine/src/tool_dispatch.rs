@@ -1490,11 +1490,11 @@ async fn emit_gap_progress(
 /// BOTH channels have closed and received their final flush — "the pump
 /// returns after both drains drop their senders," per the brief.
 ///
-/// `sink: None` (every non-shell dispatch — the four filesystem kinds) makes
+/// `sink: None` (every filesystem dispatch, plus tests that opt out) makes
 /// this an immediate no-op — both `stdout_rx`/`stderr_rx` are `None` too in
 /// that case (see [`run_isolated_shell_dispatch`]), so a filesystem call's
-/// behavior (single buffered `ShellOutput`, no deltas) is unchanged. A shell
-/// dispatch passes `Some` (Phase 8 Task 19 lane B, Task 9's production
+/// behavior (single buffered `ShellOutput`, no deltas) is unchanged. Both
+/// production shell call sites pass `Some` (Phase 8 Task 19 lane B, Task 9's
 /// wiring).
 ///
 /// No `biased;` on the `select!` below (fix round 1, finding 11 — an

@@ -1519,7 +1519,7 @@ async fn dispatch_builtin(
     // actor.writer();`), the exact `EventWriter` this function's own
     // `TaskCompleted`/`TaskFailed` appends below use — `writer.clone()`
     // must stay a clone of THAT SAME writer for the Global Constraint to
-    // hold; see `run_isolated_shell_dispatch`'s doc comment on `completion`
+    // hold; see `run_isolated_shell_dispatch`'s comment on `completion`
     // for the full argument.
     let delta_sink = match &params {
         roundhouse_policy::TaskParams::Shell(_) => Some(crate::tool_dispatch::ShellDeltaSink::new(

@@ -1003,7 +1003,7 @@ async fn a_dispatched_shell_tasks_deltas_and_progress_land_between_started_and_i
 /// cancelled mid-flight by the owning session leaving `Running`, must still
 /// have every delta/progress event it produced commit strictly before its
 /// own terminal event — the Global Constraint holds even when the call
-/// never finishes on its own. See `run_isolated_shell_dispatch`'s own doc
+/// never finishes on its own. See `run_isolated_shell_dispatch`'s own
 /// comment on `completion` for why this is guaranteed: `ShellDeltaSink`
 /// holds a `Clone` of the very same `EventWriter` that records the terminal
 /// event, so both enqueue onto the same writer-actor FIFO.
@@ -1018,13 +1018,22 @@ async fn a_dispatched_shell_tasks_deltas_and_progress_land_between_started_and_i
 /// terminal event," true almost by construction, and never entering the
 /// window the Global Constraint is actually about (a `flush_stream` future
 /// dropped by the outer `select!` after its `send(...).await` returned but
-/// before the reply). The dispatched script now runs `yes` alone — genuinely
-/// unbounded output (`drain_to_end` keeps reading past `MAX_SHELL_OUTPUT_BYTES`
-/// to EOF, so it never stops on its own) — and the cancel is condition-driven:
-/// this test polls the store for the shell task's own first `TaskDelta`
-/// (proof the pump is actively streaming, not idle) and only then cancels,
-/// under an outer safety timeout rather than a fixed-duration guess. This
-/// way the cancel genuinely races a live, still-producing pump.
+/// before the reply). The dispatched script now runs `yes` alone, and the
+/// cancel is condition-driven: this test polls the store for the shell
+/// task's own first `TaskDelta` — proof the pump has actually started
+/// streaming — and only then cancels, under an outer safety timeout rather
+/// than a fixed-duration guess.
+///
+/// **Fix round 2, finding 1 residual:** it is the CHILD PROCESS that never
+/// stops on its own here, not the delta stream — `drain_to_end` still sends
+/// `ShellChunk::Gap(GapReason::Cap)` and drops the delta sender the instant
+/// `MAX_SHELL_OUTPUT_BYTES` is reached (measured: a `sh -c yes` child
+/// delivers that many bytes through 64 KiB reads in a few milliseconds), so
+/// past that cap the pump only outlives it for as long as its own backlog
+/// takes to flush (at most the shared 4 MiB in-flight budget, 64 KiB per
+/// flush). The cancel above may therefore land while the pump is still
+/// flushing that backlog rather than while a stream is actively arriving —
+/// either way, the ordering assertion below holds.
 #[tokio::test]
 async fn a_cancelled_shell_tasks_deltas_all_commit_before_its_terminal_event() {
     let (dir, script) = workspace_contained_script("#!/bin/sh\nyes\n", "cancel_me.sh");
@@ -1073,20 +1082,36 @@ async fn a_cancelled_shell_tasks_deltas_all_commit_before_its_terminal_event() {
     tokio::pin!(run);
 
     // Condition-driven: wait for real proof the pump is actively streaming
-    // (its own first committed `TaskDelta`) before cancelling — never a
-    // fixed sleep whose duration would otherwise decide whether the
+    // (the shell task's OWN first committed `TaskDelta` — fix round 2,
+    // finding N2: an earlier version matched any `TaskDelta` in the
+    // session, which is equivalent today but would break the instant a
+    // sibling infer-delta stream exists in this session, e.g. once
+    // `chat.rs`'s own delta streaming lands here too) before cancelling —
+    // never a fixed sleep whose duration would otherwise decide whether the
     // non-vacuity assertion below can pass. Wrapped in an outer safety
     // timeout so a genuine regression (no delta ever streamed) fails fast
     // with a clear message instead of hanging.
     let wait_for_first_delta_then_cancel = async {
+        let mut shell_task_id = None;
         loop {
             let reopened = open(&db_path).await.unwrap();
             let events = session_events(&reopened, session_id).await.unwrap();
-            if events
-                .iter()
-                .any(|e| matches!(&e.payload, EventPayload::TaskDelta { .. }))
-            {
-                break;
+            if shell_task_id.is_none() {
+                shell_task_id = events.iter().find_map(|e| match &e.payload {
+                    EventPayload::TaskCreated {
+                        kind: TaskKind::Shell,
+                        ..
+                    } => e.task_id,
+                    _ => None,
+                });
+            }
+            if let Some(task_id) = shell_task_id {
+                if events.iter().any(|e| {
+                    e.task_id == Some(task_id)
+                        && matches!(&e.payload, EventPayload::TaskDelta { .. })
+                }) {
+                    break;
+                }
             }
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
@@ -1157,8 +1182,8 @@ async fn a_cancelled_shell_tasks_deltas_all_commit_before_its_terminal_event() {
         .collect();
     assert!(
         !delta_or_progress_seqs.is_empty(),
-        "the ~100 KiB of stdout written before the cancel must have produced at least one \
-         streamed delta/progress event — otherwise this ordering assertion is vacuous"
+        "the shell task's own stdout must have produced at least one streamed delta/progress \
+         event before the cancel — otherwise this ordering assertion is vacuous"
     );
     let max_delta_seq = *delta_or_progress_seqs.iter().max().unwrap();
     assert!(
