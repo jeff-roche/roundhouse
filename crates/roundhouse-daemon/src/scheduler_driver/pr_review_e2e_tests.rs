@@ -775,9 +775,8 @@ const FAILING_PR: u32 = 3;
 /// finally reports is simply its last-run inner step's status — here
 /// `post`'s. (The walk stops early only on a failure, and only one the
 /// step's own `continue_on_error:` did not declare non-fatal.) Append an
-/// unconditional step after `post`
-/// and this item would report `completed` instead, with nothing else about
-/// the run changed.
+/// unconditional step after `post` and this item would report `completed`
+/// instead, with nothing else about the run changed.
 const SKIPPED_PR: u32 = 4;
 
 /// The PRs that reach a gate, in item order — everything that neither fails
@@ -1315,8 +1314,8 @@ async fn a_map_dispatches_nested_agent_shell_and_gate_steps_for_real_concurrentl
                  `fold_inner_step_outcome` overwrites the running outcome on every inner step \
                  the item walks — and this item's last step (`post`) is `when:`-false, even \
                  though its `review` and `tests` steps completed. If this ever fails because a \
-                 step was appended \
-                 after `post`, the fold is what changed, not `when:` evaluation: {item:?}"
+                 step was appended after `post`, the fold is what changed, not `when:` \
+                 evaluation: {item:?}"
             );
             assert_eq!(
                 gate_rows

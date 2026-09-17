@@ -995,14 +995,14 @@ pub(crate) fn nested_report_refusal(inner: &StepDef) -> Option<ItemOutcome> {
 /// success. Stopping here, on the first `Failed`, is what keeps the failure.
 ///
 /// **Unless the step declared `continue_on_error: true`** (Phase 8 Task 25.7
-/// Task 10). The flag is `continue_on_error`'s own field on the inner step,
+/// Task 10). The flag is the inner step's own `continue_on_error:` field,
 /// passed in by the caller because this function is otherwise not handed the
 /// step it is folding — which is exactly why the flag used to be *inert*
-/// inside a `map`, while `crate::exec::run_loop::Loop::run_phase` had honoured
-/// it for a top-level step since B12c. §8.9's own reference workflow turns on
-/// that reading: its `tests` step is a `tool: shell` with
-/// `continue_on_error: true`, so that a red test suite still lets the review
-/// be posted.
+/// inside a `map`, while `crate::exec::run_loop::Loop::run_phase` honours it
+/// for a top-level step at both of its own failure seams. §8.9's own
+/// reference workflow turns on that reading: its `tests` step is a
+/// `tool: shell` with `continue_on_error: true`, so that a red test suite
+/// still lets the review be posted.
 ///
 /// What the flag changes is **only** whether the walk stops. The assignment
 /// above it is unconditional, so `last` still reports "the last inner step

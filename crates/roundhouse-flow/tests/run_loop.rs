@@ -9185,3 +9185,66 @@ fn a_map_items_inner_step_is_not_visible_to_a_top_level_step_after_the_map() {
         after.output
     );
 }
+
+/// **A sibling's secret-derived output is readable *and* redacted** — the new
+/// binding carries the same per-step taint paths the run's own
+/// (`Loop::bind_steps_context`) does.
+///
+/// `source` emits a **field of** a JSON secret, so what the sibling relays is a
+/// derived leaf the whole-value needle backstop structurally cannot match —
+/// the same shape, and the same argument, as
+/// [`taint_crosses_a_step_boundary_inside_the_run_loop_too`] one level up. Only
+/// the taint path this binding declares can keep it out of the append-only
+/// log, so an item-scoped binding that bound values without their provenance
+/// would put the leaf in the log in cleartext and still pass every other test
+/// in this section.
+#[test]
+fn an_inner_step_relaying_a_secret_derived_siblings_leaf_keeps_it_out_of_the_log() {
+    let mut conn = open_test_db();
+    let (run_id, _) = seed_run(&mut conn);
+    let def = parse_workflow(&workflow(
+        "steps:\n\
+         \x20 - id: fan\n\
+         \x20   map:\n\
+         \x20     over: \"${{ [1] }}\"\n\
+         \x20     as: item\n\
+         \x20   steps:\n\
+         \x20     - id: source\n\
+         \x20       emit: { body: \"${{ json(secrets.TOKEN).inner }}\" }\n\
+         \x20     - id: relay\n\
+         \x20       emit: { relayed: \"${{ steps.source.output.body }}\" }\n",
+    ))
+    .expect("fixture parses");
+    let mut sink = RecordingSink::default();
+    let mut host = FakeHost::new();
+    let mut run_ctx = ctx(run_id);
+    run_ctx.secrets.insert(
+        "TOKEN".into(),
+        "{\"inner\":\"derived-leaf-not-a-needle\"}".into(),
+    );
+
+    let outcome = run_workflow(
+        &mut conn,
+        &def,
+        run_id,
+        &mut sink,
+        &mut host,
+        run_ctx,
+        at(10),
+        None,
+    )
+    .expect("the run drives");
+
+    let output = map_output(&outcome, "fan");
+    assert_eq!(
+        output["items"][0]["output"]["relayed"], "derived-leaf-not-a-needle",
+        "the relay must really have happened, unredacted for dispatch, or the log assertion \
+         below holds for the uninteresting reason: {output:?}"
+    );
+    let logged = format!("{:?}", sink.emitted);
+    assert!(
+        !logged.contains("derived-leaf-not-a-needle"),
+        "a derived leaf relayed between one item's inner steps must not reach the log in \
+         cleartext: {logged}"
+    );
+}

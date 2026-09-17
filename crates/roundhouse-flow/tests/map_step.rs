@@ -934,10 +934,10 @@ fn a_failed_inner_step_declaring_continue_on_error_does_not_abort_the_item() {
     // `a_failed_inner_step_declaring_continue_on_error_lets_its_item_go_on`).
     //
     // The contrast that makes this a real assertion rather than a tautology
-    // is two steps up:
-    // `on_item_error_collect_through_dispatch_map_step_gathers_a_non_final_inner_step_failure`
-    // drives the same shape *without* the flag, and there `after` never
-    // dispatches for any item.
+    // is this file's own
+    // `on_item_error_collect_through_dispatch_map_step_gathers_a_non_final_inner_step_failure`:
+    // the same shape *without* the flag, where `after` never dispatches for
+    // any item and every item's entry reads `failed`.
     let yaml = r#"
 name: map-inner-continue-on-error
 version: 1
