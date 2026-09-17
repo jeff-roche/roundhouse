@@ -513,9 +513,13 @@ async fn admit_task_refuses_while_cancelling_and_after_closed() {
     // succeeded nor that close() has reached the gated close_session call yet — only that
     // it has started cancel(). That's still enough for this test: calling `release()` below
     // is safe regardless of whether the gated call has reached `admit()` yet, because
-    // `CloseGate::release` only takes effect (and only calls `notify_one`) while a `hold()`
-    // is genuinely outstanding, and `notify_one` stores a permit for the next `notified()`
-    // call when nothing is waiting yet — so a `release()` that runs first is not lost.
+    // `CloseGate::hold` pairs a fresh `oneshot::Sender`/`Receiver` and `CloseGate::release`
+    // only ever needs the sender half — a `oneshot::Sender::send` succeeds and buffers its
+    // value the moment the receiver exists, whether or not that receiver has started
+    // awaiting it yet, so a `release()` that runs before `admit()` reaches its own `.await`
+    // is not lost (fix round 2, review finding N1 — see `CloseGate`'s own doc comment for
+    // why this is no longer built on `Notify`, whose stored-permit behavior did not have
+    // this guarantee across separate `hold()` generations).
     rx.changed().await.unwrap();
     assert_eq!(*rx.borrow(), SessionState::Cancelling);
 

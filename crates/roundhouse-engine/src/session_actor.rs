@@ -985,10 +985,15 @@ impl SessionActor {
     /// submitted post-`Closed` is admitted here, not refused with
     /// `AdmitError::SessionClosed`. `Closed` only became reachable at all
     /// once `SessionActor::close` existed; deliberately left as-is rather
-    /// than reordering this match (see `close`'s own doc comment for the
-    /// full rationale and what actually stops such a step from having any
-    /// effect: the store's own tail guard rejects the append with
-    /// `StoreError::SessionClosed` once it's attempted).
+    /// than reordering this match. In practice this is not silently
+    /// permissive: whatever that step then tries to append through `writer`
+    /// hits the store's own tail guard (`next_seq_or_reject_closed`) and
+    /// fails with `StoreError::SessionClosed`, since `EventWriter::
+    /// close_session` always appends `SessionClosed` as this session's
+    /// genuine terminator. A caller of a finally step after `close`
+    /// therefore sees a store error from the append, not a clean
+    /// `AdmitError` from admission — worth knowing when debugging a
+    /// "finally step ran anyway" report against an already-closed session.
     ///
     /// Task 25: once the `SessionState` gate above admits the task (an
     /// ordinary admit or a trusted finally-step bypass — this gate's own
@@ -1232,33 +1237,23 @@ impl SessionActor {
     ///
     /// Step 3's `wait_idle` has no timeout: if any [`WorkGuard`] held for
     /// this session is simply never dropped (a bug elsewhere, not just the
-    /// self-close deadlock described above — e.g. a task that panics inside
-    /// a `catch_unwind` boundary that swallows the panic without ever
-    /// dropping its guard), EVERY call to `close` — from any caller, not
-    /// only one calling from inside its own work — blocks on `wait_idle`
-    /// forever. `close` has no way to distinguish "still legitimately
-    /// working" from "a guard leaked" from the outside; a caller that needs
-    /// a bound on how long it will wait must apply its own
-    /// `tokio::time::timeout` around the whole `close` call.
+    /// self-close deadlock described above — e.g. a guard moved into a
+    /// future that is stored somewhere and never polled to completion, or
+    /// kept alive by an `Arc` cycle), EVERY call to `close` — from any
+    /// caller, not only one calling from inside its own work — blocks on
+    /// `wait_idle` forever. `close` has no way to distinguish "still
+    /// legitimately working" from "a guard leaked" from the outside; a
+    /// caller that needs a bound on how long it will wait must apply its
+    /// own `tokio::time::timeout` around the whole `close` call.
     ///
-    /// # `admit_task`'s finally-step bypass still applies after `Closed`, backstopped by the store
+    /// # `admit_task`'s finally-step bypass still applies after `Closed`
     ///
-    /// [`Self::admit_task`]'s `is_finally_step`/`Origin::System` bypass arm
-    /// is checked before its `SessionState` match reaches `Closed`, so a
-    /// trusted finally step submitted after this session has genuinely
-    /// closed is still ADMITTED by `admit_task` — a known, deliberate gap
-    /// this task leaves as-is rather than widening `admit_task`'s own
-    /// gating logic, which `Closed` only became a reachable state for at
-    /// all once this task existed. In practice this is not silently
-    /// permissive: whatever that step then tries to append
-    /// through `writer` hits the store's own tail guard
-    /// (`next_seq_or_reject_closed`) and fails with
-    /// `StoreError::SessionClosed`, since `EventWriter::close_session`
-    /// always appends `SessionClosed` as this session's genuine terminator.
-    /// A caller of a finally step after `close` therefore sees a store
-    /// error from the append, not a clean `AdmitError` from admission —
-    /// worth knowing when debugging a "finally step ran anyway" report
-    /// against an already-closed session.
+    /// See [`Self::admit_task`]'s own doc comment ("Known gap (Phase 8,
+    /// T19a Task 4)") for the full rationale: a trusted finally step
+    /// submitted after this session has genuinely closed is still admitted
+    /// by `admit_task`, but whatever it then tries to append is rejected by
+    /// the store's own tail guard once `close` has appended `SessionClosed`
+    /// as this session's terminator.
     ///
     /// # A session whose PERSISTED log is already closed, but whose in-memory state is not
     ///
@@ -1266,10 +1261,14 @@ impl SessionActor {
     /// session that THIS actor has itself already closed. A freshly
     /// constructed actor rehydrated over a session whose event log already
     /// ends in `SessionClosed` from a PRIOR process (or a prior, different
-    /// `SessionActor` instance) starts `state()`-wise as whatever
-    /// `initial_state` its constructor was given — never genuinely
-    /// `Closed` merely from that construction — so step 1 does not
-    /// short-circuit, and `cancel`'s own append (step 2) instead fails with
+    /// `SessionActor` instance) does not automatically start `state()`-wise
+    /// as `Closed` — construction never DERIVES that from the persisted
+    /// log, it only reflects whatever `initial_state` a caller explicitly
+    /// passed in (a caller that already knows the log ends in
+    /// `SessionClosed` can and should pass `SessionState::Closed`, which
+    /// correctly short-circuits here). A caller that instead rehydrates
+    /// with some other `initial_state` skips step 1's short-circuit, and
+    /// `cancel`'s own append (step 2) instead fails with
     /// `Err(StoreError::SessionClosed)` from the exact same store tail
     /// guard described above. A caller sees this as `close` returning
     /// `Err`, indistinguishable from a genuine store failure — it CANNOT

@@ -17,7 +17,7 @@
 use std::sync::Arc;
 
 use arc_swap::ArcSwap;
-use tokio::sync::{mpsc, Mutex, Notify};
+use tokio::sync::{mpsc, oneshot, Mutex};
 
 use crate::pool::StorePool;
 use crate::redact::Redactor;
@@ -42,19 +42,26 @@ use super::{append_batch, append_one, close_session, EventWriter, WriteCmd};
 /// affected.
 pub struct CloseGate {
     state: Mutex<GateState>,
-    notify: Notify,
+    /// The sender paired with whichever [`oneshot::Receiver`] the CURRENT `GateState::
+    /// Waiting` carries, if any. Deliberately a separate `Mutex` from `state`: `admit` takes
+    /// the receiver out of `state` (and flips `state` back to `Open`) before it has actually
+    /// been fired, so `release` — which only ever needs `tx`, never `state` — must still be
+    /// able to reach it after that happens. See [`Self::hold`]/[`Self::release`] for why this
+    /// generational replacement, rather than `Notify`, is what closes the fix round 2
+    /// (review finding N1) hazard.
+    tx: Mutex<Option<oneshot::Sender<()>>>,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
 enum GateState {
     /// Let `close_session` run immediately, against the real store.
     Open,
     /// Fail the next `close_session` call with a synthesized error, without ever touching
     /// the store.
     FailNext,
-    /// Block the next `close_session` call until `release()` is called, then let it run
-    /// against the real store.
-    Waiting,
+    /// Block the next `close_session` call until [`CloseGate::release`] fires this
+    /// receiver's paired sender (held in `CloseGate::tx`), then let it run against the real
+    /// store.
+    Waiting(oneshot::Receiver<()>),
 }
 
 impl CloseGate {
@@ -63,7 +70,7 @@ impl CloseGate {
     pub fn new() -> Arc<Self> {
         Arc::new(Self {
             state: Mutex::new(GateState::Open),
-            notify: Notify::new(),
+            tx: Mutex::new(None),
         })
     }
 
@@ -71,54 +78,47 @@ impl CloseGate {
     /// without the store or its tail guard ever being consulted.
     pub async fn fail_next(&self) {
         *self.state.lock().await = GateState::FailNext;
+        *self.tx.lock().await = None;
     }
 
     /// Blocks the next `close_session` call until [`Self::release`] is called, then lets it
     /// proceed against the real store.
+    ///
+    /// Creates a brand-new `oneshot` pair every call, unconditionally overwriting both
+    /// `state` (the receiver half) and `tx` (the sender half) — dropping whatever pair, if
+    /// any, was already there. That unconditional replacement is what makes re-arming safe:
+    /// a channel with nothing sent to it carries nothing across the swap, so a later
+    /// `admit()` can only ever be satisfied by a `release()` that runs after THIS `hold()`,
+    /// never by one left over from an earlier generation.
     pub async fn hold(&self) {
-        *self.state.lock().await = GateState::Waiting;
+        let (tx, rx) = oneshot::channel();
+        *self.tx.lock().await = Some(tx);
+        *self.state.lock().await = GateState::Waiting(rx);
     }
 
     /// Releases a `close_session` call currently blocked by [`Self::hold`].
     ///
-    /// A no-op unless a `hold()` is genuinely still outstanding (`*guard ==
-    /// GateState::Waiting`) at the moment this runs: the state transition
-    /// from `Waiting` to `Open` happens HERE, under the same lock `admit`
-    /// reads, before `notify_one` is ever called — never inside `admit`
-    /// itself. Fix round 1 (review finding M2): an earlier version left the
-    /// `Waiting` -> `Open` transition to `admit`'s own Waiting arm, which
-    /// meant a `release()` called with no `hold()` outstanding still called
-    /// `notify_one` unconditionally — and `Notify::notify_one` stores a
-    /// permit for the next `notified().await` when nobody is waiting yet, so
-    /// that stray permit would silently satisfy the NEXT, unrelated
-    /// `hold()`/`admit()` pair instead of making it actually wait. Gating the
-    /// notification on "is a hold genuinely active right now" closes that:
-    /// a `release()` with nothing to release touches neither `*guard` nor
-    /// `notify`, so no permit is ever manufactured for a future hold.
+    /// Fix round 2 (review finding N1): the earlier `Notify`-based version gated
+    /// `notify_one` on "is a hold genuinely active right now," but `Notify::notify_one`
+    /// still stores a permit for the next `notified().await` even when that check passes
+    /// only because nothing is *currently* waiting — so a `release()` racing ahead of the
+    /// `close_session` call it was meant for could leave a stray permit that a LATER,
+    /// unrelated `hold()`/`admit()` pair would consume instead of genuinely waiting. A
+    /// `oneshot::Sender` has no such stored-permit behavior: `send` either reaches the one
+    /// receiver it was created with, or the receiver was already dropped and `send` is a
+    /// true no-op — there is no shared "permit" slot for an unrelated future receiver to
+    /// observe. Combined with [`Self::hold`] replacing `tx` wholesale on every call, a
+    /// `release()` can only ever wake the `hold()` it is paired with (or nothing, if that
+    /// pairing has already been consumed or superseded).
     ///
-    /// Uses `Notify::notify_one`, not `notify_waiters`, for the same reason
-    /// as before this fix round: a caller has no way to know whether the
-    /// gated `close_session` call has already reached its own
-    /// `notified().await` by the time `release` runs (in practice it
-    /// usually hasn't — a caller typically observes some OTHER signal, like
-    /// this session's state watch flipping to `Cancelling`, and calls
-    /// `release` right after, well before the gated task's own executor
-    /// turn). `notify_waiters` only wakes tasks ALREADY waiting and stores
-    /// nothing for a future one, so calling it before that turn would be a
-    /// genuine lost wakeup — the held call would then never wake.
-    /// `notify_one` stores a permit for exactly the next `notified()` call
-    /// when nothing is waiting yet, which is what makes `release` safe to
-    /// call before, concurrently with, or after the corresponding
-    /// `hold`ing call actually starts waiting. This gate supports exactly
-    /// one outstanding `hold`/`release` pair at a time — a second `hold()`
-    /// racing an unconsumed first one is not a case any current caller
-    /// needs, and isn't specially handled here.
+    /// Locks `tx` — not `state` — so this works whether `admit` has already taken the
+    /// receiver out of `state` (the common case: `admit` starts waiting first, `release`
+    /// runs later) or not yet (a `release` racing ahead of `admit` still finds `tx` in
+    /// place and the eventual `admit` still recovers the same paired receiver from `state`
+    /// unless a later `hold()` supersedes it first).
     pub async fn release(&self) {
-        let mut guard = self.state.lock().await;
-        if *guard == GateState::Waiting {
-            *guard = GateState::Open;
-            drop(guard);
-            self.notify.notify_one();
+        if let Some(tx) = self.tx.lock().await.take() {
+            let _ = tx.send(());
         }
     }
 
@@ -127,7 +127,7 @@ impl CloseGate {
     /// caller to run the real close now.
     async fn admit(&self) -> Result<(), StoreError> {
         let mut guard = self.state.lock().await;
-        match *guard {
+        match &mut *guard {
             GateState::Open => Ok(()),
             GateState::FailNext => {
                 *guard = GateState::Open;
@@ -135,13 +135,19 @@ impl CloseGate {
                     "close_session failed: CloseGate injected a test failure".to_string(),
                 ))
             }
-            GateState::Waiting => {
-                // Drop the lock and wait — `release()` (not this method) is what
-                // transitions `*guard` back to `Open`, and it does so BEFORE calling
-                // `notify_one`, so by the time this `notified().await` resolves the
-                // state is already consistent for whoever reads it next.
+            GateState::Waiting(_) => {
+                // Take the receiver and flip back to `Open` before waiting on it: `tx`
+                // lives in its own `Mutex`, independent of `state`, so `release` can still
+                // reach and fire the paired sender no matter what `state` has moved on to
+                // by the time it runs.
+                let GateState::Waiting(rx) = std::mem::replace(&mut *guard, GateState::Open) else {
+                    unreachable!("matched Waiting above");
+                };
                 drop(guard);
-                self.notify.notified().await;
+                // A dropped sender (e.g. superseded by a later `hold()` before this one was
+                // ever released) closes the channel rather than hanging forever — either
+                // way it is safe to proceed once this resolves.
+                let _ = rx.await;
                 Ok(())
             }
         }
