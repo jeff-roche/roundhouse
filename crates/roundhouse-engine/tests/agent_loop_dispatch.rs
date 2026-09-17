@@ -10,7 +10,6 @@
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 
-use futures::stream;
 use roundhouse_core::{
     EventPayload, OnDegrade, SessionId, SessionSpec, SessionState, TaskId, TaskKind, Tier,
 };
@@ -324,7 +323,7 @@ impl Provider for ScriptedToolCallProvider {
                     StreamEvent::MessageStop,
                 ]
             };
-            Ok(ChatStream(Box::pin(stream::iter(events))))
+            Ok(ChatStream::from_events(events))
         })
     }
     fn count_tokens<'a>(
@@ -387,7 +386,7 @@ impl Provider for AlwaysToolUseProvider {
                 StreamEvent::BlockStop { index: 0 },
                 StreamEvent::MessageStop,
             ];
-            Ok(ChatStream(Box::pin(stream::iter(events))))
+            Ok(ChatStream::from_events(events))
         })
     }
     fn count_tokens<'a>(
@@ -1628,7 +1627,7 @@ impl Provider for ManyToolUsesInOneTurnProvider {
                 events.push(StreamEvent::BlockStop { index: i as u32 });
             }
             events.push(StreamEvent::MessageStop);
-            Ok(ChatStream(Box::pin(stream::iter(events))))
+            Ok(ChatStream::from_events(events))
         })
     }
     fn count_tokens<'a>(

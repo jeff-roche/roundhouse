@@ -192,7 +192,7 @@ impl Provider for AnthropicMessagesProvider {
             let events = decode_anthropic_messages_stream(response.body)
                 .await
                 .map_err(stream_failure_to_provider_error)?;
-            let stream = ChatStream(Box::pin(futures::stream::iter(events)));
+            let stream = ChatStream::from_events(events);
             Ok(stream)
         })
     }

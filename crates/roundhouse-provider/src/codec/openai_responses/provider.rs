@@ -335,7 +335,7 @@ impl Provider for OpenAiResponsesProvider {
                         &headers,
                     ),
                 })?;
-            let stream = ChatStream(Box::pin(futures::stream::iter(events)));
+            let stream = ChatStream::from_events(events);
             Ok(stream)
         })
     }

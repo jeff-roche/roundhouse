@@ -284,7 +284,7 @@ impl Provider for AnthropicMessagesProfileProvider {
             let events = decode_anthropic_messages_stream(response.body)
                 .await
                 .map_err(stream_failure_to_provider_error)?;
-            Ok(ChatStream(Box::pin(futures::stream::iter(events))))
+            Ok(ChatStream::from_events(events))
         })
     }
 

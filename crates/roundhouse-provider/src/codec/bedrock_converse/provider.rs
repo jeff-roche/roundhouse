@@ -187,7 +187,7 @@ impl Provider for BedrockConverseProvider {
                      EventWriter channel yet to persist this as EventPayload::Loss"
                 );
             }
-            let stream = ChatStream(Box::pin(futures::stream::iter(events)));
+            let stream = ChatStream::from_events(events);
             Ok(stream)
         })
     }

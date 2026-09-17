@@ -41,7 +41,24 @@ pub async fn fold_stream_to_blocks(mut stream: ChatStream) -> Vec<ContentBlock> 
     let mut order: Vec<u32> = Vec::new();
     let mut kinds: BTreeMap<u32, BlockKind> = BTreeMap::new();
 
-    while let Some(event) = stream.next().await {
+    while let Some(item) = stream.next().await {
+        let event = match item {
+            Ok(event) => event,
+            Err(err) => {
+                // T19b Task 1: `ChatStream` items are now fallible. Task 4
+                // changes this function's own return type to `Result` so a
+                // mid-stream error can be reported to its caller; for now,
+                // keep today's behavior (fold what's been seen so far) but
+                // stop folding and name the error rather than silently
+                // treating the stream as having ended cleanly.
+                tracing::warn!(
+                    error = %err,
+                    "stream item error while folding to content blocks; \
+                     stopping with the content folded so far"
+                );
+                break;
+            }
+        };
         match event {
             StreamEvent::BlockStart { index, kind } => {
                 order.push(index);

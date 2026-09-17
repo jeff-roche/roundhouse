@@ -94,10 +94,10 @@ impl Provider for FabricatingSubject {
     ) -> BoxFut<'a, Result<ChatStream, ProviderError>> {
         Box::pin(async move {
             let _ = collect_body(ctx).await;
-            Ok(ChatStream(Box::pin(futures::stream::iter(vec![
+            Ok(ChatStream::from_events(vec![
                 text_block_start(),
                 StreamEvent::MessageStop,
-            ]))))
+            ]))
         })
     }
 
@@ -137,7 +137,7 @@ impl Provider for AbsenceEncodingSubject {
             if saw_marker(&bytes) {
                 events.push(StreamEvent::MessageStop);
             }
-            Ok(ChatStream(Box::pin(futures::stream::iter(events))))
+            Ok(ChatStream::from_events(events))
         })
     }
 
@@ -174,10 +174,10 @@ impl Provider for StrictEncodingSubject {
         Box::pin(async move {
             let bytes = collect_body(ctx).await;
             if saw_marker(&bytes) {
-                Ok(ChatStream(Box::pin(futures::stream::iter(vec![
+                Ok(ChatStream::from_events(vec![
                     text_block_start(),
                     StreamEvent::MessageStop,
-                ]))))
+                ]))
             } else {
                 Err(ProviderError::StreamInterrupted {
                     partial: String::new(),

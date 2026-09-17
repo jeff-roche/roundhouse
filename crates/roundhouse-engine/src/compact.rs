@@ -133,12 +133,14 @@ fn build_summarization_request(
 ///
 /// Returns `Ok(summary)` only if `MessageStop` was observed and the folded text
 /// is non-empty. Otherwise returns `Err(ProviderError::StreamInterrupted)` with
-/// the partial text seen so far.
+/// the partial text seen so far — including when the stream itself reports a
+/// mid-stream `Err` item (T19b Task 1), which this function propagates
+/// directly via `?` rather than treating as a silent truncation.
 async fn fold_stream_text(stream: &mut ChatStream) -> Result<String, ProviderError> {
     let mut text = String::new();
     let mut saw_message_stop = false;
-    while let Some(event) = stream.0.next().await {
-        match event {
+    while let Some(item) = stream.0.next().await {
+        match item? {
             StreamEvent::BlockDelta {
                 delta: BlockDelta::Text(t),
                 ..

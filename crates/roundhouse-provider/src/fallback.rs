@@ -226,39 +226,51 @@ fn finalize(total_known_pico_usd: u64, any_cost_unknown: bool) -> Cost {
 
 /// Consume a `ChatStream`, folding the final `UsageDelta` values into a
 /// `Usage`, and return both the folded usage and a fresh `ChatStream` that
-/// replays the buffered events.
+/// replays the buffered items.
+///
+/// A mid-stream `Err` item (T19b Task 1: `ChatStream` items are now
+/// `Result<StreamEvent, ProviderError>`) stops consumption immediately —
+/// there is nothing more to usefully drain past a stream that has already
+/// reported its own failure — and the error is buffered as the replay's
+/// final item, so a caller folding the replayed stream sees the same error
+/// the original stream reported rather than a truncated-looking success.
 async fn consume_and_replay(stream: ChatStream) -> (Usage, ChatStream) {
     let mut usage = Usage::default();
     let mut buffered = Vec::new();
 
     let mut stream = stream;
-    while let Some(event) = stream.next().await {
-        match event {
-            StreamEvent::UsageDelta {
-                input_tokens,
-                output_tokens,
-                cache_read_tokens,
-            } => {
-                if let Some(v) = input_tokens {
-                    usage.input_tokens = v;
-                }
-                if let Some(v) = output_tokens {
-                    usage.output_tokens = v;
-                }
-                if let Some(v) = cache_read_tokens {
-                    usage.cache_read_tokens = v;
-                }
-            }
-            StreamEvent::MessageStop => {
-                buffered.push(event);
+    while let Some(item) = stream.next().await {
+        let event = match item {
+            Ok(event) => event,
+            Err(err) => {
+                buffered.push(Err(err));
                 break;
             }
-            _ => {}
+        };
+        if let StreamEvent::UsageDelta {
+            input_tokens,
+            output_tokens,
+            cache_read_tokens,
+        } = &event
+        {
+            if let Some(v) = input_tokens {
+                usage.input_tokens = *v;
+            }
+            if let Some(v) = output_tokens {
+                usage.output_tokens = *v;
+            }
+            if let Some(v) = cache_read_tokens {
+                usage.cache_read_tokens = *v;
+            }
         }
-        buffered.push(event);
+        let is_stop = matches!(event, StreamEvent::MessageStop);
+        buffered.push(Ok(event));
+        if is_stop {
+            break;
+        }
     }
 
-    (usage, ChatStream(Box::pin(futures::stream::iter(buffered))))
+    (usage, ChatStream::from_results(buffered))
 }
 
 fn now_ts() -> Timestamp {

@@ -19,7 +19,6 @@
 
 use std::sync::{Arc, Mutex};
 
-use futures::stream;
 use roundhouse_bus::limits::{MAX_DEPTH, MAX_FAN_OUT};
 use roundhouse_bus::spawn_tree::SpawnTree;
 use roundhouse_bus::teams::TeamRegistry;
@@ -184,7 +183,7 @@ impl Provider for ScriptedAgentCall {
                     StreamEvent::MessageStop,
                 ]
             };
-            Ok(ChatStream(Box::pin(stream::iter(events))))
+            Ok(ChatStream::from_events(events))
         })
     }
     fn count_tokens<'a>(

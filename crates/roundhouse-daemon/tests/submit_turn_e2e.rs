@@ -34,7 +34,6 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use futures::stream;
 use roundhouse_core::{EventPayload, SessionId, TaskKind};
 use roundhouse_daemon::session_bootstrap::{
     no_policy_rules, policy_rules_from_files, PolicyRuleSource,
@@ -123,7 +122,7 @@ impl Provider for ScriptedToolCallProvider {
                     StreamEvent::MessageStop,
                 ]
             };
-            Ok(ChatStream(Box::pin(stream::iter(events))))
+            Ok(ChatStream::from_events(events))
         })
     }
     fn count_tokens<'a>(
@@ -207,7 +206,7 @@ impl Provider for SequencedToolCallProvider {
                     StreamEvent::MessageStop,
                 ],
             };
-            Ok(ChatStream(Box::pin(stream::iter(events))))
+            Ok(ChatStream::from_events(events))
         })
     }
 
@@ -1096,7 +1095,7 @@ impl Provider for ScriptedTextOnlyProvider {
                 StreamEvent::BlockStop { index: 0 },
                 StreamEvent::MessageStop,
             ];
-            Ok(ChatStream(Box::pin(stream::iter(events))))
+            Ok(ChatStream::from_events(events))
         })
     }
     fn count_tokens<'a>(

@@ -907,9 +907,7 @@ impl roundhouse_provider::Provider for RendezvousReviewProvider {
                 roundhouse_provider::StreamEvent::BlockStop { index: 0 },
                 roundhouse_provider::StreamEvent::MessageStop,
             ];
-            Ok(roundhouse_provider::ChatStream(Box::pin(
-                futures::stream::iter(events),
-            )))
+            Ok(roundhouse_provider::ChatStream::from_events(events))
         })
     }
 

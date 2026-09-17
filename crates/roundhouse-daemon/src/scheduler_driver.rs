@@ -7345,9 +7345,7 @@ mod child_run_tests {
                     roundhouse_provider::StreamEvent::BlockStop { index: 0 },
                     roundhouse_provider::StreamEvent::MessageStop,
                 ];
-                Ok(roundhouse_provider::ChatStream(Box::pin(
-                    futures::stream::iter(events),
-                )))
+                Ok(roundhouse_provider::ChatStream::from_events(events))
             })
         }
         fn count_tokens<'a>(
@@ -7514,9 +7512,7 @@ mod child_run_tests {
                     events.push(roundhouse_provider::StreamEvent::BlockStop { index: i });
                 }
                 events.push(roundhouse_provider::StreamEvent::MessageStop);
-                Ok(roundhouse_provider::ChatStream(Box::pin(
-                    futures::stream::iter(events),
-                )))
+                Ok(roundhouse_provider::ChatStream::from_events(events))
             })
         }
         fn count_tokens<'a>(

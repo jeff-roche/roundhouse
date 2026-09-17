@@ -109,7 +109,8 @@ async fn stream_chat_encodes_the_request_and_decodes_a_real_shaped_sse_response(
     let mut stream = provider.stream_chat(&sample_request(), &ctx).await.unwrap();
 
     let mut text = String::new();
-    while let Some(event) = stream.next().await {
+    while let Some(item) = stream.next().await {
+        let event = item.expect("this cassette decodes without a mid-stream error");
         if let StreamEvent::BlockDelta {
             delta: BlockDelta::Text(t),
             ..

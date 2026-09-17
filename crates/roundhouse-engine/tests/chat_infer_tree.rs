@@ -1,4 +1,3 @@
-use futures::stream;
 use roundhouse_core::{SessionId, TaskId, TaskRunner};
 use roundhouse_engine::run_chat_turn;
 use roundhouse_provider::{
@@ -46,7 +45,7 @@ impl Provider for FakeProvider {
                 StreamEvent::BlockStop { index: 0 },
                 StreamEvent::MessageStop,
             ];
-            let s = ChatStream(Box::pin(stream::iter(events)));
+            let s = ChatStream::from_events(events);
             Ok(s)
         })
     }
@@ -254,7 +253,7 @@ async fn thinking_deltas_fold_to_a_thinking_block_with_signature_intact() {
         StreamEvent::BlockStop { index: 0 },
         StreamEvent::MessageStop,
     ];
-    let stream = ChatStream(Box::pin(stream::iter(events)));
+    let stream = ChatStream::from_events(events);
 
     let blocks = fold_stream_to_blocks(stream).await;
 
@@ -274,5 +273,55 @@ async fn thinking_deltas_fold_to_a_thinking_block_with_signature_intact() {
             assert!(!redacted);
         }
         other => panic!("expected ContentBlock::Thinking, got {other:?}"),
+    }
+}
+
+/// T19b Task 1: `ChatStream` items are `Result<StreamEvent, ProviderError>`.
+/// `fold_stream_to_blocks` keeps its `Vec<ContentBlock>` return type in this
+/// task (a later task changes it to `Result`) — on a mid-stream `Err` item it
+/// must stop folding and return whatever was folded so far, not panic or
+/// silently keep polling past the error.
+#[tokio::test]
+async fn fold_stream_to_blocks_stops_at_a_mid_stream_error_and_keeps_the_partial_fold() {
+    use roundhouse_engine::fold_stream_to_blocks;
+
+    let results = vec![
+        Ok(StreamEvent::BlockStart {
+            index: 0,
+            kind: BlockKind::Text,
+        }),
+        Ok(StreamEvent::BlockDelta {
+            index: 0,
+            delta: BlockDelta::Text("partial".into()),
+        }),
+        Ok(StreamEvent::BlockStop { index: 0 }),
+        Err(ProviderError::StreamInterrupted {
+            partial: "partial".into(),
+        }),
+        // Never reached: proves the fold stopped at the error above rather
+        // than continuing to poll the stream.
+        Ok(StreamEvent::BlockStart {
+            index: 1,
+            kind: BlockKind::Text,
+        }),
+        Ok(StreamEvent::BlockDelta {
+            index: 1,
+            delta: BlockDelta::Text("unreachable".into()),
+        }),
+        Ok(StreamEvent::BlockStop { index: 1 }),
+        Ok(StreamEvent::MessageStop),
+    ];
+    let stream = ChatStream::from_results(results);
+
+    let blocks = fold_stream_to_blocks(stream).await;
+
+    assert_eq!(
+        blocks.len(),
+        1,
+        "only the block sealed before the error must be returned"
+    );
+    match &blocks[0] {
+        ContentBlock::Text { text, .. } => assert_eq!(text, "partial"),
+        other => panic!("expected ContentBlock::Text, got {other:?}"),
     }
 }

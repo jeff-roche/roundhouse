@@ -209,7 +209,7 @@ impl Provider for AzureOpenAiProvider {
             let events = decode_openai_chat_stream(response.body)
                 .await
                 .map_err(stream_failure_to_provider_error)?;
-            Ok(ChatStream(Box::pin(futures::stream::iter(events))))
+            Ok(ChatStream::from_events(events))
         })
     }
 
