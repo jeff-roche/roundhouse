@@ -5,7 +5,8 @@
 
 use futures::StreamExt;
 use roundhouse_provider::{
-    BlockDelta, BlockKind, ChatStream, ContentBlock, IdOrigin, Signature, StreamEvent, ToolCallId,
+    BlockDelta, BlockKind, ChatStream, ContentBlock, IdOrigin, ProviderError, Signature,
+    StreamEvent, ToolCallId,
 };
 use std::collections::BTreeMap;
 
@@ -33,7 +34,17 @@ use std::collections::BTreeMap;
 /// (not catch-all) `BlockKind::Text`/`None` arm, so a future `BlockKind` variant that
 /// isn't explicitly handled here fails to compile instead of silently falling through
 /// to `ContentBlock::Text` the same way.
-pub async fn fold_stream_to_blocks(mut stream: ChatStream) -> Vec<ContentBlock> {
+///
+/// **T19b Task 4:** `ChatStream` items are fallible (Task 1); a mid-stream
+/// `Err` item is a real provider failure (e.g. a truncated response), not a
+/// clean end of stream — it must fail this fold, not be silently folded as a
+/// short success. This function stops at the first `Err` item and returns
+/// that item's error rather than the partial `Vec` folded so far; `chat.rs`'s
+/// `run_chat_turn` takes its provider-failure branch on that `Err`, the same
+/// branch it already takes when `provider.stream_chat` itself fails.
+pub async fn fold_stream_to_blocks(
+    mut stream: ChatStream,
+) -> Result<Vec<ContentBlock>, ProviderError> {
     let mut text_by_index: BTreeMap<u32, String> = BTreeMap::new();
     let mut thinking_by_index: BTreeMap<u32, (String, Option<String>)> = BTreeMap::new();
     let mut tool_args_by_index: BTreeMap<u32, String> = BTreeMap::new();
@@ -44,20 +55,7 @@ pub async fn fold_stream_to_blocks(mut stream: ChatStream) -> Vec<ContentBlock> 
     while let Some(item) = stream.next().await {
         let event = match item {
             Ok(event) => event,
-            Err(err) => {
-                // T19b Task 1: `ChatStream` items are now fallible. Task 4
-                // changes this function's own return type to `Result` so a
-                // mid-stream error can be reported to its caller; for now,
-                // keep today's behavior (fold what's been seen so far) but
-                // stop folding and name the error rather than silently
-                // treating the stream as having ended cleanly.
-                tracing::warn!(
-                    error = %err,
-                    "stream item error while folding to content blocks; \
-                     stopping with the content folded so far"
-                );
-                break;
-            }
+            Err(err) => return Err(err),
         };
         match event {
             StreamEvent::BlockStart { index, kind } => {
@@ -89,7 +87,7 @@ pub async fn fold_stream_to_blocks(mut stream: ChatStream) -> Vec<ContentBlock> 
         }
     }
 
-    order
+    let blocks = order
         .into_iter()
         .map(|index| match kinds.get(&index) {
             Some(BlockKind::ToolUse { .. }) => {
@@ -134,5 +132,6 @@ pub async fn fold_stream_to_blocks(mut stream: ChatStream) -> Vec<ContentBlock> 
                 citations: vec![],
             },
         })
-        .collect()
+        .collect();
+    Ok(blocks)
 }

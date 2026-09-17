@@ -255,7 +255,9 @@ async fn thinking_deltas_fold_to_a_thinking_block_with_signature_intact() {
     ];
     let stream = ChatStream::from_events(events);
 
-    let blocks = fold_stream_to_blocks(stream).await;
+    let blocks = fold_stream_to_blocks(stream)
+        .await
+        .expect("no stream error");
 
     assert_eq!(blocks.len(), 1);
     match &blocks[0] {
@@ -276,13 +278,13 @@ async fn thinking_deltas_fold_to_a_thinking_block_with_signature_intact() {
     }
 }
 
-/// T19b Task 1: `ChatStream` items are `Result<StreamEvent, ProviderError>`.
-/// `fold_stream_to_blocks` keeps its `Vec<ContentBlock>` return type in this
-/// task (a later task changes it to `Result`) — on a mid-stream `Err` item it
-/// must stop folding and return whatever was folded so far, not panic or
-/// silently keep polling past the error.
+/// T19b Task 4: `fold_stream_to_blocks` now returns
+/// `Result<Vec<ContentBlock>, ProviderError>` — a mid-stream `Err` item is no
+/// longer folded as a short success. It must stop folding and return that
+/// item's error, not the partial `Vec` folded so far, and it must not keep
+/// polling the stream past the error.
 #[tokio::test]
-async fn fold_stream_to_blocks_stops_at_a_mid_stream_error_and_keeps_the_partial_fold() {
+async fn fold_stream_to_blocks_returns_the_mid_stream_error_instead_of_a_partial_fold() {
     use roundhouse_engine::fold_stream_to_blocks;
 
     let results = vec![
@@ -313,15 +315,161 @@ async fn fold_stream_to_blocks_stops_at_a_mid_stream_error_and_keeps_the_partial
     ];
     let stream = ChatStream::from_results(results);
 
-    let blocks = fold_stream_to_blocks(stream).await;
+    let result = fold_stream_to_blocks(stream).await;
+
+    match result {
+        Err(ProviderError::StreamInterrupted { partial }) => assert_eq!(partial, "partial"),
+        other => panic!("expected Err(ProviderError::StreamInterrupted), got {other:?}"),
+    }
+}
+
+/// T19b Task 4: a mid-stream provider error must fail the whole turn, not be
+/// folded as a short success — `run_chat_turn` takes the same failure branch
+/// it already uses when `provider.stream_chat` itself returns `Err`: records
+/// `TaskFailed` for the `infer` task, then for the `chat` task, and returns
+/// `AgentError::Provider`.
+#[tokio::test]
+async fn a_mid_stream_provider_error_fails_the_turn_instead_of_folding_a_partial_success() {
+    use roundhouse_provider::BoxFut;
+
+    struct MidStreamErrorProvider;
+
+    impl Provider for MidStreamErrorProvider {
+        fn capabilities(&self, _model: &ModelId) -> Capabilities {
+            Capabilities::default()
+        }
+        fn resolve(&self, _req: &ChatRequest) -> Result<Plan, ProviderError> {
+            Ok(Plan {
+                endpoint: "fake".into(),
+            })
+        }
+        fn stream_chat<'a>(
+            &'a self,
+            _req: &'a ChatRequest,
+            _ctx: &'a RequestCtx,
+        ) -> BoxFut<'a, Result<ChatStream, ProviderError>> {
+            Box::pin(async move {
+                let results = vec![
+                    Ok(StreamEvent::BlockStart {
+                        index: 0,
+                        kind: BlockKind::Text,
+                    }),
+                    Ok(StreamEvent::BlockDelta {
+                        index: 0,
+                        delta: BlockDelta::Text("partial".into()),
+                    }),
+                    Err(ProviderError::StreamInterrupted {
+                        partial: "partial".into(),
+                    }),
+                ];
+                Ok(ChatStream::from_results(results))
+            })
+        }
+        fn count_tokens<'a>(
+            &'a self,
+            _req: &'a ChatRequest,
+            _ctx: &'a RequestCtx,
+        ) -> BoxFut<'a, Result<TokenCount, ProviderError>> {
+            Box::pin(async move { Ok(TokenCount::default()) })
+        }
+        fn list_models<'a>(
+            &'a self,
+            _ctx: &'a RequestCtx,
+        ) -> BoxFut<'a, Result<Vec<ModelInfo>, ProviderError>> {
+            Box::pin(async move { Ok(vec![]) })
+        }
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("events.db");
+    let store = open(&db_path).await.unwrap();
+    let writer = spawn_writer(store).await;
+
+    let ctx = RequestCtx {
+        trace_id: None,
+        transport: Arc::new(NoopTransport),
+        api_key: "test".into(),
+        credentials: None,
+    };
+    let session_id = SessionId::new();
+    let request = ChatRequest {
+        model: ModelId("claude-sonnet-5".into()),
+        system: vec![],
+        messages: vec![],
+        tools: vec![],
+        tool_choice: ToolChoice::Auto,
+        params: Params::default(),
+        reasoning: ReasoningRequest::default(),
+        response_format: ResponseFormat::default(),
+        ext: ProviderExt::None,
+        extra: BTreeMap::new(),
+        policy: RequestPolicy::Error,
+    };
+
+    let result = run_chat_turn(
+        &writer,
+        &RUNNER,
+        &MidStreamErrorProvider,
+        &ctx,
+        session_id,
+        request,
+    )
+    .await;
+
+    assert!(
+        matches!(
+            result,
+            Err(roundhouse_engine::AgentError::Provider(
+                ProviderError::StreamInterrupted { .. }
+            ))
+        ),
+        "expected Err(AgentError::Provider(StreamInterrupted)), got {result:?}"
+    );
+
+    let reopened = open(&db_path).await.unwrap();
+    let conn = reopened.pool.get().await.unwrap();
+    let task_ids: Vec<(Option<String>,)> = conn
+        .interact(|c| {
+            let mut stmt = c
+                .prepare("SELECT DISTINCT task_id FROM events WHERE task_id IS NOT NULL ORDER BY task_id")
+                .unwrap();
+            stmt.query_map([], |row| Ok((row.get(0)?,)))
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap()
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        task_ids.len(),
+        2,
+        "one chat task and one infer task, both failed"
+    );
+
+    let mut chat_task: Option<Task> = None;
+    let mut infer_task: Option<Task> = None;
+    for (task_id_str,) in task_ids {
+        let task_id = TaskId::from_uuid(uuid::Uuid::parse_str(&task_id_str.unwrap()).unwrap());
+        let events = load_task_events(&reopened, task_id).await;
+        let task = fold_task(&events).expect("TaskCreated event present");
+        match task.kind {
+            roundhouse_core::TaskKind::Chat => chat_task = Some(task),
+            roundhouse_core::TaskKind::Infer => infer_task = Some(task),
+            other => panic!("unexpected task kind in tree: {other:?}"),
+        }
+    }
+
+    let chat_task = chat_task.expect("chat task recorded");
+    let infer_task = infer_task.expect("infer task recorded");
 
     assert_eq!(
-        blocks.len(),
-        1,
-        "only the block sealed before the error must be returned"
+        chat_task.state,
+        TaskState::Failed,
+        "chat task must be recorded as failed, not completed with a partial fold"
     );
-    match &blocks[0] {
-        ContentBlock::Text { text, .. } => assert_eq!(text, "partial"),
-        other => panic!("expected ContentBlock::Text, got {other:?}"),
-    }
+    assert_eq!(
+        infer_task.state,
+        TaskState::Failed,
+        "infer task must be recorded as failed, not completed with a partial fold"
+    );
 }

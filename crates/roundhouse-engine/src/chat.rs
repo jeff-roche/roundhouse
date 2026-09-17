@@ -87,31 +87,70 @@ pub async fn run_chat_turn(
     let stream = match provider.stream_chat(&request, ctx).await {
         Ok(stream) => stream,
         Err(provider_err) => {
-            let error = TaskError {
-                message: provider_err.to_string(),
-                category: "provider_error".into(),
-            };
-            // Innermost first: infer failed because of the provider, which is why
-            // the parent chat task fails too.
-            append_failed(
+            return fail_turn_on_provider_error(
                 writer,
                 runner,
                 session_id,
                 infer_task_id,
-                error.clone(),
-                false,
+                chat_task_id,
+                provider_err,
             )
-            .await?;
-            append_failed(writer, runner, session_id, chat_task_id, error, false).await?;
-            return Err(AgentError::Provider(provider_err));
+            .await
         }
     };
-    let blocks = fold_stream_to_blocks(stream).await;
+    // A mid-stream `Err` item (Task 1's fallible `ChatStream`) is a real
+    // provider failure, not a clean end of stream — Task 4 makes the fold
+    // itself fallible so this takes the exact same failure branch as a
+    // `stream_chat` call that fails outright above, rather than folding a
+    // truncated stream into a silently short success.
+    let blocks = match fold_stream_to_blocks(stream).await {
+        Ok(blocks) => blocks,
+        Err(provider_err) => {
+            return fail_turn_on_provider_error(
+                writer,
+                runner,
+                session_id,
+                infer_task_id,
+                chat_task_id,
+                provider_err,
+            )
+            .await
+        }
+    };
 
     append_completed(writer, runner, session_id, infer_task_id).await?;
     append_completed(writer, runner, session_id, chat_task_id).await?;
 
     Ok((chat_task_id, blocks))
+}
+
+/// The `infer`/`chat` failure branch shared by a `provider.stream_chat` call
+/// that fails outright and a `fold_stream_to_blocks` call that fails
+/// mid-stream (Task 4): innermost first, `infer` fails because of the
+/// provider, which is why the parent `chat` task fails too.
+async fn fail_turn_on_provider_error(
+    writer: &EventWriter,
+    runner: &TaskRunner,
+    session_id: SessionId,
+    infer_task_id: TaskId,
+    chat_task_id: TaskId,
+    provider_err: ProviderError,
+) -> Result<(TaskId, Vec<ContentBlock>), AgentError> {
+    let error = TaskError {
+        message: provider_err.to_string(),
+        category: "provider_error".into(),
+    };
+    append_failed(
+        writer,
+        runner,
+        session_id,
+        infer_task_id,
+        error.clone(),
+        false,
+    )
+    .await?;
+    append_failed(writer, runner, session_id, chat_task_id, error, false).await?;
+    Err(AgentError::Provider(provider_err))
 }
 
 async fn append_created(
