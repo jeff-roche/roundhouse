@@ -1148,6 +1148,33 @@ impl ShellDeltaSink {
     }
 }
 
+/// Why a [`ShellChunk::Gap`] was sent — carried through to
+/// [`emit_gap_progress`]'s message text (fix round 1 follow-up, finding 8's
+/// note: a test must be able to pin down "exactly one cap-close discontinuity"
+/// distinctly from an arbitrary, environment-dependent number of budget-drop
+/// ones, which a single undifferentiated `Gap` variant cannot support).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GapReason {
+    /// [`try_send_chunk`] dropped a chunk for being over the shared
+    /// [`SHELL_DELTA_BUDGET_BYTES`] budget — can happen zero, one, or many
+    /// times over a single stream's life, depending on how far the pump
+    /// falls behind a fast producer.
+    Budget,
+    /// [`drain_to_end`] reached the [`MAX_SHELL_OUTPUT_BYTES`] cap — happens
+    /// at most once per stream, always as that stream's last event before
+    /// its channel closes.
+    Cap,
+}
+
+impl std::fmt::Display for GapReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            GapReason::Budget => write!(f, "budget"),
+            GapReason::Cap => write!(f, "cap"),
+        }
+    }
+}
+
 /// One item on a [`DeltaChannel`] — either a genuine chunk of stream bytes,
 /// or a discontinuity marker (Phase 8 Task 19 lane B, Task 8 fix round 1,
 /// security finding I1): [`try_send_chunk`] sends [`Self::Gap`] whenever it
@@ -1159,7 +1186,7 @@ impl ShellDeltaSink {
 /// never be treated the same as a clean, contiguous continuation.
 enum ShellChunk {
     Data(Vec<u8>),
-    Gap,
+    Gap(GapReason),
 }
 
 /// The shared plumbing [`drain_to_end`] uses to forward a copy of each
@@ -1197,7 +1224,7 @@ fn try_send_chunk(channel: &DeltaChannel, chunk: &[u8]) {
         let reserved = current + len;
         if reserved > SHELL_DELTA_BUDGET_BYTES {
             channel.lag.fetch_add(len, Ordering::Relaxed);
-            let _ = channel.tx.send(ShellChunk::Gap);
+            let _ = channel.tx.send(ShellChunk::Gap(GapReason::Budget));
             return;
         }
         match channel.in_flight.compare_exchange_weak(
@@ -1411,13 +1438,18 @@ async fn flush_stream(
 /// ever rides the NEXT successful flush, which may be arbitrarily later, or
 /// may never happen at all (e.g. a discontinuity that turns out to be the
 /// very last thing this stream ever does, once its final buffer is empty).
-/// Best-effort like every other streamed append here — a failure is not
-/// this call's problem to propagate.
+/// `reason` is embedded in the message text (fix round 1 follow-up, finding
+/// 8's note) so a caller — chiefly a test — can tell a `Cap` discontinuity
+/// (at most one per stream, always its last event) apart from an arbitrary,
+/// environment-dependent number of `Budget` ones. Best-effort like every
+/// other streamed append here — a failure is not this call's problem to
+/// propagate.
 async fn emit_gap_progress(
     writer: &EventWriter,
     runner: &TaskRunner,
     session_id: SessionId,
     task_id: TaskId,
+    reason: GapReason,
     lag: &AtomicUsize,
 ) {
     let lag_bytes = lag.load(Ordering::Relaxed);
@@ -1428,7 +1460,7 @@ async fn emit_gap_progress(
         task_id,
         Progress {
             message: format!(
-                "shell output stream interrupted -- {lag_bytes} B not streamed so far"
+                "shell output stream interrupted ({reason}) -- {lag_bytes} B not streamed so far"
             ),
             fraction: None,
         },
@@ -1509,9 +1541,10 @@ async fn run_shell_delta_pump(
 /// - `Some(ShellChunk::Data(bytes))`: a genuinely contiguous chunk — buffered
 ///   (and its reserved budget released) and, once large enough, offered to
 ///   [`flush_stream`] as a non-final attempt.
-/// - `Some(ShellChunk::Gap)` (fix round 1, security finding I1): a
+/// - `Some(ShellChunk::Gap(reason))` (fix round 1, security finding I1): a
 ///   discontinuity — bytes existed on the real stream that will never reach
-///   this buffer (a budget drop, or the output cap). Whatever is currently
+///   this buffer (`reason` says whether it was a budget drop or the output
+///   cap — see [`GapReason`]). Whatever is currently
 ///   buffered is offered to [`flush_stream`] as a non-final attempt (WITH
 ///   holdback — this is deliberately never `final_flush = true`, so a
 ///   partial match still touching the tail is never released), and
@@ -1570,7 +1603,7 @@ async fn handle_stream_event(
                 .await;
             }
         }
-        Some(ShellChunk::Gap) => {
+        Some(ShellChunk::Gap(reason)) => {
             let other_flushed = other.flushed;
             let _ = flush_stream(
                 writer,
@@ -1593,7 +1626,7 @@ async fn handle_stream_event(
                 lag.fetch_add(stream.buf.len(), Ordering::Relaxed);
                 stream.buf.clear();
             }
-            emit_gap_progress(writer, runner, session_id, task_id, lag).await;
+            emit_gap_progress(writer, runner, session_id, task_id, reason, lag).await;
         }
         None => {
             stream.rx = None;
@@ -1964,7 +1997,7 @@ async fn drain_to_end<R: tokio::io::AsyncRead + Unpin>(
             // in this SAME iteration, not a later one.
             truncated = true;
             if let Some(channel) = deltas.take() {
-                let _ = channel.tx.send(ShellChunk::Gap);
+                let _ = channel.tx.send(ShellChunk::Gap(GapReason::Cap));
             }
         }
     }
@@ -3371,6 +3404,26 @@ mod tests {
             .count()
     }
 
+    /// The strict subset of [`gap_progress_count`] that are specifically the
+    /// [`GapReason::Cap`] discontinuity (fix round 1 follow-up, finding 8's
+    /// note): at most one per stream, always that stream's LAST event before
+    /// its channel closes — unlike [`GapReason::Budget`] gaps, which can fire
+    /// an environment-dependent number of times. Distinguished by the
+    /// `"(cap)"` tag `emit_gap_progress` embeds in the message per
+    /// `GapReason`'s `Display` impl.
+    fn cap_gap_progress_count(events: &[roundhouse_store::StoredEvent], task_id: TaskId) -> usize {
+        events
+            .iter()
+            .filter(|e| e.task_id == Some(task_id))
+            .filter(|e| match &e.payload {
+                roundhouse_core::EventPayload::TaskProgress { progress } => progress
+                    .message
+                    .contains("shell output stream interrupted (cap)"),
+                _ => false,
+            })
+            .count()
+    }
+
     /// (a) `seq 1 60000` on stdout, a DISJOINT `seq 60001 90000` on stderr
     /// (fix round 1, BLOCKING finding 3 — the previous version used the
     /// SAME sequence on both streams "told apart only by mime," which a
@@ -3679,15 +3732,18 @@ mod tests {
 
     /// (e) Output well past `MAX_SHELL_OUTPUT_BYTES` (10 MiB): the retained
     /// `ShellOutput` still shows the existing truncation marker (unchanged
-    /// behavior), and the streamed stdout deltas stop at (not indefinitely
-    /// past) the cap — proven as an upper bound on total delta bytes, since
-    /// `drain_to_end` only stops FORWARDING to deltas once it has already
-    /// committed a chunk that reaches the cap, which can include a few
-    /// bytes of natural per-flush overshoot up to one 64 KiB read. Every
-    /// flush (including the stream's cap-triggered closing one) pairs
-    /// exactly one `Delta::Blob` with exactly one `TaskProgress` — so the
-    /// cap-stop produces its own "one progress note" via the same
-    /// mechanism as an ordinary close, never a special second one.
+    /// behavior), and the streamed stdout deltas never exceed the cap — an
+    /// exact upper bound, not a loose one (fix round 1 follow-up, finding
+    /// 8): `drain_to_end`'s `take = remaining.min(n)` means the drain never
+    /// forwards a single byte past `cap`, so there is no "natural per-flush
+    /// overshoot" to allow for (an earlier version of this comment/assertion
+    /// claimed one, which the drain-seam-level
+    /// `drain_to_end_forwards_exactly_up_to_the_cap_then_stops` test now
+    /// proves false directly). Every flush pairs exactly one `Delta::Blob`
+    /// with exactly one `TaskProgress`, and the cap being reached fires
+    /// exactly one `GapReason::Cap` discontinuity marker — distinct from an
+    /// arbitrary, environment-dependent number of `GapReason::Budget` ones a
+    /// fast producer can also trigger before the cap is even reached.
     #[tokio::test]
     async fn output_over_the_cap_stops_deltas_and_emits_one_progress_note() {
         let (writer, db_path, state_dir, _guard) = shell_delta_test_store().await;
@@ -3741,8 +3797,9 @@ mod tests {
              vacuously satisfy the upper-bound check below"
         );
         assert!(
-            stdout_bytes_len <= MAX_SHELL_OUTPUT_BYTES + SHELL_FLUSH_CHUNK_BYTES as u64,
-            "deltas must stop at (near) the cap, not continue for the whole over-cap output -- \
+            stdout_bytes_len <= MAX_SHELL_OUTPUT_BYTES,
+            "deltas must never exceed the cap -- drain_to_end's `take = remaining.min(n)` \
+             never forwards a byte past it, so there is no per-flush overshoot to allow for; \
              got {stdout_bytes_len} bytes of deltas against a {MAX_SHELL_OUTPUT_BYTES}-byte cap"
         );
         assert_eq!(
@@ -3752,10 +3809,13 @@ mod tests {
              the only progress events NOT so paired are emit_gap_progress's own standalone \
              discontinuity markers -- no progress event may exist unaccounted for"
         );
-        assert!(
-            gap_progress_count(&events, task_id) > 0,
-            "the cap being reached must have fired at least one discontinuity marker (fix \
-             round 1, security finding M2)"
+        assert_eq!(
+            cap_gap_progress_count(&events, task_id),
+            1,
+            "the cap being reached must fire EXACTLY ONE GapReason::Cap discontinuity marker \
+             (fix round 1 follow-up, finding 8) -- distinct from the possibly-many \
+             GapReason::Budget ones a fast producer can also trigger before the cap is even \
+             reached"
         );
     }
 
@@ -3807,7 +3867,15 @@ mod tests {
         while let Ok(chunk) = rx.try_recv() {
             match chunk {
                 ShellChunk::Data(bytes) => forwarded.extend_from_slice(&bytes),
-                ShellChunk::Gap => gap_count += 1,
+                ShellChunk::Gap(reason) => {
+                    assert_eq!(
+                        reason,
+                        GapReason::Cap,
+                        "the only discontinuity a cap-only scenario (no shared budget \
+                         involved) can ever produce is a Cap gap"
+                    );
+                    gap_count += 1;
+                }
             }
         }
         assert_eq!(
@@ -3948,7 +4016,7 @@ mod tests {
             &state_dir,
             &mut stream,
             &mut other,
-            Some(ShellChunk::Gap),
+            Some(ShellChunk::Gap(GapReason::Budget)),
             &in_flight,
             &lag,
         )
