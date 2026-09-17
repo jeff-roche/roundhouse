@@ -3734,9 +3734,16 @@ impl<H: WorkflowHost> Loop<'_, H> {
     /// The one over-count is a `tool:`/`agent:` step that failed *before*
     /// dispatching (an uninterpolatable `with:`, an unknown tool — the
     /// [`super::DispatchDecision::Done`] arms of `Executor::dispatch_step`):
-    /// its row is `Failed`, and this counts it. Harmless by construction
-    /// rather than by tolerance — `fold_inner_step_outcome` ends the item on
-    /// any inner-step failure, so no later step of that item ever asks.
+    /// its row is `Failed`, and this counts it. That used to be harmless by
+    /// construction — `fold_inner_step_outcome` ended the item on any
+    /// inner-step failure, so no later step of that item ever asked — and
+    /// since Phase 8 Task 25.7 Task 10 it is harmless by **bound** instead:
+    /// a step declaring `continue_on_error: true` lets the walk go on, so its
+    /// phantom call is charged against the share the item's remaining steps
+    /// are measured against. It costs at most one slot per such step, the
+    /// item's inner-step list bounds how many there can be, and it moves the
+    /// per-item refusal earlier rather than later — the safe direction for a
+    /// ceiling.
     ///
     /// # A re-decided step is charged once, not once per attempt
     ///
@@ -3780,14 +3787,26 @@ impl<H: WorkflowHost> Loop<'_, H> {
     ///   routes.
     ///
     /// **At most one step per item is in a re-decide state at a time**, so
-    /// these cases never compound within one item. An item's rows are a
-    /// *prefix* of its inner steps: the walk is sequential, and
-    /// [`Self::decided_map_item_step`] inherits a `Completed`/`Skipped` row on
-    /// every entry, so such a step never reaches the dispatch seam again and
-    /// its row can never go back to `Running`. A row that still needs deciding
-    /// is therefore always the item's furthest-progressed one, with nothing
-    /// after it holding a row at all — an inner-step failure ends the item
-    /// (`fold_inner_step_outcome`), so no later step was ever started either.
+    /// these cases never compound within one item — with the one exception
+    /// named below. An item's rows are a *prefix* of its inner steps: the walk
+    /// is sequential, and [`Self::decided_map_item_step`] inherits a
+    /// `Completed`/`Skipped` row on every entry, so such a step never reaches
+    /// the dispatch seam again and its row can never go back to `Running`. A
+    /// row that still needs deciding is therefore always the item's
+    /// furthest-progressed one, with nothing after it holding a row at all —
+    /// an inner-step failure ended the item (`fold_inner_step_outcome`), so no
+    /// later step was ever started either.
+    ///
+    /// **The exception is `continue_on_error: true`** (Phase 8 Task 25.7 Task
+    /// 10), which is exactly the case that last sentence used to rule out: a
+    /// failure the author declared non-fatal leaves a `Failed` row behind and
+    /// lets the walk go on, so a **cold** entry can find that row re-decidable
+    /// (`Failed` is inherited only on a continuation of the drive that decided
+    /// it) *and* a later row still `Running`. The two then compound, each
+    /// contributing its own slot of the first case's overshoot — bounded by
+    /// how many such steps the item declares, which is at most its inner-step
+    /// list. The rows are still a prefix, and every other property above is
+    /// unchanged.
     ///
     /// Closing the first case outright would mean counting attempts, which
     /// needs durable per-attempt state this task deliberately does not add
@@ -3881,13 +3900,23 @@ impl<H: WorkflowHost> Loop<'_, H> {
                 // dropped at the suspension.
                 outcome.output_is_secret_derived |= self.map_item_step_taint(&inner.id, item_index);
                 self.checkpoint_map_item_step(inner, item_index, &outcome, seqs.0, seqs.1)?;
-                if fold_inner_step_outcome(&mut last, outcome, any_item_secret_derived) {
+                if fold_inner_step_outcome(
+                    &mut last,
+                    outcome,
+                    inner.continue_on_error,
+                    any_item_secret_derived,
+                ) {
                     break;
                 }
                 continue;
             }
             if let Some(outcome) = self.decided_map_item_step(map_step_id, inner, item_index) {
-                if fold_inner_step_outcome(&mut last, outcome, any_item_secret_derived) {
+                if fold_inner_step_outcome(
+                    &mut last,
+                    outcome,
+                    inner.continue_on_error,
+                    any_item_secret_derived,
+                ) {
                     break;
                 }
                 continue;
@@ -4253,7 +4282,12 @@ impl<H: WorkflowHost> Loop<'_, H> {
             let mut outcome = outcome;
             outcome.output_is_secret_derived |= outcome.gate_condition_was_secret_derived;
             self.checkpoint_map_item_step(inner, item_index, &outcome, None, None)?;
-            if fold_inner_step_outcome(&mut last, outcome, any_item_secret_derived) {
+            if fold_inner_step_outcome(
+                &mut last,
+                outcome,
+                inner.continue_on_error,
+                any_item_secret_derived,
+            ) {
                 break;
             }
         }

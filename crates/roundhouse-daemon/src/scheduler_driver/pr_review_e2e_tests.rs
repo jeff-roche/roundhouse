@@ -15,16 +15,19 @@
 //!    [`the_frozen_reference_workflows_map_refuses_every_worktree_isolated_item`]
 //!    pin what the **frozen fixture itself** does today — unmodified, and
 //!    modified in exactly one named place, respectively — joined by
-//!    [`a_map_inner_step_reads_a_siblings_output_as_null_today`] and
-//!    [`a_map_inner_steps_continue_on_error_is_not_honored_today`], which
-//!    pin the two mechanisms the fixture's `map` body depends on and that
-//!    are not there. All four are characterization tests: their assertions
-//!    are a record of real behaviour, not of intended behaviour.
+//!    [`a_map_inner_step_reads_a_siblings_output_as_null_today`], which pins
+//!    a mechanism the fixture's `map` body depends on and that is not
+//!    there. All three are characterization tests: their assertions are a
+//!    record of real behaviour, not of intended behaviour.
 //! 2. [`a_map_dispatches_nested_agent_shell_and_gate_steps_for_real_concurrently_and_resumably`]
 //!    proves the integration those cannot: a `map` fanning out to several
 //!    items that each nest a real `agent:` step, a real `tool: shell` step,
 //!    a real `gate:` park/resume, and a real follow-up `tool:` step —
 //!    concurrently, and across two full park/resume cycles.
+//! 3. [`a_failed_map_inner_step_declaring_continue_on_error_does_not_stop_its_item`]
+//!    is the one test here that asserts *intended* behaviour: it started
+//!    life in group 1, pinning a gap this drive found, and Phase 8 Task
+//!    25.7 Task 10 closed the gap and flipped the assertion.
 //!
 //! # What driving the frozen fixture turned up
 //!
@@ -47,8 +50,12 @@
 //! 4. **A `map` inner step cannot read a sibling's output.** §8.9's map
 //!    gates on `${{ len(steps.review.output.findings) > 0 }}` and then on
 //!    `${{ steps.gate.output.approve }}`; both evaluate to `null`.
-//! 5. **`continue_on_error:` is ignored on a `map` inner step**, so §8.9's
-//!    `tests` step would fail its whole item rather than let it continue.
+//! 5. **`continue_on_error:` was ignored on a `map` inner step**, so §8.9's
+//!    `tests` step failed its whole item rather than letting it continue.
+//!    **Closed by Phase 8 Task 25.7 Task 10**, which is why the test that
+//!    pinned it now asserts the opposite — see group 3 above and
+//!    `map_step::fold_inner_step_outcome`, the one place both fan-out loops
+//!    decide whether an inner step's failure ends its item.
 //!
 //! Separately, and *not* a divergence but the accepted limitation that
 //! `run_loop`'s `worktree_cannot_span_a_suspend` documents in full: the
@@ -755,8 +762,9 @@ const FAILING_PR: u32 = 3;
 /// `map_step::fold_inner_step_outcome` overwrites the item's running
 /// outcome with **every** inner step's status in turn, so what an item
 /// finally reports is simply its last-run inner step's status — here
-/// `post`'s. (The walk stops early only on a failure, which is the one
-/// status that also breaks out.) Append an unconditional step after `post`
+/// `post`'s. (The walk stops early only on a failure, and only one the
+/// step's own `continue_on_error:` did not declare non-fatal.) Append an
+/// unconditional step after `post`
 /// and this item would report `completed` instead, with nothing else about
 /// the run changed.
 const SKIPPED_PR: u32 = 4;
@@ -991,12 +999,14 @@ fn posted_path(root: &Path, pr: u32) -> PathBuf {
 /// conditional `gate:` that really parks the run, then a conditional
 /// follow-up `tool:` step — plus `catch:` and `finally:` blocks.
 ///
-/// `tests` keeps §8.9's `continue_on_error: true` even though it is inert
-/// on a `map` inner step today (see
-/// [`a_map_inner_steps_continue_on_error_is_not_honored_today`]), because
-/// dropping it would quietly make this workflow *depend* on the shell step
-/// never failing — and the test asserts that step's durable row is
-/// `Completed` precisely so nothing rests on the flag.
+/// `tests` keeps §8.9's `continue_on_error: true`, which since Phase 8 Task
+/// 25.7 Task 10 really does keep an item walking past a failed inner step
+/// (see
+/// [`a_failed_map_inner_step_declaring_continue_on_error_does_not_stop_its_item`]).
+/// The test still asserts that step's durable row is `Completed`, so no
+/// assertion below rests on the flag: a shell step that silently stopped
+/// spawning would fail this test rather than be waved through as a failure
+/// its author declared non-fatal.
 ///
 /// Written as a raw string with `@NAME@` placeholders substituted
 /// afterwards, rather than as a `format!` template: every `${{ … }}` in a
@@ -1289,9 +1299,10 @@ async fn a_map_dispatches_nested_agent_shell_and_gate_steps_for_real_concurrentl
             assert_eq!(
                 item["status"], "skipped",
                 "an item reports its LAST-RUN inner step's status, whatever that status is — \
-                 `fold_inner_step_outcome` overwrites the running outcome on every inner step — \
-                 and this item's last step (`post`) is `when:`-false, even though its `review` \
-                 and `tests` steps completed. If this ever fails because a step was appended \
+                 `fold_inner_step_outcome` overwrites the running outcome on every inner step \
+                 the item walks — and this item's last step (`post`) is `when:`-false, even \
+                 though its `review` and `tests` steps completed. If this ever fails because a \
+                 step was appended \
                  after `post`, the fold is what changed, not `when:` evaluation: {item:?}"
             );
             assert_eq!(
@@ -1420,23 +1431,26 @@ async fn a_map_inner_step_reads_a_siblings_output_as_null_today() {
     );
 }
 
-/// **`continue_on_error:` on a `map`'s inner step does nothing today** —
-/// the divergence that makes §8.9's own `tests` step (`tool: shell` with
+// ────────── 3. the inner-step mechanics §8.9's `map` body needs ──────────
+
+/// **A failed `map` inner step that declared `continue_on_error: true` does
+/// not stop its item** — so §8.9's own `tests` step (`tool: shell` with
 /// `continue_on_error: true`, so a red test suite still lets the review be
-/// posted) behave as if it had not been written.
+/// posted) means what it says.
 ///
 /// `map_step::fold_inner_step_outcome` is the whole mechanism an inner
-/// step's outcome goes through, and its `StepStatus::Failed` arm returns
-/// "stop this item" unconditionally — it is not passed the `StepDef` and so
-/// cannot consult `continue_on_error` at all. The top-level phase walk
-/// honours the flag (`Loop::run_phase`'s own `!step.continue_on_error`
-/// guard); the per-item walk has no equivalent.
+/// step's outcome goes through, and until Phase 8 Task 25.7 Task 10 its
+/// `StepStatus::Failed` arm returned "stop this item" unconditionally: it
+/// was never handed the step it was folding, so it could not consult the
+/// flag at all. It now mirrors the guard `Loop::run_phase` has always
+/// applied to a top-level step's failure.
 ///
-/// Pinned here rather than fixed: it is a real behavioural gap in `map`'s
-/// fan-out, not this task's to decide, and an assertion is how the next
-/// person finds out it was known.
+/// Two halves, and the second is what keeps this from being a fix that
+/// merely swallows failures: the failure is still **recorded** — on the
+/// failing inner step's own durable row, with its message — and the item's
+/// later inner steps still run.
 #[tokio::test]
-async fn a_map_inner_steps_continue_on_error_is_not_honored_today() {
+async fn a_failed_map_inner_step_declaring_continue_on_error_does_not_stop_its_item() {
     let yaml = "name: continue-probe\nversion: 1\npermissions:\n  default: deny\n  \
                 unattended: { escalate: fail }\nsteps:\n  - id: m\n    map:\n      \
                 over: \"${{ [1] }}\"\n      as: it\n      on_item_error: continue\n      \
@@ -1464,13 +1478,39 @@ async fn a_map_inner_steps_continue_on_error_is_not_honored_today() {
 
     let items = map_items(step(&steps, "m"));
     assert_eq!(
-        items[0]["status"], "failed",
-        "an inner step declaring `continue_on_error: true` still fails its whole item: {:?}",
+        items[0],
+        serde_json::json!({ "status": "completed", "output": { "reached": true } }),
+        "the item walks on to `after` and reports that step's outcome, rather than stopping at \
+         a failure its author declared non-fatal: {:?}",
         items[0]
     );
+    let boom = f.item_step_rows("boom").await;
+    let failed = boom
+        .get(&0)
+        .expect("the failed inner step still gets its own durable row");
+    assert_eq!(
+        failed.state,
+        StepRunState::Failed,
+        "`continue_on_error:` decides whether the item stops, never whether the failure is \
+         recorded — the row must still say what went wrong"
+    );
     assert!(
-        f.item_step_rows("after").await.is_empty(),
-        "and the inner step after it never runs — which is what makes this a behavioural gap \
-         rather than a cosmetic one"
+        failed
+            .error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("no_such_fn"),
+        "and it must be the step's own failure, not some later step's: {:?}",
+        failed.error
+    );
+    assert_eq!(
+        f.item_step_rows("after")
+            .await
+            .get(&0)
+            .expect("the inner step after the failure runs")
+            .state,
+        StepRunState::Completed,
+        "the step after the failure really ran — which is what makes the flag behavioural \
+         rather than cosmetic"
     );
 }

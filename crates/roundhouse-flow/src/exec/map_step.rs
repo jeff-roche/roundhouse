@@ -979,16 +979,45 @@ pub(crate) fn nested_report_refusal(inner: &StepDef) -> Option<ItemOutcome> {
 /// following step returned, and both `fail_fast` and `collect` reported full
 /// success. Stopping here, on the first `Failed`, is what keeps the failure.
 ///
+/// **Unless the step declared `continue_on_error: true`** (Phase 8 Task 25.7
+/// Task 10). The flag is `continue_on_error`'s own field on the inner step,
+/// passed in by the caller because this function is otherwise not handed the
+/// step it is folding — which is exactly why the flag used to be *inert*
+/// inside a `map`, while `crate::exec::run_loop::Loop::run_phase` had honoured
+/// it for a top-level step since B12c. §8.9's own reference workflow turns on
+/// that reading: its `tests` step is a `tool: shell` with
+/// `continue_on_error: true`, so that a red test suite still lets the review
+/// be posted.
+///
+/// What the flag changes is **only** whether the walk stops. The assignment
+/// above it is unconditional, so `last` still reports "the last inner step
+/// that ran failed" for as long as that is true — and is then legitimately
+/// overwritten by whatever the item's next inner step returns, exactly as a
+/// top-level phase that continues past a non-fatal failure still ends
+/// `Completed`. An item allowed to continue is therefore not a *failed item*,
+/// so [`ItemErrorPolicy`] neither collects its message nor lets it trip
+/// `fail_fast` — the same thing "non-fatal" means one level up.
+///
+/// Where the continued failure *is* kept is the step's own durable
+/// `workflow_step_run` row, which
+/// `crate::exec::run_loop::Loop::checkpoint_map_item_step` has already written
+/// by the time this is called. The in-memory fan-out
+/// ([`Executor::dispatch_map_step`]) has no such rows, so there a continued
+/// failure's message is kept nowhere at all — the cost of declaring a failure
+/// non-fatal in a loop with no durable record, recorded rather than repaired.
+///
 /// **Fix round 3, item 1: both taint bits are folded, not just the output
 /// one.** [`ItemOutcome`] has no field for an inner step's
 /// `gate_condition_was_secret_derived`, so without this the flag
 /// [`evaluate_when_gate`] computed — including the `Err` arm's deliberate,
 /// fail-safe `true` — was dropped at every item boundary. Both mean the same
 /// thing to a caller deciding whether `${{ steps.<map_id>.output }}` needs
-/// redaction downstream, so one aggregate carries both.
+/// redaction downstream, so one aggregate carries both. A continued failure
+/// folds its taint here the same way, before the walk goes on.
 pub(crate) fn fold_inner_step_outcome(
     last: &mut ItemOutcome,
     outcome: StepOutcome,
+    continue_on_error: bool,
     any_item_secret_derived: &mut bool,
 ) -> bool {
     *any_item_secret_derived |= outcome.output_is_secret_derived;
@@ -996,7 +1025,7 @@ pub(crate) fn fold_inner_step_outcome(
     match outcome.status {
         StepStatus::Failed { message } => {
             *last = ItemOutcome::Failed(message);
-            true
+            !continue_on_error
         }
         StepStatus::Skipped { reason } => {
             *last = ItemOutcome::Skipped { reason };
@@ -2225,9 +2254,15 @@ impl<'a> Executor<'a> {
                         }
                     };
                     // Both taint bits and the "an item fails as soon as any
-                    // inner step fails" rule, through the helper both
-                    // fan-out loops share — see `fold_inner_step_outcome`.
-                    if fold_inner_step_outcome(&mut last, outcome, &mut any_item_secret_derived) {
+                    // inner step fails, unless it said otherwise" rule,
+                    // through the helper both fan-out loops share — see
+                    // `fold_inner_step_outcome`.
+                    if fold_inner_step_outcome(
+                        &mut last,
+                        outcome,
+                        inner.continue_on_error,
+                        &mut any_item_secret_derived,
+                    ) {
                         break;
                     }
                 }

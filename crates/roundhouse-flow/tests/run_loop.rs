@@ -8988,3 +8988,87 @@ fn a_siblings_nested_call_shrinks_a_later_waves_per_item_share() {
          sibling's child left it — with both numbers in the message: {error:?}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// An item's inner steps cooperating — Phase 8 Task 25.7 (#64) Task 10
+//
+// The two gaps driving §8.9's own reference workflow through the real daemon
+// turned up (`roundhouse-daemon`'s `pr_review_e2e_tests`), both in `map`'s
+// per-item walk and both long since settled at the top level: an inner step's
+// `continue_on_error:` was ignored, and an inner step could not read a
+// sibling's output through `${{ steps.* }}`.
+// ---------------------------------------------------------------------------
+
+/// **A failed inner step that declared `continue_on_error: true` does not stop
+/// its item** — the guard `Loop::run_phase` applies to a top-level step's
+/// failure, applied per item inside `map_step::fold_inner_step_outcome`.
+///
+/// The contrast that makes this more than a tautology is
+/// [`fail_fast_lets_an_already_started_item_finish_its_remaining_inner_steps`],
+/// which drives the same shape **without** the flag: there item 0's failure
+/// ends its walk and its second inner step never dispatches.
+#[test]
+fn a_failed_inner_step_declaring_continue_on_error_lets_its_item_go_on() {
+    let (conn, run_id, _sink, waves, result) = drive_waves(
+        "steps:\n\
+         \x20 - id: fan\n\
+         \x20   map:\n\
+         \x20     over: \"${{ inputs.items }}\"\n\
+         \x20     as: item\n\
+         \x20     max_parallel: 2\n\
+         \x20     on_item_error: continue\n\
+         \x20   steps:\n\
+         \x20     - id: build\n\
+         \x20       tool: shell\n\
+         \x20       with: { cmd: [echo, build] }\n\
+         \x20       continue_on_error: true\n\
+         \x20     - id: after\n\
+         \x20       emit: { ran: \"${{ item }}\" }\n",
+        serde_json::json!({ "items": map_items(2) }),
+        &[("build", 0)],
+    );
+    let outcome = result.expect("the run drives");
+
+    assert_eq!(
+        waves,
+        vec![vec![
+            ("build".to_string(), Some(0)),
+            ("build".to_string(), Some(1)),
+        ]],
+        "one wave: `after` is an `emit:` and needs no dispatch, so the segment that answers \
+         both builds also finishes both items: {waves:?}"
+    );
+    let output = map_output(&outcome, "fan");
+    let entries = output["items"].as_array().expect("one entry per item");
+    assert_eq!(
+        entries[0],
+        serde_json::json!({ "status": "completed", "output": { "ran": "0" } }),
+        "item 0 walks on to `after` and reports that step's outcome, rather than stopping at \
+         a failure its author declared non-fatal: {entries:?}"
+    );
+    assert_eq!(
+        entries[1],
+        serde_json::json!({ "status": "completed", "output": { "ran": "1" } }),
+        "and the item that never failed is unaffected: {entries:?}"
+    );
+    let (state, error) = item_step_row(&conn, run_id, "build", 0)
+        .expect("the failed inner step still gets its own durable row");
+    assert_eq!(
+        state,
+        StepRunState::Failed,
+        "`continue_on_error:` decides whether the item stops, never whether the failure is \
+         recorded"
+    );
+    assert!(
+        error
+            .unwrap_or_default()
+            .contains("could not be dispatched"),
+        "and the row keeps the step's own failure message, which is the only place a \
+         continued failure survives at all"
+    );
+    assert_eq!(
+        item_step_row(&conn, run_id, "after", 0).map(|row| row.0),
+        Some(StepRunState::Completed),
+        "the step after the failure really ran"
+    );
+}
