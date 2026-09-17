@@ -5726,6 +5726,256 @@ fn an_items_worktree_cannot_span_a_suspend_and_says_so_rather_than_re_materializ
     );
 }
 
+fn git_available() -> bool {
+    std::process::Command::new("git")
+        .arg("--version")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+/// A fresh `git init`-ed repository with one commit, cleaned up on drop.
+///
+/// A second copy of the helper `tests/map_step_worktree.rs` already has,
+/// because each `tests/*.rs` file is its own crate and nothing can be imported
+/// between them — the same reason `RecordedEvent`/`RecordingSink` are
+/// duplicated across this suite.
+struct TempRepo {
+    path: std::path::PathBuf,
+}
+
+impl TempRepo {
+    fn new() -> Self {
+        let path = std::env::temp_dir().join(format!(
+            "roundhouse-run-loop-worktree-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&path).expect("create temp repo dir");
+        let run = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&path)
+                .status()
+                .expect("spawn git for test fixture setup");
+            assert!(status.success(), "git {args:?} failed during test setup");
+        };
+        run(&["init", "-q"]);
+        run(&["config", "user.email", "test@example.com"]);
+        run(&["config", "user.name", "test"]);
+        std::fs::write(path.join("f.txt"), "hello\n").expect("write fixture file");
+        run(&["add", "f.txt"]);
+        run(&["commit", "-q", "-m", "init"]);
+        TempRepo { path }
+    }
+
+    /// Real `git worktree list` output — ground truth, not this crate's own
+    /// bookkeeping.
+    fn worktree_list(&self) -> String {
+        let output = std::process::Command::new("git")
+            .args(["worktree", "list"])
+            .current_dir(&self.path)
+            .output()
+            .expect("git worktree list");
+        String::from_utf8_lossy(&output.stdout).into_owned()
+    }
+}
+
+impl Drop for TempRepo {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.path);
+    }
+}
+
+/// The real [`roundhouse_flow::worktree::SandboxWorktreeProvider`], recording
+/// both halves of each item's lifecycle — [`CountingWorktreeProvider`]'s
+/// counterpart for the one test here that wants real `git`.
+///
+/// `materialize` checks that what came back is genuinely a *linked git
+/// worktree* (a linked worktree's `.git` is a file holding `gitdir: ..`, not a
+/// directory) rather than merely a path the adapter invented. Deliberately a
+/// filesystem check and not a `git worktree list` subprocess: this provider is
+/// shared by concurrent callers elsewhere in the suite's sibling test files,
+/// and a listing would run outside `roundhouse_sandbox::worktree`'s own
+/// per-repository lock.
+struct RealWorktreeRecorder {
+    inner: roundhouse_flow::worktree::SandboxWorktreeProvider,
+    materialized: std::sync::Mutex<Vec<std::path::PathBuf>>,
+    released: std::sync::Mutex<Vec<std::path::PathBuf>>,
+}
+
+impl RealWorktreeRecorder {
+    fn new(repo_root: std::path::PathBuf) -> Self {
+        Self {
+            inner: roundhouse_flow::worktree::SandboxWorktreeProvider::new(repo_root),
+            materialized: std::sync::Mutex::new(Vec::new()),
+            released: std::sync::Mutex::new(Vec::new()),
+        }
+    }
+}
+
+impl roundhouse_flow::worktree::WorktreeProvider for RealWorktreeRecorder {
+    fn materialize(
+        &self,
+        base_ref: &str,
+    ) -> Result<std::path::PathBuf, roundhouse_flow::worktree::WorktreeProviderError> {
+        let path = self.inner.materialize(base_ref)?;
+        assert!(
+            path.join(".git").is_file(),
+            "what came back must be a real linked git worktree, not just a path: {path:?}"
+        );
+        self.materialized
+            .lock()
+            .expect("not poisoned")
+            .push(path.clone());
+        Ok(path)
+    }
+
+    fn release(
+        &self,
+        worktree_path: &std::path::Path,
+    ) -> Result<(), roundhouse_flow::worktree::WorktreeProviderError> {
+        self.inner.release(worktree_path)?;
+        self.released
+            .lock()
+            .expect("not poisoned")
+            .push(worktree_path.to_path_buf());
+        Ok(())
+    }
+}
+
+/// **The per-item worktree lifecycle on the production loop, against a real
+/// repository** (Phase 8 Task 25.7 Task 8, fix round 1).
+///
+/// The three other `Loop`-path worktree tests in this file
+/// ([`an_items_worktree_cannot_span_a_suspend_and_says_so_rather_than_re_materializing`]
+/// and its nested-`gate:`/nested-`call:` siblings) all drive
+/// [`CountingWorktreeProvider`]'s fake paths and all assert the item **fails**:
+/// they pin `worktree_cannot_span_a_suspend`'s refusal, which is a different
+/// claim from "the isolation this loop does support actually works". And the
+/// one test in this workspace that did drive a real `git` repository through a
+/// whole fan-out (`tests/map_step_worktree.rs`) drives the legacy in-memory
+/// `Executor::run_to_completion`, not [`run_workflow`]. So the pairing Tasks
+/// 2/6/7 restructured — `Loop::dispatch_map` → `advance_map_item` →
+/// `Executor::prepare_item_isolation`/`release_item_isolation` — had no
+/// end-to-end coverage of its **successful** path at all. This is it.
+///
+/// `emit:`-only inner steps, deliberately: any `tool:`/`agent:`/`call:`/`gate:`
+/// inner step would hit `worktree_cannot_span_a_suspend` and fail the item, so
+/// an `emit:` is the whole of what `isolation: worktree` supports on this loop
+/// (see that function's own doc comment, which records that as a permanent,
+/// accepted residual rather than a pending task). Eight items at
+/// `max_parallel: 4`, which is the fan-out shape this task's plan asks for.
+#[test]
+fn a_real_repos_worktrees_are_materialized_and_released_once_per_item_on_the_loop_path() {
+    if !git_available() {
+        eprintln!("skipping: git not available on this host");
+        return;
+    }
+    const ITEMS: usize = 8;
+
+    let repo = TempRepo::new();
+    let provider = Arc::new(RealWorktreeRecorder::new(repo.path.clone()));
+    let (conn, run_id, _sink, waves, result) = drive_waves_with_context(
+        "steps:\n\
+         \x20 - id: fan\n\
+         \x20   map:\n\
+         \x20     over: \"${{ inputs.items }}\"\n\
+         \x20     as: item\n\
+         \x20     max_parallel: 4\n\
+         \x20     on_item_error: continue\n\
+         \x20     isolation: worktree\n\
+         \x20   steps:\n\
+         \x20     - id: emit_path\n\
+         \x20       emit: { path: \"${{ worktree.path }}\" }\n",
+        &[],
+        |run_ctx| {
+            run_ctx.inputs = serde_json::json!({ "items": map_items(ITEMS) });
+            run_ctx.worktree_provider = Some(provider.clone());
+        },
+    );
+    let outcome = result.expect("the run drives");
+    assert!(
+        waves.is_empty(),
+        "an `emit:`-only fan-out never suspends, so nothing is dispatched: {waves:?}"
+    );
+
+    let output = map_output(&outcome, "fan");
+    let entries = output["items"].as_array().expect("one entry per item");
+    assert_eq!(entries.len(), ITEMS);
+    for (index, entry) in entries.iter().enumerate() {
+        assert_eq!(
+            entry["status"], "completed",
+            "item {index} must complete inside its own worktree: {entry:?}"
+        );
+    }
+
+    // What the fan-out *saw*: `${{ worktree.path }}`, bound per item, is the
+    // path this item's own `prepare_item_isolation` materialized.
+    let bound: Vec<String> = entries
+        .iter()
+        .map(|entry| {
+            entry["output"]["path"]
+                .as_str()
+                .unwrap_or_else(|| panic!("item output must carry the bound path: {entry:?}"))
+                .to_string()
+        })
+        .collect();
+    let materialized = provider.materialized.lock().expect("not poisoned").clone();
+    let released = provider.released.lock().expect("not poisoned").clone();
+    assert_eq!(
+        materialized.len(),
+        ITEMS,
+        "one real worktree per item, materialized exactly once"
+    );
+    assert_eq!(
+        bound,
+        materialized
+            .iter()
+            .map(|p| p.display().to_string())
+            .collect::<Vec<_>>(),
+        "each item's `${{ worktree.path }}` is the path its own materialize returned"
+    );
+    let distinct: std::collections::BTreeSet<&String> = bound.iter().collect();
+    assert_eq!(
+        distinct.len(),
+        ITEMS,
+        "every item gets its own worktree — no two items may share one: {bound:?}"
+    );
+    assert_eq!(
+        released, materialized,
+        "every worktree is released, at exactly the path it was materialized at"
+    );
+
+    // Ground truth, independent of this crate's bookkeeping: the repository is
+    // back to its own primary worktree and nothing is left on disk.
+    let listing = repo.worktree_list();
+    assert_eq!(
+        listing.lines().count(),
+        1,
+        "only the repository's own primary worktree may remain:\n{listing}"
+    );
+    for path in &materialized {
+        assert!(!path.exists(), "{path:?} must be gone from disk");
+    }
+
+    // And the run really did finish, with each item's inner step checkpointed
+    // under its own index — the durable half, read back rather than trusted.
+    assert_eq!(
+        recover_run(&conn, run_id)
+            .expect("the run is recoverable")
+            .run
+            .state,
+        RunState::Completed
+    );
+    for index in 0..ITEMS as u32 {
+        assert_eq!(
+            item_step_row(&conn, run_id, "emit_path", index).map(|r| r.0),
+            Some(StepRunState::Completed),
+            "item {index}'s inner step has a row of its own"
+        );
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Per-item admission — Phase 8 Task 25.7 (#64) Task 4
 //

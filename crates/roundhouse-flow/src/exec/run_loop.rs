@@ -4583,8 +4583,7 @@ fn map_item_crash_refusal(
 }
 
 /// **A materialized worktree cannot span a suspension, and this says so
-/// instead of silently re-materializing one** (Phase 8 Task 25.7 Task 2;
-/// Task 8 owns closing it).
+/// instead of silently re-materializing one** (Phase 8 Task 25.7 Task 2).
 ///
 /// `WorktreeGuard`'s lifetime is one synchronous call — and it has to be,
 /// since a guard is what guarantees `release` runs on a panic — while
@@ -4593,16 +4592,47 @@ fn map_item_crash_refusal(
 /// between. So an item that suspended inside its own worktree would resume
 /// with `${{ worktree.path }}` unbound, materialize a *second* worktree, and
 /// run the rest of its inner steps somewhere its earlier steps never touched
-/// — a corrupted environment with no error anywhere. Making the path durable
-/// (so a resumed item rebinds the same one) is a real design problem and is
-/// explicitly Task 8's, "worktree fan-out under concurrency".
+/// — a corrupted environment with no error anywhere.
 ///
-/// Narrower than "a `map` item cannot use worktree isolation": an item whose
-/// inner steps are all pure still gets a real worktree, materialized and
-/// released inside one segment, exactly as before. Only the specific step
-/// that would suspend is refused, and `on_item_error` governs what that does
-/// to the rest of the fan-out — the same granularity a missing
-/// `WorktreeProvider` already had.
+/// # This refusal is permanent and accepted, not a placeholder (ruling R12)
+///
+/// **No task owns closing it.** An earlier version of this comment named Phase
+/// 8 Task 25.7 Task 8 as the owner; that task ran, deliberately did not build
+/// this, and the decision was then made explicitly rather than left as a stale
+/// pointer to a finished task. Issue #64's scope is `map.max_parallel` and
+/// per-item caps, and worktree-path durability is neither — nor is this a
+/// regression #64 introduced, since before it *every* `map` inner step was
+/// stubbed regardless of `isolation:`, so `isolation: worktree` plus real
+/// dispatch was already non-functional for real work. #64 made real dispatch
+/// work for items that are not worktree-isolated and left worktree-isolated
+/// ones exactly where they were.
+///
+/// **What a future reader would actually have to build**, stated so that
+/// whoever picks this up starts from the real shape rather than from "there
+/// was a TODO here":
+///
+/// - a durable per-item record of the materialized worktree path, keyed the
+///   way `workflow_step_run` is (`run_id, step_id, attempt, item_index`), so
+///   the path outlives the process that created it;
+/// - a rebind-on-resume path, so a resumed [`Loop`] re-binds
+///   `${{ worktree.path }}` to that recorded path (and re-establishes a guard
+///   over a worktree it did not itself create) instead of calling
+///   `Executor::prepare_item_isolation` a second time;
+/// - an orphan-worktree GC story for the run that never resumes — a park can
+///   wait 72h ([`crate::parking::DEFAULT_HOLD_TTL`]) and a crashed run may
+///   never come back at all, so a durable path is also a durable *leak*
+///   unless something reclaims it.
+///
+/// # What still works, and what does not
+///
+/// Narrower than "a `map` item cannot use worktree isolation", but only just:
+/// an item whose inner steps all complete in-process — `emit:`, or a step
+/// whose `when:` is false — still gets a real worktree, materialized and
+/// released inside one segment. Any inner `tool:`/`agent:`/`call:`/`gate:`
+/// hits this refusal, so on this loop `isolation: worktree` is not usable for
+/// real work today. Only the specific step that would suspend is refused, and
+/// `on_item_error` governs what that does to the rest of the fan-out — the
+/// same granularity a missing `WorktreeProvider` already had.
 ///
 /// `suspension` names *how* the step would suspend — a dispatch the caller
 /// must perform, or (Phase 8 Task 25.7 Task 6) a human's answer to a nested
