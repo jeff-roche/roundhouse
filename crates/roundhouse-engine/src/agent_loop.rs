@@ -1513,19 +1513,14 @@ async fn dispatch_builtin(
         };
     }
 
-    // Phase 8 Task 19 lane B, Task 9: a shell call streams real deltas; the
-    // four filesystem kinds stay one-shot (`None`). **`writer.clone()` is
-    // load-bearing, not incidental** — `writer` here IS `actor.writer()`
-    // (see `run_agent_loop`'s own `let writer = actor.writer();`), the exact
-    // `EventWriter` this function's own `TaskCompleted`/`TaskFailed` appends
-    // below use. `ShellDeltaSink` must hold a `Clone` of that SAME
-    // `EventWriter` — a derived `Clone` over the identical underlying
-    // `mpsc::Sender<WriteCmd>` — for the Global Constraint
-    // (`run_isolated_shell_dispatch`'s own doc comment on `completion` has
-    // the full argument) to hold: every delta/progress append and the
-    // terminal append must enqueue onto the SAME writer-actor FIFO, or the
-    // "whichever enqueues first is processed first" guarantee this relies on
-    // does not apply.
+    // Phase 8 Task 19 lane B, Task 9: `TaskParams::Shell` streams real
+    // deltas; the four filesystem kinds stay one-shot (`None`). `writer`
+    // here is `actor.writer()` (`run_agent_loop`'s own `let writer =
+    // actor.writer();`), the exact `EventWriter` this function's own
+    // `TaskCompleted`/`TaskFailed` appends below use — `writer.clone()`
+    // must stay a clone of THAT SAME writer for the Global Constraint to
+    // hold; see `run_isolated_shell_dispatch`'s doc comment on `completion`
+    // for the full argument.
     let delta_sink = match &params {
         roundhouse_policy::TaskParams::Shell(_) => Some(crate::tool_dispatch::ShellDeltaSink::new(
             writer.clone(),

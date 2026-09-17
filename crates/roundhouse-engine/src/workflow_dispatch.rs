@@ -319,19 +319,16 @@ pub async fn dispatch_tool_for_workflow(
         });
     }
 
-    // Phase 8 Task 19 lane B, Task 9: a shell step streams real deltas; the
-    // four filesystem kinds stay one-shot (`None`). **`writer.clone()` is
-    // load-bearing, not incidental** — `writer` here is `actor.writer()`
-    // (see this function's own `let writer = actor.writer();` above), the
-    // exact `EventWriter` this function's own `TaskCompleted`/`TaskFailed`
-    // appends use. `ShellDeltaSink` must hold a `Clone` of that SAME
-    // `EventWriter` — a derived `Clone` over the identical underlying
-    // `mpsc::Sender<WriteCmd>` — for the Global Constraint
-    // (`run_isolated_shell_dispatch`'s own doc comment on `completion` has
-    // the full argument) to hold: every delta/progress append and the
-    // terminal append must enqueue onto the SAME writer-actor FIFO, or the
-    // "whichever enqueues first is processed first" guarantee this relies on
-    // does not apply.
+    // Phase 8 Task 19 lane B, Task 9: `TaskParams::Shell` streams real
+    // deltas; the four filesystem kinds stay one-shot (`None`). `writer`
+    // here is `actor.writer()` (this function's own `let writer =
+    // actor.writer();` above) — the same instance this function's own
+    // `TaskCompleted` append below uses, and the same instance
+    // `record_workflow_task_failed` reaches for via `actor.writer()` on the
+    // terminal-failure path. `writer.clone()` must stay a clone of THAT
+    // writer for the Global Constraint to hold; see
+    // `run_isolated_shell_dispatch`'s doc comment on `completion` for the
+    // full argument.
     let delta_sink = match &params {
         TaskParams::Shell(_) => Some(crate::tool_dispatch::ShellDeltaSink::new(
             writer.clone(),

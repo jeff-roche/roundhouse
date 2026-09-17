@@ -579,12 +579,21 @@ async fn shell_tool_dispatch_streams_deltas_and_progress_before_its_terminal_eve
 /// records the terminal event, so both enqueue onto the same writer-actor
 /// FIFO.
 ///
-/// The dispatched script writes ~100 KiB of stdout immediately — comfortably
-/// over `SHELL_FLUSH_CHUNK_BYTES` (64 KiB), so the pump's size-triggered
-/// flush fires and commits almost immediately — before blocking in
-/// `sleep 30`, so the step's own 300ms `step_timeout` always elapses while
-/// the script is still deep in that sleep, long after the size-triggered
-/// flush already landed.
+/// **Fix round 1, M2:** an earlier version of this test used a fixed-size
+/// burst (`yes | head -c 100000`, then `sleep 30`) before the 300ms
+/// `step_timeout` elapsed. That whole ~100 KiB write (and its one
+/// size-triggered flush) completes in microseconds, so by the time the
+/// timeout fired the pump was already idle and blocked on `recv()` — the
+/// assertion below was then only ever checking "an already-committed delta
+/// precedes the terminal event," true almost by construction, and never
+/// entering the window the Global Constraint is actually about (a
+/// `flush_stream` future dropped by the outer `select!` after its
+/// `send(...).await` returned but before the reply). The dispatched script
+/// now runs `yes` alone — genuinely unbounded output (`drain_to_end` keeps
+/// reading past `MAX_SHELL_OUTPUT_BYTES` to EOF, so it never stops on its
+/// own) — so the pump is still actively streaming, not idle, at the instant
+/// the real 300ms `step_timeout` (the parameter under test, not test-side
+/// synchronization) fires.
 #[tokio::test]
 async fn shell_tool_step_timeout_with_prior_output_commits_all_deltas_before_the_terminal_event() {
     let dir = TempDir::new().unwrap();
@@ -592,7 +601,7 @@ async fn shell_tool_step_timeout_with_prior_output_commits_all_deltas_before_the
     let program = workspace_program(
         &workspace_root,
         "streamed_then_hangs.sh",
-        "#!/bin/sh\nyes | head -c 100000\nsleep 30\n",
+        "#!/bin/sh\nyes\n",
     );
 
     let (actor, actor_root, db_path, session_id) = setup_actor(

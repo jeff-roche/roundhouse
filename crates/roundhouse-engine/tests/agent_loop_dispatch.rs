@@ -1008,21 +1008,26 @@ async fn a_dispatched_shell_tasks_deltas_and_progress_land_between_started_and_i
 /// holds a `Clone` of the very same `EventWriter` that records the terminal
 /// event, so both enqueue onto the same writer-actor FIFO.
 ///
-/// The dispatched script writes ~100 KiB of stdout immediately — comfortably
-/// over `SHELL_FLUSH_CHUNK_BYTES` (64 KiB) — before blocking in `sleep 30`,
-/// so the pump's size-triggered (not tick-triggered) flush fires and commits
-/// almost immediately, well before the fixed head start below elapses; the
-/// dispatch is cancelled while the script is still deep in that sleep, long
-/// before it could ever exit on its own. This mirrors the fixed-head-start
-/// idiom `shell_command_cancellation_reaches_the_model_facing_dispatch`
-/// above already uses for "cancel mid-flight" tests in this file, sized up
-/// for the extra size-triggered-flush margin this test needs.
+/// **Fix round 1, M4+M2:** an earlier version of this test used a
+/// fixed-size burst (`yes | head -c 100000`, then `sleep 30`) and a fixed
+/// `tokio::time::sleep` head start before cancelling. Both were wrong the
+/// same way: the whole ~100 KiB write (and its one size-triggered flush)
+/// completed in microseconds, so by the time the fixed sleep elapsed the
+/// pump was already idle and blocked on `recv()` — the assertion below was
+/// then only ever checking "an already-committed delta precedes the
+/// terminal event," true almost by construction, and never entering the
+/// window the Global Constraint is actually about (a `flush_stream` future
+/// dropped by the outer `select!` after its `send(...).await` returned but
+/// before the reply). The dispatched script now runs `yes` alone — genuinely
+/// unbounded output (`drain_to_end` keeps reading past `MAX_SHELL_OUTPUT_BYTES`
+/// to EOF, so it never stops on its own) — and the cancel is condition-driven:
+/// this test polls the store for the shell task's own first `TaskDelta`
+/// (proof the pump is actively streaming, not idle) and only then cancels,
+/// under an outer safety timeout rather than a fixed-duration guess. This
+/// way the cancel genuinely races a live, still-producing pump.
 #[tokio::test]
 async fn a_cancelled_shell_tasks_deltas_all_commit_before_its_terminal_event() {
-    let (dir, script) = workspace_contained_script(
-        "#!/bin/sh\nyes | head -c 100000\nsleep 30\n",
-        "cancel_me.sh",
-    );
+    let (dir, script) = workspace_contained_script("#!/bin/sh\nyes\n", "cancel_me.sh");
     let canonical_script = script.canonicalize().unwrap();
 
     let (actor, _writer, db_path, session_id) = new_actor(
@@ -1066,14 +1071,43 @@ async fn a_cancelled_shell_tasks_deltas_all_commit_before_its_terminal_event() {
         },
     );
     tokio::pin!(run);
+
+    // Condition-driven: wait for real proof the pump is actively streaming
+    // (its own first committed `TaskDelta`) before cancelling — never a
+    // fixed sleep whose duration would otherwise decide whether the
+    // non-vacuity assertion below can pass. Wrapped in an outer safety
+    // timeout so a genuine regression (no delta ever streamed) fails fast
+    // with a clear message instead of hanging.
+    let wait_for_first_delta_then_cancel = async {
+        loop {
+            let reopened = open(&db_path).await.unwrap();
+            let events = session_events(&reopened, session_id).await.unwrap();
+            if events
+                .iter()
+                .any(|e| matches!(&e.payload, EventPayload::TaskDelta { .. }))
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        actor
+            .cancel(&RUNNER, roundhouse_core::CancelReason::User)
+            .await
+            .unwrap();
+    };
+
     tokio::select! {
         result = &mut run => panic!("shell command completed before cancellation: {result:?}"),
         _ = async {
-            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-            actor
-                .cancel(&RUNNER, roundhouse_core::CancelReason::User)
-                .await
-                .unwrap();
+            tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                wait_for_first_delta_then_cancel,
+            )
+            .await
+            .expect(
+                "a streamed TaskDelta must appear well within 10s of `yes` running -- if it \
+                 never does, the size-triggered flush this test depends on has regressed",
+            );
         } => {}
     }
     let blocks = tokio::time::timeout(std::time::Duration::from_secs(5), &mut run)

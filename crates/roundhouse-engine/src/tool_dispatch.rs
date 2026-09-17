@@ -1114,8 +1114,12 @@ impl FlushTicker for IntervalFlushTicker {
 /// the caller that already holds these (a `SessionActor`, via its
 /// `writer()`/`runner()`/`session_id()`/`state_dir()` accessors) and handed
 /// to [`execute_builtin`]/[`run_isolated_shell_dispatch`] as
-/// `Option<ShellDeltaSink>` — `None` (every existing call site, until Task 9
-/// wires this up) preserves today's single-buffered-string behavior exactly.
+/// `Option<ShellDeltaSink>` — `None` for the four filesystem kinds, which
+/// stay single-buffered-string; `agent_loop::dispatch_builtin` and
+/// `workflow_dispatch::dispatch_tool_for_workflow` (Phase 8 Task 19 lane B,
+/// Task 9) each build `Some` of these for `TaskParams::Shell`, from a clone
+/// of the exact `EventWriter` that records that dispatch's own terminal
+/// event.
 pub struct ShellDeltaSink {
     writer: EventWriter,
     runner: &'static TaskRunner,
@@ -1486,10 +1490,12 @@ async fn emit_gap_progress(
 /// BOTH channels have closed and received their final flush — "the pump
 /// returns after both drains drop their senders," per the brief.
 ///
-/// `sink: None` (every call site until Task 9 wires this up) makes this an
-/// immediate no-op — both `stdout_rx`/`stderr_rx` are `None` too in that
-/// case (see [`run_isolated_shell_dispatch`]), so today's behavior
-/// (single buffered `ShellOutput`, no deltas) is unchanged.
+/// `sink: None` (every non-shell dispatch — the four filesystem kinds) makes
+/// this an immediate no-op — both `stdout_rx`/`stderr_rx` are `None` too in
+/// that case (see [`run_isolated_shell_dispatch`]), so a filesystem call's
+/// behavior (single buffered `ShellOutput`, no deltas) is unchanged. A shell
+/// dispatch passes `Some` (Phase 8 Task 19 lane B, Task 9's production
+/// wiring).
 ///
 /// No `biased;` on the `select!` below (fix round 1, finding 11 — an
 /// earlier version had one): with it, a stream that is continuously ready
