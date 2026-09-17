@@ -285,8 +285,10 @@ impl SubAgentSessions {
     /// filter was already looking for and, before this task, nothing ever
     /// wrote. Three production paths reach it: `scheduler_driver::
     /// drive_workflow_agent_child`, which retires a workflow `agent:` step's
-    /// child unconditionally the moment driving it finishes — success,
-    /// error, timeout, or a vanished session alike; `DaemonSubAgentHost::
+    /// child on every path driving it can finish — success, loop error,
+    /// timeout, or a vanished session — mapping which one onto the
+    /// terminator's own outcome (Task 7) rather than passing the same value
+    /// unconditionally; `DaemonSubAgentHost::
     /// close_children`, which retires a closing session's own tracked
     /// children as one step of that session's own close; and
     /// `spawn_session_reaper`'s `RetireSubAgent` reap action, for a tracked

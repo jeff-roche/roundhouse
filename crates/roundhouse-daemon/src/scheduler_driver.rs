@@ -38,14 +38,15 @@
 //!   so it is a known state rather than a surprise. Detecting and recovering
 //!   such rows is §8.11's reaper, not this driver's to invent.
 //! - **It does not resume a parked run, so it does not retire a parked run's
-//!   session either.** Every *terminal* delivery retires its session through
-//!   [`HeadlessSession::teardown`] (see
-//!   [`DeliveryExecutor::retire_session`] for why that cannot wait for
-//!   `spawn_session_reaper`), so live sessions are bounded by the
-//!   concurrency cap rather than by the daemon's uptime. A run parked on a
-//!   human gate is the exception: its session must stay alive for the resume
-//!   that has no implementation yet, so it is held until the daemon
-//!   restarts.
+//!   session either.** Every *terminal* delivery retires its session —
+//!   durably closed with its mapped outcome through [`DeliveryExecutor::
+//!   close_and_retire`] when a workflow run actually reached one, or torn
+//!   down with no terminator through [`DeliveryExecutor::release_session`]
+//!   when it never did (see that method's own doc comment for why) — so
+//!   live sessions are bounded by the concurrency cap rather than by the
+//!   daemon's uptime. A run parked on a human gate is the exception: its
+//!   session must stay alive for the resume that has no implementation yet,
+//!   so it is held until the daemon restarts.
 //! - **It resolves no secrets and no `env()` names.** See
 //!   [`DeliveryExecutor::run_claimed_delivery`] for both.
 
@@ -1747,7 +1748,7 @@ impl DeliveryExecutor {
             Err(error) => {
                 self.fail(&delivery_id, binding_id, error.kind(), error.to_string())
                     .await;
-                self.retire_session(session).await;
+                self.release_session(session).await;
             }
         }
     }
@@ -1795,7 +1796,8 @@ impl DeliveryExecutor {
             })
             .await;
             self.release(binding_id);
-            self.retire_session(session).await;
+            self.close_and_retire(session, SessionOutcome::Cancelled)
+                .await;
             return outcome;
         }
 
@@ -1807,7 +1809,8 @@ impl DeliveryExecutor {
                 })
                 .await;
                 self.release(binding_id);
-                self.retire_session(session).await;
+                self.close_and_retire(session, SessionOutcome::Completed)
+                    .await;
             }
             RunConclusion::Parked => {
                 tracing::info!(
@@ -1824,7 +1827,22 @@ impl DeliveryExecutor {
             RunConclusion::Failed(reason) => {
                 self.fail(delivery_id, binding_id, "workflow_failed", reason)
                     .await;
-                self.retire_session(session).await;
+                // Task 7: only a genuinely reached terminal `RunState` (this
+                // arm also catches `Cancelled` when `cancelled_handling` is
+                // `AsFailure` — the ordinary live-claim shape, where
+                // `Cancelled` is not carved out above) gets a `SessionClosed`
+                // terminator; a driver `Err` that never reached one gets
+                // `release_session` instead, per that method's own doc
+                // comment.
+                match terminal_run_state(&outcome) {
+                    Some(state) => {
+                        self.close_and_retire(session, session_outcome_for_terminal(state))
+                            .await;
+                    }
+                    None => {
+                        self.release_session(session).await;
+                    }
+                }
             }
         }
         outcome
@@ -1845,7 +1863,8 @@ impl DeliveryExecutor {
         }
     }
 
-    /// Retires a finished delivery's headless session, if one was created.
+    /// Releases a finished delivery's headless session **without** writing a
+    /// `SessionClosed` terminator, if one was created.
     ///
     /// **This is the whole reason a scheduled run's session does not
     /// accumulate.** `spawn_session_reaper` only fires on
@@ -1855,18 +1874,54 @@ impl DeliveryExecutor {
     /// one session per delivery. At one delivery a minute a daemon would
     /// reach `SessionRegistry`'s `DEFAULT_MAX_SESSIONS` (10,000) in about a
     /// week and then fail every further delivery with `RegistryFull`, holding
-    /// ten thousand real isolation handles. Retiring the session at the
-    /// delivery's terminal outcome is what bounds it, and the bound is the
+    /// ten thousand real isolation handles. Tearing the session down at the
+    /// delivery's own end is what bounds it, and the bound is the
     /// concurrency cap rather than the daemon's uptime.
     ///
-    /// Called on the completed and failed paths and never on the parked one —
-    /// see [`Self::run_claimed`].
-    async fn retire_session(&self, session: Option<HeadlessSession>) {
+    /// # Why this writes no terminator (Task 7)
+    ///
+    /// This is [`Self::close_and_retire`]'s counterpart for every path that
+    /// never reached a genuine `Ok(DrivenRun::Outcome(RunOutcome::Terminal
+    /// { .. }))`: a pre-run infra failure (`Err(DeliveryError)` — workspace/
+    /// job resolution, session construction, a store error) and a boot-time
+    /// redrive whose own infra failed the same way. Both recreate a session
+    /// under the SAME `session_id` on a later attempt — the infra failure
+    /// leaves the underlying `workflow_run` row non-terminal, so a future
+    /// boot's Mechanism 2/3 redrive rebuilds a `HeadlessSession` for that
+    /// same `session_id` and keeps appending to its event log. A terminator
+    /// written here would precede those later events and trip the store's
+    /// own tail guard (`StoreError::SessionClosed`) the moment that redrive
+    /// tried to append anything.
+    ///
+    /// Never called on the parked path — see [`Self::run_claimed`].
+    async fn release_session(&self, session: Option<HeadlessSession>) {
         let Some(session) = session else {
             return;
         };
         session
             .teardown(&self.sessions, &self.resources.proxy)
+            .await;
+    }
+
+    /// Durably closes a finished delivery's headless session with `outcome`
+    /// as its `SessionClosed` terminator, then tears it down — [`Self::
+    /// release_session`]'s counterpart for the paths that reached a genuine
+    /// `Ok(DrivenRun::Outcome(RunOutcome::Terminal { .. }))` (Task 7): the
+    /// delivery is done and this `session_id` will never be redriven again,
+    /// so recording how it ended is safe.
+    ///
+    /// A close failure (a durable store error, or [`HeadlessSession::
+    /// close_and_teardown`]'s own timeout) is already logged at error level
+    /// by that method; this has nothing further to add and does not
+    /// propagate it, matching [`SubAgentSessions::retire_child`]'s identical
+    /// choice for a delivery already past the point of reporting one further
+    /// onward.
+    async fn close_and_retire(&self, session: Option<HeadlessSession>, outcome: SessionOutcome) {
+        let Some(session) = session else {
+            return;
+        };
+        let _ = session
+            .close_and_teardown(outcome, &self.sessions, &self.resources.proxy)
             .await;
     }
 
@@ -3128,11 +3183,29 @@ impl DeliveryExecutor {
         // later timing out or erroring still genuinely tainted its parent.
         apply_taint_boundary_merge(parent_actor, &child_actor);
 
+        // Task 7: `retire_child` durably closes the child with whichever
+        // outcome it is handed, so that outcome has to say what actually
+        // happened rather than the placeholder `Cancelled` every path used
+        // to pass unconditionally — a run loop that genuinely succeeded was
+        // being recorded as cancelled in an append-only log. Computed from a
+        // borrow of `outcome` so the value itself is still intact for the
+        // `match outcome` below, which builds this step's `WorkDone`.
+        let child_session_outcome = match &outcome {
+            Ok(Ok(_)) => SessionOutcome::Completed,
+            Ok(Err(loop_err)) => SessionOutcome::Failed {
+                reason: format!("the spawned child's agent loop failed: {loop_err}"),
+            },
+            Err(_elapsed) => SessionOutcome::Failed {
+                reason: format!(
+                    "the agent step's spawned child exceeded its {step_timeout:?} step_timeout"
+                ),
+            },
+        };
         self.resources
             .sub_agents
             .retire_child(
                 child_session_id,
-                SessionOutcome::Cancelled,
+                child_session_outcome,
                 &self.resources.spawn_tree,
                 &self.sessions,
                 &self.resources.proxy,
@@ -3777,6 +3850,41 @@ fn conclusion_for(
     }
 }
 
+/// The `RunState` this outcome's own run reached through `RunOutcome::
+/// Terminal`, or `None` for every other shape (`Err`, `Parked`,
+/// `AwaitingWork`, `ChildParked`).
+///
+/// Task 7: this is the exact boundary between [`DeliveryExecutor::
+/// close_and_retire`] and [`DeliveryExecutor::release_session`] —
+/// `conclusion_for`'s [`RunConclusion::Failed`] arm alone cannot tell them
+/// apart, since it also collapses a driver `Err` (which never reached any
+/// `RunState` at all) into the same variant as a genuine `Terminal { state:
+/// Failed, .. }`. Only `Some` gets a `SessionClosed` terminator.
+fn terminal_run_state(
+    outcome: &Result<DrivenRun, roundhouse_flow::exec::run_loop::RunLoopError>,
+) -> Option<RunState> {
+    match outcome {
+        Ok(DrivenRun::Outcome(RunOutcome::Terminal { state, .. })) => Some(*state),
+        _ => None,
+    }
+}
+
+/// Maps a genuinely reached terminal `RunState` onto the `SessionOutcome`
+/// its session's `SessionClosed` terminator records (Task 7's mapping):
+/// `Completed` to `Completed`, `Cancelled` to `Cancelled`, and anything else
+/// (in practice only `Failed`, `RunState`'s one other terminal variant) to
+/// `Failed` carrying the state's own wire name — never a free-text sentence,
+/// since [`RunState::wire_name`] already names it.
+fn session_outcome_for_terminal(state: RunState) -> SessionOutcome {
+    match state {
+        RunState::Completed => SessionOutcome::Completed,
+        RunState::Cancelled => SessionOutcome::Cancelled,
+        other => SessionOutcome::Failed {
+            reason: other.wire_name().to_string(),
+        },
+    }
+}
+
 /// Discovers `ready` deliveries, **claims them in this tick**, and spawns one
 /// task per claimed delivery to run it.
 ///
@@ -4298,7 +4406,7 @@ async fn redrive_reserved_or_running(
                             error.to_string(),
                         )
                         .await;
-                    executor.retire_session(session).await;
+                    executor.release_session(session).await;
                 }
             }
         }
@@ -4501,7 +4609,7 @@ async fn finish_cancellation_requested_delivery(
                  cancellation_requested and its admission slot held so the next boot retries \
                  rather than stranding the run at non-terminal Cancelling forever"
             );
-            executor.retire_session(session).await;
+            executor.release_session(session).await;
         }
     }
 }
@@ -5838,6 +5946,47 @@ mod child_run_tests {
             conn.interact(move |connection| recover_run(connection, run_id).unwrap().run.state)
                 .await
                 .unwrap()
+        }
+
+        /// The `SessionOutcome` this session's own `SessionClosed` terminator
+        /// carries, or `None` if its log has no terminator at all.
+        async fn session_close_outcome(&self, session_id: SessionId) -> Option<SessionOutcome> {
+            roundhouse_store::session_events(&self.store, session_id)
+                .await
+                .unwrap()
+                .into_iter()
+                .find_map(|event| match event.payload {
+                    EventPayload::SessionClosed { outcome } => Some(outcome),
+                    _ => None,
+                })
+        }
+
+        /// The one other session besides `parent` with any recorded events —
+        /// the spawned `agent:` step's child, whose registry/spawn-tree
+        /// record is already gone by the time `retire_child` finishes
+        /// retiring it, so its `session_id` cannot be recovered from either
+        /// of those any more.
+        async fn only_other_session_id(&self, parent: SessionId) -> SessionId {
+            let conn = self.store.pool.get().await.unwrap();
+            let parent_str = parent.to_string();
+            let ids: Vec<String> = conn
+                .interact(move |connection| {
+                    connection
+                        .prepare("SELECT DISTINCT session_id FROM events WHERE session_id != ?1")
+                        .unwrap()
+                        .query_map(rusqlite::params![parent_str], |row| row.get(0))
+                        .unwrap()
+                        .map(Result::unwrap)
+                        .collect()
+                })
+                .await
+                .unwrap();
+            assert_eq!(
+                ids.len(),
+                1,
+                "expected exactly one other session besides the parent, got {ids:?}"
+            );
+            SessionId::from_uuid(Uuid::parse_str(&ids[0]).unwrap())
         }
 
         async fn headless_parent(
@@ -7455,6 +7604,16 @@ mod child_run_tests {
             "the spawned child's fan-out slot must be released once it is driven to completion"
         );
 
+        // Task 7: `retire_child`'s own terminator must reflect the child's
+        // real outcome — `run_agent_loop` genuinely succeeded here.
+        let child_session_id = harness.only_other_session_id(session_id).await;
+        match harness.session_close_outcome(child_session_id).await {
+            Some(SessionOutcome::Completed) => {}
+            other => panic!(
+                "a spawned child that finished successfully must close Completed, got {other:?}"
+            ),
+        }
+
         let requests = provider.requests();
         assert_eq!(
             requests.len(),
@@ -7564,6 +7723,222 @@ mod child_run_tests {
             0,
             "a driving FAILURE must still release the spawned child's fan-out slot, not just success"
         );
+
+        // Task 7: a run loop error is `SessionOutcome::Failed`, naming what
+        // happened — not the placeholder `Cancelled` `retire_child` used to
+        // be handed unconditionally.
+        let parent_session_id = row.session_id.expect("reserve stamps a session id");
+        let child_session_id = harness.only_other_session_id(parent_session_id).await;
+        match harness.session_close_outcome(child_session_id).await {
+            Some(SessionOutcome::Failed { reason }) => assert!(
+                reason.contains("agent loop failed"),
+                "a run-loop failure must close its child Failed naming the loop error, got \
+                     {reason:?}"
+            ),
+            other => panic!("a run loop error must close its child Failed, got {other:?}"),
+        }
+    }
+
+    /// A `Provider` whose `stream_chat` future never resolves. Paired with
+    /// `#[tokio::test(start_paused = true)]` and `tokio::time::advance`, this
+    /// forces `drive_workflow_agent_child`'s own `tokio::time::timeout` to
+    /// elapse deterministically — no real time passes and there is nothing
+    /// to race, unlike a genuinely slow real operation.
+    struct HangingProvider;
+
+    impl roundhouse_provider::Provider for HangingProvider {
+        fn capabilities(
+            &self,
+            _model: &roundhouse_provider::ModelId,
+        ) -> roundhouse_provider::Capabilities {
+            roundhouse_provider::Capabilities::default()
+        }
+        fn resolve(
+            &self,
+            _req: &roundhouse_provider::ChatRequest,
+        ) -> Result<roundhouse_provider::Plan, roundhouse_provider::ProviderError> {
+            Ok(roundhouse_provider::Plan {
+                endpoint: "fake".into(),
+            })
+        }
+        fn stream_chat<'a>(
+            &'a self,
+            _req: &'a roundhouse_provider::ChatRequest,
+            _ctx: &'a roundhouse_provider::RequestCtx,
+        ) -> roundhouse_provider::BoxFut<
+            'a,
+            Result<roundhouse_provider::ChatStream, roundhouse_provider::ProviderError>,
+        > {
+            Box::pin(std::future::pending())
+        }
+        fn count_tokens<'a>(
+            &'a self,
+            _req: &'a roundhouse_provider::ChatRequest,
+            _ctx: &'a roundhouse_provider::RequestCtx,
+        ) -> roundhouse_provider::BoxFut<
+            'a,
+            Result<roundhouse_provider::TokenCount, roundhouse_provider::ProviderError>,
+        > {
+            Box::pin(async { Ok(roundhouse_provider::TokenCount::default()) })
+        }
+        fn list_models<'a>(
+            &'a self,
+            _ctx: &'a roundhouse_provider::RequestCtx,
+        ) -> roundhouse_provider::BoxFut<
+            'a,
+            Result<Vec<roundhouse_provider::ModelInfo>, roundhouse_provider::ProviderError>,
+        > {
+            Box::pin(async { Ok(Vec::new()) })
+        }
+    }
+
+    /// Task 7's full `drive_workflow_agent_child` mapping, exercised by
+    /// calling it directly rather than through a whole driven workflow —
+    /// `dispatch_agent_for_workflow` alone is enough to build a real,
+    /// registered child, and this method's own outer `tokio::time::timeout`
+    /// is what this test forces to elapse.
+    ///
+    /// No sleep, no real time: `start_paused = true` plus
+    /// `tokio::time::advance` jumps straight past `step_timeout` while
+    /// `HangingProvider`'s `stream_chat` sits pending forever.
+    #[tokio::test(start_paused = true)]
+    async fn drive_workflow_agent_child_maps_an_elapsed_step_timeout_to_a_failed_terminator() {
+        let harness = harness_with_overlap_and_rules_and_provider(
+            agent_step_workflow(),
+            OverlapPolicy::Skip,
+            allow_agent_rules(),
+            Arc::new(HangingProvider) as Arc<dyn roundhouse_provider::Provider>,
+        )
+        .await;
+        let (parent, _spec) = harness.headless_parent(&harness.sessions).await;
+        let host = parent
+            .actor()
+            .sub_agent_host()
+            .expect("create_headless_session wires one");
+
+        let dispatched = dispatch_agent_for_workflow(
+            parent.actor(),
+            Some(&host),
+            serde_json::json!({"prompt": "say hi"}),
+            None,
+            250,
+        )
+        .await
+        .expect("dispatch must not error");
+        let child_session_id = match dispatched.result {
+            AgentSpawnOutcome::Spawned { child_session_id } => child_session_id,
+            other => panic!("expected a real spawn, got {other:?}"),
+        };
+
+        let executor = harness.executor.clone();
+        let parent_actor = Arc::clone(parent.actor());
+        let task_id = dispatched.task_id;
+        let first_task_seq = dispatched.first_task_seq;
+        let drive = tokio::spawn(async move {
+            executor
+                .drive_workflow_agent_child(
+                    &parent_actor,
+                    child_session_id,
+                    task_id,
+                    first_task_seq,
+                    "review".to_string(),
+                    "say hi".to_string(),
+                    "claude-sonnet-5".to_string(),
+                    vec![],
+                    None,
+                    Duration::from_millis(1),
+                )
+                .await
+        });
+        tokio::time::advance(Duration::from_millis(2)).await;
+        let done = drive.await.expect("the drive task must not panic");
+
+        match &done.status {
+            WorkStatus::Failed { message } => assert!(
+                message.contains("step_timeout"),
+                "an elapsed step_timeout must name itself in the failure, got {message:?}"
+            ),
+            other => panic!("an elapsed step_timeout must fail the step, got {other:?}"),
+        }
+        match harness.session_close_outcome(child_session_id).await {
+            Some(SessionOutcome::Failed { reason }) => assert!(
+                reason.contains("step_timeout"),
+                "a timed-out child must close Failed naming the timeout, got {reason:?}"
+            ),
+            other => panic!("a timed-out child must close Failed, got {other:?}"),
+        }
+    }
+
+    /// The fourth arm of Task 7's mapping: a child whose own `SessionRegistry`
+    /// entry is gone by the time this method tries to drive it (evicted by
+    /// something else, while `SubAgentSessions` still tracks it as a live
+    /// child pending drive) still gets a durable terminator — `Cancelled`,
+    /// since nothing here ever learns how it actually ended.
+    #[tokio::test]
+    async fn drive_workflow_agent_child_maps_a_vanished_child_to_a_cancelled_terminator() {
+        let harness = harness_with_overlap_and_rules_and_provider(
+            agent_step_workflow(),
+            OverlapPolicy::Skip,
+            allow_agent_rules(),
+            Arc::new(ScriptedTextProvider::new("unused")) as Arc<dyn roundhouse_provider::Provider>,
+        )
+        .await;
+        let (parent, _spec) = harness.headless_parent(&harness.sessions).await;
+        let host = parent
+            .actor()
+            .sub_agent_host()
+            .expect("create_headless_session wires one");
+
+        let dispatched = dispatch_agent_for_workflow(
+            parent.actor(),
+            Some(&host),
+            serde_json::json!({"prompt": "say hi"}),
+            None,
+            250,
+        )
+        .await
+        .expect("dispatch must not error");
+        let child_session_id = match dispatched.result {
+            AgentSpawnOutcome::Spawned { child_session_id } => child_session_id,
+            other => panic!("expected a real spawn, got {other:?}"),
+        };
+
+        // The child's own registry entry vanishes while `SubAgentSessions`
+        // still tracks it as a live child pending drive — exactly the gap
+        // `drive_workflow_agent_child`'s missing-child branch exists to
+        // close.
+        harness.sessions.remove(child_session_id);
+
+        let done = harness
+            .executor
+            .drive_workflow_agent_child(
+                parent.actor(),
+                child_session_id,
+                dispatched.task_id,
+                dispatched.first_task_seq,
+                "review".to_string(),
+                "say hi".to_string(),
+                "claude-sonnet-5".to_string(),
+                vec![],
+                None,
+                Duration::from_secs(60),
+            )
+            .await;
+
+        match &done.status {
+            WorkStatus::Failed { message } => assert!(
+                message.contains("vanished"),
+                "a missing child must fail naming what happened, got {message:?}"
+            ),
+            other => panic!("a missing child must fail the step, got {other:?}"),
+        }
+        match harness.session_close_outcome(child_session_id).await {
+            Some(SessionOutcome::Cancelled) => {}
+            other => panic!(
+                "a vanished child must still be closed Cancelled — SubAgentSessions still \
+                     tracked it even though its own registry entry was gone, got {other:?}"
+            ),
+        }
     }
 
     #[tokio::test]
