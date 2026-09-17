@@ -30,10 +30,19 @@
 //! against an arbitrary *smaller* point picked without asking the splitter
 //! again). `DeltaCoalescer` never holds an `EventWriter` or a `Redactor`
 //! itself — it only calls whatever is injected — so it stays pure,
-//! synchronous, and ignorant of the store. A final flush
-//! ([`DeltaCoalescer::block_stop`], [`DeltaCoalescer::finish`]) releases
-//! everything, splitter or not — the splitter is a holdback-for-more-bytes
-//! mechanism, and a final flush has no more bytes coming.
+//! synchronous, and ignorant of the store.
+//!
+//! **Controller ruling R11 (a final release still needs split-safe
+//! boundaries):** a chunk boundary inside a final release
+//! ([`DeltaCoalescer::block_stop`], [`DeltaCoalescer::finish`], and the
+//! kind-change flush) is still a boundary between two separately redacted
+//! payloads, so R1's constraint applies there too — R1's original "a final
+//! flush releases everything, splitter or not" undersold it: only the
+//! *last* chunk of a final release is an unconditional "emit whatever
+//! remains"; every earlier cut inside an oversized final release goes
+//! through [`SplitFn`] with `final_flush = true` (no holdback, since there
+//! is no more data coming — only "don't land inside a reported match"). See
+//! [`SplitFn`]'s doc comment for the two modes' exact contracts.
 //!
 //! **Controller ruling R3 (thinking signature vs. the size limit):** a
 //! thinking signature always rides the delta that closes its block. To keep
@@ -67,20 +76,32 @@ pub const FLUSH_SIZE_THRESHOLD: usize = 2048;
 /// for enough bytes to accumulate.
 pub const FLUSH_INTERVAL: Duration = Duration::from_millis(250);
 
-/// Returns the largest safe split point `k <= min(max, bytes.len())` for a
-/// buffer that may still grow (more bytes may arrive after `bytes`), with
-/// the redaction holdback already applied by whoever constructed this
-/// closure. `0` means nothing is safely flushable yet -- the caller must
-/// keep buffering and try again later (with more bytes, or at a final
-/// flush, which does not call this at all -- see the module doc's R1
-/// summary).
+/// Returns a safe split point `k <= min(max, bytes.len())` for `bytes`, with
+/// two distinct contracts selected by `final_flush` (controller ruling
+/// R11 -- the third argument):
 ///
-/// `roundhouse_store::EventWriter::redaction_split_for_flush` is the
-/// production implementation this wraps (Task 7): one `ArcSwap` load of the
-/// writer's live `Redactor` per call, so a single non-final flush sees one
-/// consistent redactor snapshot for both the holdback and the split
-/// decision.
-pub type SplitFn = Box<dyn Fn(&[u8], usize) -> usize + Send>;
+/// - `final_flush == false` (a non-final, size/time-triggered flush; more
+///   bytes may still arrive after `bytes`): the largest `k` such that no
+///   split lands inside a reported match, with the redaction holdback
+///   already applied by whoever constructed this closure. `0` means nothing
+///   is safely flushable yet -- the caller must keep buffering and try
+///   again later.
+/// - `final_flush == true` (releasing everything pending -- no more bytes
+///   are coming for this run): the largest `k` such that no split lands
+///   inside a reported match, with **no** holdback (there is nothing left
+///   to wait for). A conforming implementation must not return `0` when
+///   `max > 0` and `bytes` is non-empty -- a final release always makes
+///   progress. `DeltaCoalescer` does not simply trust that, though: if a
+///   `final_flush = true` call ever does return `0` anyway, it falls back
+///   to `min(max, bytes.len())` itself so a non-conforming splitter can
+///   never wedge a final release (see `DeltaCoalescer`'s `carve_final_chunk`
+///   for exactly where).
+///
+/// `roundhouse_store::EventWriter` supplies the production implementation
+/// (Task 7): a single additive method computing both modes from one
+/// `ArcSwap` load of the writer's live `Redactor`, so one non-final or
+/// final flush sees one consistent redactor snapshot throughout.
+pub type SplitFn = Box<dyn Fn(&[u8], usize, bool) -> usize + Send>;
 
 /// The kind of content a `Pending` run is buffering. Determined per
 /// `BlockDelta` variant; a kind change flushes whatever is pending first.
@@ -123,7 +144,7 @@ struct Pending {
 }
 
 /// Pure, synchronous batcher from `BlockDelta` to `Delta`. See the module
-/// doc for the flush rules and controller rulings R1/R3.
+/// doc for the flush rules and controller rulings R1/R3/R11.
 pub struct DeltaCoalescer {
     splitter: SplitFn,
     pending: Option<Pending>,
@@ -249,7 +270,7 @@ impl DeltaCoalescer {
         loop {
             let raw_k = {
                 let text = &self.pending.as_ref().unwrap().text;
-                (self.splitter)(text.as_bytes(), max)
+                (self.splitter)(text.as_bytes(), max, false)
             };
             if raw_k == 0 {
                 // Nothing is safely flushable yet -- keep buffering.
@@ -283,10 +304,13 @@ impl DeltaCoalescer {
         }
     }
 
-    /// Final release of whatever is pending (block_stop/finish/kind change):
-    /// releases everything, bypassing the splitter entirely (R1) -- there is
-    /// no more data coming for this run, so there is nothing left to hold
-    /// back. Still respects `BLOB_INLINE_THRESHOLD` by chunking.
+    /// Final release of whatever is pending (block_stop/finish/kind change).
+    /// Controller ruling R11: a chunk boundary inside an oversized final
+    /// release is still a boundary between two separately redacted
+    /// payloads, so it still needs the splitter -- with `final_flush = true`
+    /// (no holdback, since nothing more is coming for this run). Only the
+    /// last chunk (or the whole thing, if it already fits) is an
+    /// unconditional "emit whatever remains".
     fn close_pending(&mut self) -> Vec<Delta> {
         let Some(pending) = self.pending.take() else {
             return Vec::new();
@@ -301,7 +325,7 @@ impl DeltaCoalescer {
                 // R3: peel all buffered text into earlier, signature-less
                 // deltas first, so the closing delta -- the only one
                 // carrying the signature -- is as small as it can be.
-                let mut out = chunk_into_deltas(&text, |t| PendingKind::Thinking.make(t));
+                let mut out = self.release_chunks(&text, |t| PendingKind::Thinking.make(t));
                 if let Some(sig) = signature {
                     // Emitted unconditionally, even if the signature alone
                     // reaches BLOB_INLINE_THRESHOLD (R3's exemption): there
@@ -314,7 +338,74 @@ impl DeltaCoalescer {
                 }
                 out
             }
-            _ => chunk_into_deltas(&text, move |t| kind.make(t)),
+            _ => self.release_chunks(&text, move |t| kind.make(t)),
+        }
+    }
+
+    /// Splits `text` into char-boundary-aligned, splitter-verified prefixes
+    /// (R11), greedily as large as possible, such that each one's
+    /// `make`-wrapped `Delta` serializes under `BLOB_INLINE_THRESHOLD`. If
+    /// what remains at any point already fits as a single delta, that is
+    /// the last chunk and is emitted without consulting the splitter at all
+    /// (there is no cut to make, so nothing to verify) -- only an *actual*
+    /// cut goes through `carve_final_chunk`.
+    fn release_chunks(&self, text: &str, make: impl Fn(String) -> Delta) -> Vec<Delta> {
+        let mut out = Vec::new();
+        let mut rest = text;
+        while !rest.is_empty() {
+            if serialized_len(&make(rest.to_string())) < BLOB_INLINE_THRESHOLD {
+                out.push(make(rest.to_string()));
+                break;
+            }
+            let take = self.carve_final_chunk(rest, &make);
+            let (chunk, remainder) = rest.split_at(take);
+            out.push(make(chunk.to_string()));
+            rest = remainder;
+        }
+        out
+    }
+
+    /// Finds one splitter-verified (`final_flush = true`), size-bounded cut
+    /// point in `text`, which the caller (`release_chunks`) has already
+    /// established does *not* fit as a single delta whole. Every candidate
+    /// -- the initial ask and every further shrink needed to fit
+    /// `BLOB_INLINE_THRESHOLD` -- is re-verified through `self.splitter`
+    /// with `final_flush = true`, never decided locally (R11), mirroring
+    /// `attempt_nonfinal_flush`'s shrink loop but with no holdback and no
+    /// possibility of "keep buffering": a final release always makes
+    /// progress. If the splitter ever returns `0` here anyway (a contract
+    /// violation -- see `SplitFn`'s doc comment), this falls back to
+    /// `max` itself, and if flooring that to a char boundary ever collapses
+    /// to `0`, it widens back out to exactly one whole character -- so this
+    /// always returns at least one byte for non-empty `text`, regardless of
+    /// what the injected splitter does.
+    fn carve_final_chunk(&self, text: &str, make: &impl Fn(String) -> Delta) -> usize {
+        debug_assert!(!text.is_empty());
+        let bytes = text.as_bytes();
+        let mut max = bytes.len();
+        loop {
+            let raw_k = (self.splitter)(bytes, max, true);
+            let k = if raw_k == 0 {
+                max
+            } else {
+                raw_k.min(bytes.len())
+            };
+            let k = floor_char_boundary(text, k);
+            if k == 0 {
+                return first_char_len(text);
+            }
+            let chunk = &text[..k];
+            if serialized_len(&make(chunk.to_string())) < BLOB_INLINE_THRESHOLD {
+                return k;
+            }
+            let shrunk = floor_char_boundary(chunk, chunk.len().saturating_sub(1));
+            if shrunk == 0 {
+                // A single character's own serialization should never reach
+                // BLOB_INLINE_THRESHOLD in practice, but guarantee progress
+                // regardless of what an adversarial splitter does.
+                return first_char_len(text);
+            }
+            max = shrunk;
         }
     }
 }
@@ -341,47 +432,9 @@ fn floor_char_boundary(s: &str, idx: usize) -> usize {
     idx
 }
 
-/// Final-release chunking (no splitter/redaction holdback involved -- R1's
-/// block_stop/finish "releases everything, splitter or not"): splits `text`
-/// into char-boundary-aligned prefixes, greedily as large as possible, such
-/// that each one's `make`-wrapped `Delta` serializes under
-/// `BLOB_INLINE_THRESHOLD`.
-fn chunk_into_deltas(text: &str, make: impl Fn(String) -> Delta) -> Vec<Delta> {
-    let mut out = Vec::new();
-    let mut rest = text;
-    while !rest.is_empty() {
-        let take = max_fit_prefix_len(rest, &make);
-        let (chunk, remainder) = rest.split_at(take);
-        out.push(make(chunk.to_string()));
-        rest = remainder;
-    }
-    out
-}
-
-/// The largest char-boundary prefix length of `s` (`1..=s.len()`) whose
-/// `make`-wrapped `Delta` still serializes under `BLOB_INLINE_THRESHOLD`.
-/// Assumes a single character's own serialization never reaches
-/// `BLOB_INLINE_THRESHOLD` (4096 bytes is generous even for a worst-case
-/// `\uXXXX` escape plus envelope), so the first char boundary always
-/// qualifies and this never returns 0 for a non-empty `s` -- callers can
-/// rely on it to make forward progress.
-fn max_fit_prefix_len(s: &str, make: &impl Fn(String) -> Delta) -> usize {
-    let mut boundaries = s
-        .char_indices()
-        .map(|(i, _)| i)
-        .skip(1)
-        .chain(std::iter::once(s.len()));
-    let mut best = boundaries
-        .next()
-        .expect("s is non-empty, so it has at least one char boundary after 0");
-    for boundary in boundaries {
-        if serialized_len(&make(s[..boundary].to_string())) < BLOB_INLINE_THRESHOLD {
-            best = boundary;
-        } else {
-            break;
-        }
-    }
-    best
+/// The byte length of `s`'s first character (`0` for an empty `s`).
+fn first_char_len(s: &str) -> usize {
+    s.chars().next().map_or(0, char::len_utf8)
 }
 
 #[cfg(test)]
@@ -412,17 +465,19 @@ mod tests {
         serde_json::to_vec(delta).expect("Delta serializes").len()
     }
 
-    /// No holdback, no redaction concerns: always releases exactly what was
-    /// asked for.
+    /// No holdback, no redaction concerns, same answer for either mode:
+    /// always releases exactly what was asked for.
     fn identity_splitter() -> SplitFn {
-        Box::new(|bytes: &[u8], max: usize| max.min(bytes.len()))
+        Box::new(|bytes: &[u8], max: usize, _final_flush: bool| max.min(bytes.len()))
     }
 
-    /// Models "nothing is safely flushable yet" unconditionally -- the
-    /// degenerate holdback case R1 calls out: a non-final flush must emit
-    /// nothing and keep buffering.
+    /// Models "nothing is safely flushable yet" unconditionally, for either
+    /// mode -- the degenerate holdback case R1 calls out for a non-final
+    /// flush (must emit nothing and keep buffering), and the contract
+    /// violation R11 calls out for a final flush (the coalescer must still
+    /// make progress despite it).
     fn zero_splitter() -> SplitFn {
-        Box::new(|_bytes: &[u8], _max: usize| 0)
+        Box::new(|_bytes: &[u8], _max: usize, _final_flush: bool| 0)
     }
 
     // -------------------------------------------------------------------
@@ -649,7 +704,7 @@ mod tests {
         // start, never handing back a truncated half.
         const SECRET_START: usize = 2040;
         const SECRET_END: usize = 2060;
-        let splitter: SplitFn = Box::new(|bytes, max| {
+        let splitter: SplitFn = Box::new(|bytes, max, _final_flush| {
             let naive = max.min(bytes.len());
             if naive > SECRET_START && naive < SECRET_END {
                 SECRET_START
@@ -684,6 +739,156 @@ mod tests {
             text,
             "no bytes may be lost or reordered"
         );
+    }
+
+    // -------------------------------------------------------------------
+    // Controller ruling R11: a final release still needs split-safe chunk
+    // boundaries -- a chunk boundary inside a final release is still a
+    // boundary between two separately redacted payloads.
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn a_final_release_needing_multiple_chunks_still_never_cuts_a_secret() {
+        // Find, empirically, the natural cut point a plain (no-secret,
+        // no-escaping) buffer would converge to when it must be chunked at
+        // a final release: the largest N of plain 'a' characters whose
+        // `Delta::Text` still serializes under BLOB_INLINE_THRESHOLD.
+        let mut probe_len = 0usize;
+        while serialized_len(&Delta::Text {
+            text: "a".repeat(probe_len + 1),
+        }) < BLOB_INLINE_THRESHOLD
+        {
+            probe_len += 1;
+        }
+
+        // Plant a 20-byte secret straddling that natural cut point, so an
+        // unprotected final release would cut right through it.
+        let secret_start = probe_len - 10;
+        let secret_end = secret_start + 20;
+        let secret = "S".repeat(secret_end - secret_start);
+
+        // Refuses every non-final ask outright (so this test exercises only
+        // the final-release path, not `attempt_nonfinal_flush`), and for a
+        // final ask, moves a naive split landing inside the planted secret
+        // back to the secret's start -- exactly what `Redactor::safe_split_len`
+        // guarantees.
+        let splitter: SplitFn = Box::new(move |bytes, max, final_flush| {
+            if !final_flush {
+                return 0;
+            }
+            let naive = max.min(bytes.len());
+            if naive > secret_start && naive < secret_end {
+                secret_start
+            } else {
+                naive
+            }
+        });
+        let mut sink = DeltaCoalescer::new(splitter);
+        let now = Instant::now();
+
+        let mut text = "a".repeat(secret_start);
+        text.push_str(&secret);
+        text.push_str(&"b".repeat(500));
+
+        assert!(
+            sink.push(BlockDelta::Text(text.clone()), now).is_empty(),
+            "the non-final splitter answer (always 0) must hold everything back"
+        );
+        let released = sink.finish();
+
+        assert!(
+            released.len() > 1,
+            "a buffer at least this large must need more than one final chunk"
+        );
+        for d in &released {
+            assert!(serialized_len(d) < BLOB_INLINE_THRESHOLD);
+        }
+        assert_eq!(
+            concat_text(&released),
+            text,
+            "no bytes may be lost or reordered"
+        );
+        assert!(
+            released.iter().any(|d| text_of(d).contains(&secret)),
+            "the whole secret must land intact inside a single delta, not \
+             split across a chunk boundary: {released:?}"
+        );
+    }
+
+    #[test]
+    fn kind_change_flush_uses_final_flush_semantics_not_non_final_holdback() {
+        // A splitter that refuses every non-final ask (as if the redactor
+        // always considers something pending unsafe until it knows this is
+        // the final word on it) but answers a final-flush ask normally --
+        // so releasing the buffer at all, through a kind change, proves the
+        // kind-change flush queried with `final_flush = true`. A `push`
+        // this large would return empty forever under a real holdback if
+        // the kind-change flush ever (incorrectly) asked with `false`.
+        let splitter: SplitFn = Box::new(
+            |bytes, max, final_flush| {
+                if final_flush {
+                    max.min(bytes.len())
+                } else {
+                    0
+                }
+            },
+        );
+        let mut sink = DeltaCoalescer::new(splitter);
+        let now = Instant::now();
+
+        // Large enough that it does not fit as a single final delta either,
+        // so the kind-change flush must actually cut it via
+        // `carve_final_chunk` -- not just take the "fits as one" shortcut.
+        let text = "a".repeat(FLUSH_SIZE_THRESHOLD * 3);
+        let out = sink.push(BlockDelta::Text(text.clone()), now);
+        assert!(
+            out.is_empty(),
+            "the non-final splitter answer (always 0) must hold everything back"
+        );
+
+        let out = sink.push(BlockDelta::ToolArgsFragment("{}".into()), now);
+
+        assert!(
+            !out.is_empty(),
+            "the kind change must release the Text run despite the non-final \
+             splitter always refusing -- proving it asked with final_flush = true"
+        );
+        for d in &out {
+            assert!(matches!(d, Delta::Text { .. }));
+            assert!(serialized_len(d) < BLOB_INLINE_THRESHOLD);
+        }
+        assert_eq!(
+            concat_text(&out),
+            text,
+            "the whole Text run must be released, not partially held back"
+        );
+    }
+
+    #[test]
+    fn a_final_flush_splitter_returning_zero_still_terminates_and_makes_progress() {
+        // R11's guard: a final-flush splitter must never return 0 when
+        // max > 0 and the buffer is non-empty, but `DeltaCoalescer` does not
+        // trust that -- it must still terminate and make progress even if
+        // one does.
+        let mut sink = DeltaCoalescer::new(zero_splitter());
+        let now = Instant::now();
+        let text = "a".repeat(FLUSH_SIZE_THRESHOLD * 3);
+
+        assert!(
+            sink.push(BlockDelta::Text(text.clone()), now).is_empty(),
+            "a 0-returning splitter must never force output at a non-final flush"
+        );
+
+        let released = sink.finish();
+
+        assert!(
+            released.len() > 1,
+            "a buffer this large needs more than one final chunk"
+        );
+        for d in &released {
+            assert!(serialized_len(d) < BLOB_INLINE_THRESHOLD);
+        }
+        assert_eq!(concat_text(&released), text);
     }
 
     // -------------------------------------------------------------------
