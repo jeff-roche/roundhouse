@@ -203,22 +203,39 @@ impl Fixture {
     /// answered, or whether one item's `tool: shell` step really ran, has to
     /// read the rows.
     ///
-    /// Keyed by item index alone, which is enough only because no fixture
-    /// in this module retries: the durable key is `(step_id, attempt,
-    /// item_index)`, so a workflow whose step ran twice would have one of
-    /// its two rows silently overwritten here.
+    /// Keyed by item index alone, which the durable key is **not**: that is
+    /// `(step_id, attempt, item_index)`, so a step that ran twice has two
+    /// rows for one item. Every fixture in this module runs each step once,
+    /// so one row per item holds here — but that is a property of these
+    /// fixtures, not of the table, and it is reachable to break: the frozen
+    /// `pr_review.yaml` itself declares `defaults: retry: { attempts: 3, …
+    /// }`, so the first test that combines this helper with a retrying
+    /// document would otherwise lose a row and assert against whichever of
+    /// the two `collect` happened to keep. Hence the collision check below
+    /// rather than a `collect()` — a plain `assert!`, not a
+    /// `debug_assert!`, so it holds in a release-profile test run too.
     async fn item_step_rows(&self, step_id: &str) -> HashMap<u32, WorkflowStepRun> {
         let conn = self.executor.store.pool.get().await.unwrap();
         let run_id = self.run_id;
         let step_id = step_id.to_string();
         conn.interact(move |connection| {
-            recover_run(connection, run_id)
-                .unwrap()
-                .steps
-                .into_iter()
-                .filter(|row| row.step_id == step_id)
-                .filter_map(|row| Some((row.item_index?, row)))
-                .collect()
+            let mut rows: HashMap<u32, WorkflowStepRun> = HashMap::new();
+            for row in recover_run(connection, run_id).unwrap().steps {
+                if row.step_id != step_id {
+                    continue;
+                }
+                let Some(item_index) = row.item_index else {
+                    continue;
+                };
+                let attempt = row.attempt;
+                assert!(
+                    rows.insert(item_index, row).is_none(),
+                    "step `{step_id}` has more than one row for item {item_index} (this one is \
+                     attempt {attempt}) — this helper keys on the item alone and would silently \
+                     drop one, so a retrying fixture needs `attempt` in the key"
+                );
+            }
+            rows
         })
         .await
         .unwrap()
@@ -458,23 +475,35 @@ fn map_items(outcome: &StepOutcome) -> Vec<serde_json::Value> {
         .clone()
 }
 
-/// Tests that spawn real `git` skip cleanly when it is absent, matching
-/// `roundhouse-flow`'s `map_step_worktree.rs` convention.
-fn git_available() -> bool {
-    std::process::Command::new("git")
+/// Fails the test — loudly and immediately — when an external binary these
+/// tests genuinely need is not on `PATH`.
+///
+/// **Deliberately not a skip** (fix round 1, ruling: fail, don't skip).
+/// `roundhouse-flow`'s `map_step_worktree.rs` prints a message and returns
+/// early when `git` is missing; this crate's own `delivery_tests` does the
+/// opposite, depending on a real `bwrap` unconditionally
+/// (`executor_and_session_with_real_bwrap` and its callers have no guard at
+/// all), so the daemon suite already fails outright on a runner without it.
+/// A skip here would buy nothing against that existing dependency and would
+/// cost something real: the one test that actually discharges #44/#64's
+/// acceptance criteria
+/// ([`a_map_dispatches_nested_agent_shell_and_gate_steps_for_real_concurrently_and_resumably`])
+/// would report green having asserted nothing, and nobody reads
+/// `eprintln!` from a passing test. A missing tool is a broken environment,
+/// and a broken environment should look broken.
+fn require_on_path(program: &str, why: &str) {
+    let found = std::process::Command::new(program)
         .arg("--version")
         .output()
         .map(|o| o.status.success())
-        .unwrap_or(false)
-}
-
-/// The same gate for `bwrap`, which a `tool: shell` step really execs.
-fn bwrap_available() -> bool {
-    std::process::Command::new("bwrap")
-        .arg("--version")
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
+        .unwrap_or(false);
+    assert!(
+        found,
+        "this test requires `{program}` on PATH ({why}). These tests fail rather than skip on a \
+         missing tool, because a skip would report green having asserted nothing — this crate's \
+         `delivery_tests` already depends on a real `bwrap` the same way, through \
+         `executor_and_session_with_real_bwrap`"
+    );
 }
 
 fn git(repo: &Path, args: &[&str]) -> String {
@@ -619,10 +648,7 @@ async fn the_frozen_reference_workflow_runs_and_stops_at_its_first_unwired_tool(
 /// pins.
 #[tokio::test]
 async fn the_frozen_reference_workflows_map_refuses_every_worktree_isolated_item() {
-    if !git_available() {
-        eprintln!("skipping: `git` is not on PATH, so no worktree can be materialized");
-        return;
-    }
+    require_on_path("git", "each item materializes a real worktree");
     let f = fixture(
         |_root| (pr_review_with_a_local_pr_list(), vec![]),
         Arc::new(crate::test_support::NoopProvider),
@@ -661,7 +687,11 @@ async fn the_frozen_reference_workflows_map_refuses_every_worktree_isolated_item
         failure_message(step(&steps, "report")).contains("missing required core field: `severity`"),
         "the same invalid `finally:` report as the unmodified fixture"
     );
-    assert!(matches!(report, ReportOrigin::Synthesised));
+    assert!(
+        matches!(report, ReportOrigin::Synthesised),
+        "the authored `report:` step failed validation here too, so the run's one report is the \
+         synthesised one — got {report:?}"
+    );
     assert_eq!(
         state,
         RunState::Failed,
@@ -717,11 +747,23 @@ const LIVE_PRS: [u32; 4] = [1, 2, 3, 4];
 const FAILING_PR: u32 = 3;
 
 /// The PR the fan-out data marks `review_needed: false`, so its `gate:` and
-/// `post:` steps' `when:` conditions are false and the item is **skipped**.
+/// `post:` steps' `when:` conditions are false and its item entry reads
+/// **skipped**.
+///
+/// Note *why* it reads that, because it is not "the item was skipped": this
+/// item's `review` and `tests` steps genuinely run and complete.
+/// `map_step::fold_inner_step_outcome` overwrites the item's running
+/// outcome with **every** inner step's status in turn, so what an item
+/// finally reports is simply its last-run inner step's status — here
+/// `post`'s. (The walk stops early only on a failure, which is the one
+/// status that also breaks out.) Append an unconditional step after `post`
+/// and this item would report `completed` instead, with nothing else about
+/// the run changed.
 const SKIPPED_PR: u32 = 4;
 
 /// The PRs that reach a gate, in item order — everything that neither fails
-/// nor is skipped. Each one costs the run a full park/resume cycle.
+/// nor has its gate's `when:` evaluate false. Each one costs the run a full
+/// park/resume cycle.
 const GATED_PRS: [u32; 2] = [1, 2];
 
 /// A scripted `Provider` that answers a workflow `agent:` step with one
@@ -1101,7 +1143,9 @@ fn live_map_rules(workspace_root: &Path, tests_script: &Path) -> Vec<CompiledRul
 ///   itself still completes.
 /// - **All three item outcomes in one fan-out**: completed
 ///   ([`GATED_PRS`]), failed ([`FAILING_PR`]), and skipped
-///   ([`SKIPPED_PR`], whose `when:` conditions are false).
+///   ([`SKIPPED_PR`], whose *last* inner step's `when:` is false — see that
+///   constant's own doc comment for why that, and not "the item was
+///   skipped", is what the status means).
 /// - **Park/resume**: the drive returns `Parked` once per gated item, each
 ///   naming the item it is about via `ParkResult::item_index`, and each
 ///   answer lands on **that item's own** durable `workflow_step_run` row.
@@ -1113,10 +1157,7 @@ fn live_map_rules(workspace_root: &Path, tests_script: &Path) -> Vec<CompiledRul
 ///   validates, so the run's report is authored rather than synthesised.
 #[tokio::test]
 async fn a_map_dispatches_nested_agent_shell_and_gate_steps_for_real_concurrently_and_resumably() {
-    if !bwrap_available() {
-        eprintln!("skipping: `bwrap` is not on PATH, so no `tool: shell` step can really spawn");
-        return;
-    }
+    require_on_path("bwrap", "each item's `tool: shell` step really spawns");
     let provider = Arc::new(RendezvousReviewProvider::new());
     let f = fixture(
         |root| {
@@ -1247,8 +1288,11 @@ async fn a_map_dispatches_nested_agent_shell_and_gate_steps_for_real_concurrentl
         } else if *pr == SKIPPED_PR {
             assert_eq!(
                 item["status"], "skipped",
-                "an item whose every remaining step's `when:` is false is skipped, not completed \
-                 — {item:?}"
+                "an item reports its LAST-RUN inner step's status, whatever that status is — \
+                 `fold_inner_step_outcome` overwrites the running outcome on every inner step — \
+                 and this item's last step (`post`) is `when:`-false, even though its `review` \
+                 and `tests` steps completed. If this ever fails because a step was appended \
+                 after `post`, the fold is what changed, not `when:` evaluation: {item:?}"
             );
             assert_eq!(
                 gate_rows
