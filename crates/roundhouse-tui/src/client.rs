@@ -224,6 +224,42 @@ impl DaemonClient {
         )
     }
 
+    /// Sends `ClientRequest::CloseSession` for this client's own session,
+    /// then waits for the daemon's `Ack` confirming the durable close,
+    /// skipping any other frame that arrives first — the same "wait for the
+    /// specific reply, not just any frame" shape [`connect_attach`] already
+    /// uses for its own `Ack`.
+    ///
+    /// # Errors
+    /// Returns whatever [`Self::send`]/[`Self::recv`] returns. Also returns
+    /// `TuiError::Io` if the daemon closes the connection without ever
+    /// sending an `Ack` — see `roundhouse_daemon::socket_server::
+    /// drive_established_session`'s `CloseSession` handling: a refusal
+    /// (wrong connection, wrong session, a close already in flight, or the
+    /// session no longer being live) never sends an `Ack` and leaves the
+    /// connection open, and a failed durable append never sends one either.
+    ///
+    /// # Panics
+    /// Panics under the same condition [`Self::session_id`] does: this
+    /// client must have been created via [`connect_create`]/[`connect_attach`].
+    pub async fn close_session(&mut self) -> Result<(), TuiError> {
+        let session_id = self.session_id();
+        self.send(&ClientRequest::CloseSession { session_id })
+            .await?;
+        loop {
+            match self.recv().await? {
+                Some(ClientEvent::Ack { .. }) => return Ok(()),
+                Some(_) => continue,
+                None => {
+                    return Err(TuiError::Io(std::io::Error::new(
+                        std::io::ErrorKind::UnexpectedEof,
+                        "daemon closed the connection instead of acknowledging CloseSession",
+                    )));
+                }
+            }
+        }
+    }
+
     /// Sends one `ClientRequest` as a single NDJSON line.
     ///
     /// # Errors

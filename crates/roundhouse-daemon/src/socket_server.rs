@@ -1061,7 +1061,7 @@ pub async fn drive_session(
     // its post-handshake requests honored — see the `Some(_request)` arm,
     // below, for the full rationale and the documented limitation this
     // implies for `Attach`.
-    let (session_id, subscription, mut session_events, is_creator) = match first_request {
+    let (session_id, subscription, session_events, is_creator) = match first_request {
         ClientRequest::CreateSession { workspace_name } => {
             // CF-14: bound at the protocol boundary, not by making the
             // client's own frame cap bigger. `SessionCreated`, below, echoes
@@ -1358,6 +1358,43 @@ pub async fn drive_session(
         _ => return,
     };
 
+    drive_established_session(
+        session_id,
+        subscription,
+        session_events,
+        is_creator,
+        requests_rx,
+        events_tx,
+        registry,
+        resources,
+    )
+    .await;
+}
+
+/// The post-handshake half of [`drive_session`]: forwards `session_events`
+/// out to `events_tx` and routes `requests_rx` — the real `SubmitTurn`/
+/// `CloseSession` handlers, once the handshake above has already decided
+/// `session_id`/`is_creator` — until either side ends, then detaches.
+///
+/// Factored out of `drive_session`'s own body (Phase 8, T19a Task 8) so a
+/// test that needs a hand-built `SessionActor` (e.g. one wired to a
+/// `roundhouse_store::test_util`-gated writer, to pin down exactly when a
+/// `CloseSession` reply is sent relative to its durable append) can drive
+/// this loop directly against a session it registered itself
+/// (`SessionRegistry::create`), without paying for a full `CreateSession`
+/// handshake and real session construction it does not need. `pub`, not
+/// `pub(crate)`, for the same reason `drive_session`/`serve_connection` are:
+/// this crate's integration tests are their own crate.
+pub async fn drive_established_session(
+    session_id: roundhouse_core::SessionId,
+    subscription: crate::session_registry::Subscription,
+    mut session_events: mpsc::Receiver<ClientEvent>,
+    is_creator: bool,
+    mut requests_rx: mpsc::Receiver<ClientRequest>,
+    events_tx: mpsc::Sender<ClientEvent>,
+    registry: Arc<SessionRegistry>,
+    resources: Arc<DaemonResources>,
+) {
     let mut pending_event: Option<ClientEvent> = None;
     // Phase 7, Task 8 — the W1-R38-compliant shape for the `SubmitTurn`
     // handler below. At most ONE turn may be in flight per connection: the
@@ -1381,6 +1418,17 @@ pub async fn drive_session(
     // client that submitted it went away.
     let (turn_done_tx, mut turn_done_rx) = mpsc::channel::<()>(1);
     let mut turn_in_flight = false;
+    // Phase 8, T19a Task 8 — the identical shape, applied to `CloseSession`:
+    // at most one close in flight per connection, run in its own spawned
+    // task (never awaited inline — `SessionActor::close` awaits a real
+    // durable append), with completion observed on its own 1-slot `select!`
+    // arm. `close_ack_pending` is a second stage past that: once the
+    // spawned close reports success, the `Ack` itself still has to wait for
+    // `events_tx` capacity via the same `reserve()`-as-an-arm shape
+    // `pending_event` already uses below, rather than being sent inline.
+    let (close_done_tx, mut close_done_rx) = mpsc::channel::<bool>(1);
+    let mut close_in_flight = false;
+    let mut close_ack_pending = false;
     loop {
         tokio::select! {
             _ = turn_done_rx.recv(), if turn_in_flight => {
@@ -1389,6 +1437,34 @@ pub async fn drive_session(
                 // spawned turn actually finished — never because every
                 // sender was dropped.
                 turn_in_flight = false;
+            }
+            close_result = close_done_rx.recv(), if close_in_flight => {
+                // `close_done_tx` is held by this stack frame for the whole
+                // loop, for the identical reason `turn_done_tx` is — see
+                // that arm, just above.
+                close_in_flight = false;
+                if close_result.expect("close_done_tx held for this loop's lifetime") {
+                    close_ack_pending = true;
+                }
+                // `false` means the close failed to durably append — already
+                // logged, with detail, at the spawn site below. No `Ack` is
+                // ever sent for a failed close, and this connection stays
+                // open: a client that wants to retry can send another
+                // `CloseSession`.
+            }
+            permit = events_tx.reserve(), if close_ack_pending => {
+                match permit {
+                    Ok(permit) => {
+                        permit.send(ClientEvent::Ack { api_version: ApiVersion::CURRENT });
+                        // The one reply a successful `CloseSession` ever
+                        // gets (ruling: Ack only after the durable append,
+                        // then the connection ends) — break rather than
+                        // looping again.
+                        break;
+                    }
+                    // `serve_connection` already gave up on this connection.
+                    Err(_) => break,
+                }
             }
             maybe_event = session_events.recv(), if pending_event.is_none() => {
                 match maybe_event {
@@ -1560,6 +1636,114 @@ pub async fn drive_session(
                                     tracing::warn!(
                                         %session_id,
                                         "refusing SubmitTurn: this session is no longer live"
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    // Phase 8, T19a Task 8: `CloseSession` — a client-
+                    // initiated, durable session terminator. Same
+                    // creator-only/named-session refusal shape as
+                    // `SubmitTurn` above, plus one refusal `SubmitTurn` has
+                    // no analogue for: a second `CloseSession` arriving
+                    // while the first is still closing is refused outright
+                    // rather than queued — a successful close ends this
+                    // connection anyway, so there is nothing left for a
+                    // second one to do, and refusing it keeps this arm's
+                    // own work O(1) the same way `turn_in_flight` already
+                    // does for `SubmitTurn`. A client that wants to retry a
+                    // *failed* close (logged, `close_in_flight` already
+                    // reset to `false`) may send another one.
+                    Some(ClientRequest::CloseSession { session_id: named }) => {
+                        if !is_creator {
+                            // W1-R37, the same read-only guard `SubmitTurn`
+                            // enforces above.
+                            tracing::warn!(
+                                %session_id,
+                                "refusing CloseSession from an attached (non-creating) \
+                                 connection: attached connections are read-only"
+                            );
+                        } else if named != session_id {
+                            tracing::warn!(
+                                %session_id,
+                                named = %named,
+                                "refusing CloseSession naming a session other than the one \
+                                 this connection established"
+                            );
+                        } else if close_in_flight {
+                            tracing::warn!(
+                                %session_id,
+                                "refusing CloseSession: a close is already in flight on this \
+                                 connection"
+                            );
+                        } else {
+                            match registry.actor(session_id) {
+                                Some(actor) => {
+                                    // The close outcome is decided HERE, from
+                                    // this connection's own `turn_in_flight`
+                                    // (exact, since this is the only
+                                    // connection ever allowed to submit a
+                                    // turn) and the actor's `live_work()`
+                                    // (which additionally covers work
+                                    // admitted from anywhere else, e.g. a
+                                    // sub-agent) — BEFORE the sweep
+                                    // transaction inside `SessionActor::close`
+                                    // ever runs, never read back off its
+                                    // `CloseReceipt` (which carries no
+                                    // outcome at all). A turn that finishes
+                                    // naturally in the window between this
+                                    // sample and `close`'s own cancel is
+                                    // still labeled `Cancelled` — a known,
+                                    // accepted residual race, not something
+                                    // this arm tries to close.
+                                    let outcome = if turn_in_flight || actor.live_work() > 0 {
+                                        roundhouse_core::SessionOutcome::Cancelled
+                                    } else {
+                                        roundhouse_core::SessionOutcome::Completed
+                                    };
+                                    close_in_flight = true;
+                                    let done = close_done_tx.clone();
+                                    tokio::spawn(async move {
+                                        // **W1-R38**, the same shape
+                                        // `run_submitted_turn` already uses
+                                        // for `SubmitTurn`: `SessionActor::
+                                        // close` awaits a real durable
+                                        // append, so it must never run
+                                        // inline in this arm's own body —
+                                        // see `close_done_tx`'s declaration.
+                                        let ok = match actor.close(outcome).await {
+                                            Ok(_receipt) => true,
+                                            Err(err) => {
+                                                // Never includes `err`'s
+                                                // `Display` in anything sent
+                                                // to a client — same
+                                                // constraint `run_submitted_
+                                                // turn` already observes, and
+                                                // there is no wire variant to
+                                                // send it on regardless.
+                                                tracing::error!(
+                                                    %session_id,
+                                                    error = %err,
+                                                    "CloseSession failed to durably append; \
+                                                     the connection stays open and no Ack is \
+                                                     sent"
+                                                );
+                                                false
+                                            }
+                                        };
+                                        // Failure means this connection
+                                        // already ended — see
+                                        // `close_done_tx`'s declaration.
+                                        let _ = done.send(ok).await;
+                                    });
+                                }
+                                None => {
+                                    // The session was reaped (its actor
+                                    // reached `Closed`) while this
+                                    // connection was still open.
+                                    tracing::warn!(
+                                        %session_id,
+                                        "refusing CloseSession: this session is no longer live"
                                     );
                                 }
                             }
