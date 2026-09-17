@@ -297,6 +297,61 @@ async fn redaction_safe_split_len_pass_through_uses_the_live_redactor() {
     );
 }
 
+/// Fix round 1, security finding S3 / Controller Ruling R9: `redaction_holdback` and
+/// `redaction_safe_split_len` each do their own independent `ArcSwap::load`, so calling
+/// them separately races against a concurrent `set_redactor`. `redaction_split_for_flush`
+/// must compute both numbers from a SINGLE live snapshot instead. This test can't directly
+/// observe "one load instead of two" (that's an implementation detail), but it does prove
+/// the combined method produces the same answer the two-call sequence produces when
+/// nothing races — the property both callers and this test can actually check.
+#[tokio::test]
+async fn redaction_split_for_flush_combines_holdback_and_split_from_one_snapshot() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = open(&dir.path().join("events.db")).await.unwrap();
+    let writer = spawn_writer(store).await;
+
+    // Default empty redactor: holdback is 0, so max == bytes.len() and nothing straddles.
+    let bytes = b"prefix sk-live-abc123 suffix";
+    assert_eq!(writer.redaction_split_for_flush(bytes), bytes.len());
+
+    writer.set_redactor(Redactor::build(&["sk-live-abc123".to_string()]));
+    let secret_start = bytes
+        .windows(14)
+        .position(|w| w == b"sk-live-abc123")
+        .unwrap();
+    let secret_end = secret_start + 14;
+
+    // holdback = 14 - 1 = 13, so max = bytes.len() - 13; the secret sits well inside that
+    // window, so the combined split must move back to the secret's start, matching what
+    // `redaction_holdback` + `redaction_safe_split_len` would produce called separately
+    // (with no race, since nothing calls `set_redactor` between them here).
+    let k = writer.redaction_split_for_flush(bytes);
+    assert!(
+        k <= secret_start,
+        "the split must not land inside or after the secret's start: k={k}, \
+         secret_start={secret_start}"
+    );
+    assert_eq!(
+        k, secret_start,
+        "with this haystack, the safe split point is exactly the secret's own start"
+    );
+    assert!(k < secret_end);
+}
+
+/// `redaction_split_for_flush` must return 0 — not panic, not an error — when the whole
+/// buffer is smaller than the live redactor's holdback requirement (nothing is safely
+/// flushable yet).
+#[tokio::test]
+async fn redaction_split_for_flush_returns_zero_when_nothing_is_safely_flushable() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = open(&dir.path().join("events.db")).await.unwrap();
+    let writer = spawn_writer(store).await;
+    writer.set_redactor(Redactor::build(&["a-fairly-long-secret-value".to_string()]));
+
+    let short_buffer = b"short";
+    assert_eq!(writer.redaction_split_for_flush(short_buffer), 0);
+}
+
 #[tokio::test]
 async fn outbound_payload_containing_a_live_secret_is_ask_by_default_and_deny_hardened() {
     let dir = tempfile::tempdir().unwrap();

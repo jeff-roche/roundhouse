@@ -2,13 +2,16 @@
 //! event-append and blob ref-count bookkeeping must commit together, in ONE transaction,
 //! for every `Delta::Blob`/`TaskInput::Blob`/`TaskOutput::Blob` a batch's events carry.
 //!
-//! Two properties matter here, matching `blobs::record_blob_write`'s own doc comment
+//! Properties covered here, matching `blobs::record_blob_write`'s own doc comment
 //! ("a blob can never be referenced by an event that isn't durably recorded, and vice
 //! versa"), extended from the single-write path to the batch path:
 //! - the ref-count bump and the event commit happen together (this file's first two
-//!   tests), and
+//!   tests);
 //! - a `record_blob_write` failure (a `BlobRef` with no backing file) rolls back the
-//!   WHOLE batch — neither the events nor any ref-count bump for the batch commits.
+//!   WHOLE batch, including an EARLIER member's already-successful ref-count bump — not
+//!   just the failing member's own effects (fix round 1, security finding S5); and
+//! - redaction genuinely runs on this path, not just on `append`/`append_batch` (fix
+//!   round 1, security finding S6).
 
 use roundhouse_core::{
     Blake3Hash, BlobRef, Delta, Origin, SessionId, TaskId, TaskInput, TaskKind, TaskOutput,
@@ -138,14 +141,22 @@ async fn append_batch_with_blobs_covers_task_input_and_task_output_blob_refs() {
 }
 
 /// A `RecordBlobError::MissingFile` (a `BlobRef` whose file isn't actually on disk) must
-/// roll back the WHOLE batch: neither the event nor the ref-count bump may commit.
+/// roll back the WHOLE batch, not just the failing member. Fix round 1, security finding
+/// S5: the original version of this test used a single-member batch, which could only
+/// prove "the failing member's own effects didn't commit" — it could not distinguish that
+/// from a (buggy) implementation that rolled back only the failing member while letting an
+/// EARLIER member's successful `record_blob_write`/event-append commit anyway. This
+/// version uses a two-member batch — `[event with a REAL, on-disk blob, event with the
+/// phantom blob]` — so a real ref-count bump for the first member is what's actually on
+/// the line, and asserts it did NOT commit either.
 #[tokio::test]
-async fn a_missing_blob_file_rolls_back_both_the_event_and_the_ref_count() {
+async fn a_missing_blob_file_rolls_back_the_whole_batch_including_an_earlier_real_blob() {
     let dir = tempfile::tempdir().unwrap();
     let db_path = dir.path().join("events.db");
     let store = open(&db_path).await.unwrap();
     let writer = spawn_writer(store).await;
 
+    let real_blob = write_blob(dir.path(), b"this one really exists on disk", None).unwrap();
     let phantom_hash = "c".repeat(64);
     let phantom = BlobRef {
         hash: Blake3Hash::from_hex(phantom_hash).unwrap(),
@@ -154,18 +165,27 @@ async fn a_missing_blob_file_rolls_back_both_the_event_and_the_ref_count() {
     };
 
     let session_id = SessionId::new();
-    let task_id = TaskId::new();
-    let event = RUNNER.record_task_delta(
+    let real_task_id = TaskId::new();
+    let phantom_task_id = TaskId::new();
+    let real_event = RUNNER.record_task_delta(
         session_id,
         0,
         now_ts(),
-        task_id,
+        real_task_id,
+        Delta::Blob(real_blob.clone()),
+        1,
+    );
+    let phantom_event = RUNNER.record_task_delta(
+        session_id,
+        0,
+        now_ts(),
+        phantom_task_id,
         Delta::Blob(phantom.clone()),
         1,
     );
 
     let result = writer
-        .append_batch_with_blobs(vec![event], dir.path().to_path_buf())
+        .append_batch_with_blobs(vec![real_event, phantom_event], dir.path().to_path_buf())
         .await;
     assert!(
         result.is_err(),
@@ -176,11 +196,100 @@ async fn a_missing_blob_file_rolls_back_both_the_event_and_the_ref_count() {
     assert_eq!(
         ref_count(&query_store, &phantom.hash).await,
         None,
-        "no blobs row may exist for a ref that was never successfully indexed"
+        "no blobs row may exist for the ref that was never successfully indexed"
+    );
+    assert_eq!(
+        ref_count(&query_store, &real_blob.hash).await,
+        None,
+        "the EARLIER member's real, on-disk blob must not have its ref_count bumped either \
+         — the whole batch rolls back together, not just the member that failed"
     );
     let events = session_events(&query_store, session_id).await.unwrap();
     assert!(
         events.is_empty(),
-        "the event must not commit either — the whole batch rolls back together"
+        "neither event may commit — the whole batch rolls back together"
+    );
+}
+
+/// Fix round 1, security finding S6: proves redaction actually runs on THIS path, not just
+/// on `append`/`append_batch`. A `Delta::Stdout` chunk carrying a live secret, appended
+/// through `append_batch_with_blobs`, must have its raw stored payload scrubbed exactly
+/// like the plain `append` path already does (see `tests/redaction.rs`'s
+/// `live_secret_value_never_lands_in_the_stored_row`) — checked with the same raw-column
+/// read, not by trusting the in-memory `EventPayload`.
+#[tokio::test]
+async fn append_batch_with_blobs_redacts_a_secret_in_a_stdout_delta() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("events.db");
+    let store = open(&db_path).await.unwrap();
+    let writer = spawn_writer(store).await;
+    writer.set_redactor(roundhouse_store::redact::Redactor::build(&[
+        "sk-live-abc123".to_string(),
+    ]));
+
+    let session_id = SessionId::new();
+    let task_id = TaskId::new();
+    // A TaskDelta needs a prior TaskCreated row before a redaction match on it can
+    // increment `tasks.redactions` without hard-erroring (Task 19 addendum, Ruling 5's
+    // fail-closed check) — same precondition `tests/redaction.rs`'s own `create_task`
+    // helper exists for. Appended directly, not through `append_batch_with_blobs` —
+    // this test is about the STDOUT delta's redaction, not about batching TaskCreated.
+    writer
+        .append(RUNNER.record_task_created(
+            session_id,
+            0,
+            now_ts(),
+            task_id,
+            TaskKind::Shell,
+            None,
+            Origin::Model,
+            TaskInput::Text("run a command".into()),
+            1,
+        ))
+        .await
+        .unwrap();
+
+    let event = RUNNER.record_task_delta(
+        session_id,
+        0,
+        now_ts(),
+        task_id,
+        Delta::Stdout {
+            bytes: b"stdout: the key is sk-live-abc123".to_vec().into(),
+        },
+        1,
+    );
+
+    writer
+        .append_batch_with_blobs(vec![event], dir.path().to_path_buf())
+        .await
+        .unwrap();
+
+    let query_store = open(&db_path).await.unwrap();
+    let raw_row_text =
+        roundhouse_store::redact::debug_read_raw_payload_text(&query_store, session_id, task_id)
+            .await
+            .unwrap();
+    // `Delta::Stdout.bytes` serializes to a JSON array of byte VALUES (not inline text —
+    // see `Delta`'s `bytes_as_vec` serde shim), so a literal-substring check on the raw
+    // JSON text would never find "[REDACTED]" even when redaction worked correctly. This
+    // decodes the actual stored byte array back to text to check the real content, the
+    // way this payload shape requires.
+    let raw_value: serde_json::Value = serde_json::from_str(&raw_row_text).unwrap();
+    let stored_bytes: Vec<u8> = raw_value["TaskDelta"]["delta"]["Stdout"]
+        .as_array()
+        .unwrap_or_else(|| panic!("expected a Stdout byte array in: {raw_row_text}"))
+        .iter()
+        .map(|v| v.as_u64().unwrap() as u8)
+        .collect();
+    let stored_text = String::from_utf8(stored_bytes).unwrap();
+    assert!(
+        !stored_text.contains("sk-live-abc123"),
+        "a live secret in a Delta::Stdout chunk appended through append_batch_with_blobs \
+         must never reach the stored row: {stored_text}"
+    );
+    assert!(
+        stored_text.contains("[REDACTED]"),
+        "the redacted placeholder must appear in its place: {stored_text}"
     );
 }

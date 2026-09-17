@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use arc_swap::ArcSwap;
@@ -520,12 +520,83 @@ fn blob_ref_in_payload(payload: &EventPayload) -> Option<&roundhouse_core::BlobR
     }
 }
 
+/// Pulls a genuinely retriable `SQLITE_BUSY`/`SQLITE_BUSY_SNAPSHOT` error out of a
+/// `StoreError`, wherever it's nested — either directly (`StoreError::Sqlite`) or one
+/// level down inside `StoreError::Blob(RecordBlobError::Sqlite(_))`, the two shapes a busy
+/// collision can take when it surfaces through `append_event_in_transaction`/
+/// `record_blob_write` rather than a raw SQL call this function makes itself (fix round 1,
+/// Controller Ruling R6). `Ok` means "the caller should retry the whole attempt with this
+/// as the outer, retriable error"; `Err` returns the original (non-retriable) `StoreError`
+/// unchanged.
+fn busy_error_in(err: StoreError) -> Result<rusqlite::Error, StoreError> {
+    match err {
+        StoreError::Sqlite(e) if is_sqlite_busy(&e) => Ok(e),
+        StoreError::Blob(crate::blobs::RecordBlobError::Sqlite(e)) if is_sqlite_busy(&e) => Ok(e),
+        other => Err(other),
+    }
+}
+
+/// One `BEGIN IMMEDIATE`-through-`commit` attempt of `append_batch_with_blobs`'s
+/// transaction, run inside `with_bounded_busy_attempt` (fix round 1, Controller Ruling
+/// R6) — hence the doubly-nested return type: the OUTER `rusqlite::Result` is what
+/// `with_bounded_busy_attempt`/the caller's retry loop inspect for `SQLITE_BUSY` (via
+/// `is_sqlite_busy`), and the INNER `Result<Vec<u64>, StoreError>` is the real,
+/// non-retriable business outcome (success, or a genuine failure like
+/// `RecordBlobError::MissingFile`) once no more retries are worth attempting.
+/// `busy_error_in` is what routes a busy error from `append_event_in_transaction`/
+/// `record_blob_write` (both `StoreError`-typed, not raw `rusqlite::Error`) into the OUTER
+/// slot so it's retried the same way a busy error from `begin_immediate`/`tx.commit()`
+/// (already raw `rusqlite::Error`) is.
+fn append_batch_with_blobs_attempt(
+    c: &mut rusqlite::Connection,
+    events: &[Event],
+    state_dir: &Path,
+    redactor: &Redactor,
+) -> rusqlite::Result<Result<Vec<u64>, StoreError>> {
+    let tx = match begin_immediate(c) {
+        Ok(tx) => tx,
+        Err(e) if is_sqlite_busy(&e) => return Err(e),
+        Err(e) => return Ok(Err(StoreError::Sqlite(e))),
+    };
+
+    let mut seqs = Vec::with_capacity(events.len());
+    for event in events {
+        let seq = match append_event_in_transaction(&tx, event, redactor) {
+            Ok(seq) => seq,
+            Err(err) => {
+                return match busy_error_in(err) {
+                    Ok(busy) => Err(busy),
+                    Err(other) => Ok(Err(other)),
+                }
+            }
+        };
+        if let Some(blob_ref) = blob_ref_in_payload(&event.payload) {
+            if let Err(err) =
+                crate::blobs::record_blob_write(&tx, state_dir, blob_ref, event.ts.as_unix_nanos())
+            {
+                return match busy_error_in(StoreError::from(err)) {
+                    Ok(busy) => Err(busy),
+                    Err(other) => Ok(Err(other)),
+                };
+            }
+        }
+        seqs.push(seq);
+    }
+
+    match tx.commit() {
+        Ok(()) => Ok(Ok(seqs)),
+        Err(e) if is_sqlite_busy(&e) => Err(e),
+        Err(e) => Ok(Err(StoreError::Sqlite(e))),
+    }
+}
+
 /// Batched append that also indexes every blob reference the batch's events carry, in the
 /// SAME transaction as the events insert — extending §4.5's "a blob can never be
 /// referenced by an event that isn't durably recorded, and vice versa" to the batch path
 /// (Phase 8 Task 19 lane B, Task 5). This is what `record_blob_write`'s own doc comment
-/// names as the deferred call site: Phase 0 delivered the function, this wires it into a
-/// real event-append transaction.
+/// names as the mechanism wiring it into a real event-append transaction — see that doc
+/// comment for today's actual call-site status (not yet reached from any production code
+/// path itself; a later task's shell pump is the intended caller).
 ///
 /// Reuses `append_event_in_transaction` per event — same redaction, seq-assignment, and
 /// `tasks`-view upkeep as a single `append` — then, for whichever of
@@ -534,14 +605,47 @@ fn blob_ref_in_payload(payload: &EventPayload) -> Option<&roundhouse_core::BlobR
 /// transaction. Blob refs are never mutated by redaction (a `BlobRef` is a content hash,
 /// not inline text — see `Redactor::redact_event_payload`'s handling of the same three
 /// shapes), so scanning the ORIGINAL, pre-redaction `event.payload` for a ref to index is
-/// equivalent to scanning the redacted one and cheaper.
+/// equivalent to scanning the redacted one and cheaper. **This does NOT redact blob
+/// CONTENT** — only the three shapes above (a content hash, never inline text) are ever
+/// looked at; a caller that writes secret-bearing bytes to a blob (`blobs::write_blob`)
+/// must redact them itself before that write.
+///
+/// **Ordering precondition this function assumes, not enforces (fix round 1, security
+/// finding S7 / Controller Ruling R10):** every `BlobRef` this call is asked to index must
+/// already have a real file on disk — i.e. the caller has already run `blobs::write_blob`
+/// for it — BEFORE calling this function, the same precondition `record_blob_write` itself
+/// documents. If this call's transaction rolls back (a later member's `MissingFile`, or a
+/// non-retriable error of any kind), any file an EARLIER member's successful
+/// `record_blob_write` referenced is left on disk with NO `blobs` row — an unindexed
+/// orphan `gc_eligible_blobs` cannot discover (it queries the `blobs` table only, so a
+/// file with no row is invisible to it, not merely ineligible). This is a real reclamation
+/// gap: an unindexed file leaked by a rolled-back batch is not cleaned up by anything in
+/// this crate today. Ruling R10 explicitly defers closing it (no `record_unreferenced_blob`
+/// pre-pass added here) — `roundhouse-flow`'s checkpoint path
+/// (`production.rs::index_prepared_checkpoint`) shows the alternative for a caller that
+/// needs the file discoverable even across a failed owner transaction: call
+/// `blobs::record_unreferenced_blob` (a zero-ref-count placeholder row) BEFORE the
+/// transaction that would otherwise be this call, so GC can still find the file if that
+/// transaction never happens. This function does not do that on a caller's behalf; a
+/// caller with the same need should follow that same pattern itself.
 ///
 /// A `RecordBlobError` (including `MissingFile` — a `BlobRef` with no backing file under
 /// `state_dir`) propagates before `tx.commit()` runs, so the whole batch rolls back:
-/// neither the events nor any ref-count bump from this call commits. Unlike `append_batch`,
-/// this does not retry on `SQLITE_BUSY` — matching every other caller of
-/// `append_event_in_transaction` today (`scheduler_driver.rs`, `workflow_host.rs`,
-/// `sub_agent_host.rs`), none of which wrap it in a busy-retry loop either.
+/// neither the events nor any ref-count bump from this call commits — for EVERY member of
+/// the batch, not just the one that failed (see
+/// `a_missing_blob_file_rolls_back_the_whole_batch_including_an_earlier_real_blob`'s own
+/// doc comment for the two-member case this specifically proves).
+///
+/// **`SQLITE_BUSY` retry (fix round 1, Controller Ruling R6):** unlike the version of this
+/// function shipped in this task's first draft, this DOES retry on `SQLITE_BUSY` /
+/// `SQLITE_BUSY_SNAPSHOT`, with the same bounded backoff as `append_one`/`append_batch`
+/// (`with_bounded_busy_attempt`, `MAX_BUSY_RETRIES`, `INITIAL_BACKOFF`) — see
+/// `append_batch_with_blobs_attempt`/`busy_error_in` for how a busy error nested inside
+/// `append_event_in_transaction`'s or `record_blob_write`'s own `StoreError`-typed result
+/// gets routed into that retry loop. A retry re-runs the ENTIRE attempt from
+/// `begin_immediate`, which is safe and idempotent here specifically because nothing about
+/// it can have partially committed: the whole transaction, including every
+/// `record_blob_write` ref-count bump, only ever commits or rolls back as one unit.
 async fn append_batch_with_blobs(
     store: &StorePool,
     events: Vec<Event>,
@@ -553,30 +657,35 @@ async fn append_batch_with_blobs(
     }
 
     let conn = store.pool.get().await?;
+    let events = std::sync::Arc::new(events);
 
-    let write_result = conn
-        .interact(move |c| -> Result<Vec<u64>, StoreError> {
-            let tx = begin_immediate(c).map_err(StoreError::Sqlite)?;
-            let mut seqs = Vec::with_capacity(events.len());
-            for event in &events {
-                let seq = append_event_in_transaction(&tx, event, &redactor)?;
-                if let Some(blob_ref) = blob_ref_in_payload(&event.payload) {
-                    crate::blobs::record_blob_write(
-                        &tx,
-                        &state_dir,
-                        blob_ref,
-                        event.ts.as_unix_nanos(),
-                    )?;
-                }
-                seqs.push(seq);
+    let mut attempt: u32 = 0;
+    let result = loop {
+        attempt += 1;
+        let events = std::sync::Arc::clone(&events);
+        let state_dir = state_dir.clone();
+        let redactor = Arc::clone(&redactor);
+
+        let write_result = conn
+            .interact(move |c| -> rusqlite::Result<Result<Vec<u64>, StoreError>> {
+                with_bounded_busy_attempt(c, |c| {
+                    append_batch_with_blobs_attempt(c, &events, &state_dir, &redactor)
+                })
+            })
+            .await
+            .map_err(|e| StoreError::Interact(e.to_string()))?;
+
+        match write_result {
+            Ok(inner) => break inner,
+            Err(err) if is_sqlite_busy(&err) && attempt < MAX_BUSY_RETRIES => {
+                tokio::time::sleep(INITIAL_BACKOFF * 2u32.pow(attempt - 1)).await;
+                continue;
             }
-            tx.commit().map_err(StoreError::Sqlite)?;
-            Ok(seqs)
-        })
-        .await
-        .map_err(|e| StoreError::Interact(e.to_string()))?;
+            Err(err) => break Err(StoreError::Sqlite(err)),
+        }
+    };
 
-    write_result
+    result
 }
 
 impl EventWriter {
@@ -622,6 +731,18 @@ impl EventWriter {
     /// [`Self::redaction_safe_split_len`], which does: see that method's, and
     /// `Redactor::safe_split_len`'s, own doc comments for why holdback alone isn't enough
     /// and why the split point must be chosen with the buffered bytes in view.
+    ///
+    /// **Race warning (fix round 1, security finding S3 / Controller Ruling R9): calling
+    /// this and [`Self::redaction_safe_split_len`] as two separate calls is NOT safe** —
+    /// each does its own independent `ArcSwap::load`, so a `set_redactor` landing between
+    /// the two calls (e.g. `wire_redaction_for_session`, called on every session creation)
+    /// can mean the holdback was computed against one redactor and the split against a
+    /// DIFFERENT, freshly-installed one with a longer pattern, holding back too few bytes
+    /// for what the split actually used. Prefer [`Self::redaction_split_for_flush`], which
+    /// reads the redactor exactly once for both numbers. This method (and
+    /// `redaction_safe_split_len`) remain as directly-callable, separately-tested
+    /// primitives for callers that genuinely only need one of the two numbers (or that can
+    /// otherwise guarantee no `set_redactor` lands between two calls of their own).
     pub fn redaction_holdback(&self) -> usize {
         self.redactor.load().max_pattern_len().saturating_sub(1)
     }
@@ -630,8 +751,36 @@ impl EventWriter {
     /// choice `redaction_holdback`'s doc comment says to pair it with. Same hot-swap
     /// semantics as every other method here: reads whichever `Redactor` is live at call
     /// time via `ArcSwap::load`.
+    ///
+    /// **Same race warning as [`Self::redaction_holdback`]: do not call this and
+    /// `redaction_holdback` as two separate calls when you need them to agree on the same
+    /// redactor.** Prefer [`Self::redaction_split_for_flush`].
     pub fn redaction_safe_split_len(&self, bytes: &[u8], max: usize) -> usize {
         self.redactor.load().safe_split_len(bytes, max)
+    }
+
+    /// Combines [`Self::redaction_holdback`] and [`Self::redaction_safe_split_len`] under a
+    /// SINGLE `ArcSwap::load` (fix round 1, security finding S3 / Controller Ruling R9) —
+    /// the race-free way to get a streaming flush's split point. Tasks 6 and 8 (later
+    /// tasks in this lane) are the intended callers.
+    ///
+    /// Returns the number of bytes of `bytes` that are safe to flush and redact now (via
+    /// `redact_outbound_bytes`/`Redactor::redact_bytes` for a byte stream, or the
+    /// UTF-8-char-boundary-floored counterpart for text — see
+    /// `Redactor::safe_split_len`'s doc comment on flooring, S4) — the rest of `bytes`
+    /// must be retained and prefixed onto whatever arrives next.
+    ///
+    /// **A return of `0` means "nothing is safely flushable yet under the live redactor's
+    /// current holdback requirement" — it is not an error and not "flush nothing, ever".**
+    /// The caller must keep buffering and try again once more bytes have arrived; nothing
+    /// here bounds how long that buffering can go on unflushed — that bound belongs to the
+    /// buffer's own size/time-based flush policy (a later task's concern), not to this
+    /// method.
+    pub fn redaction_split_for_flush(&self, bytes: &[u8]) -> usize {
+        let redactor = self.redactor.load();
+        let holdback = redactor.max_pattern_len().saturating_sub(1);
+        let max = bytes.len().saturating_sub(holdback);
+        redactor.safe_split_len(bytes, max)
     }
 
     /// Append an event to the log. The event's `seq` field is ignored (the writer
@@ -680,9 +829,14 @@ impl EventWriter {
     ///
     /// A blob ref whose file isn't actually present under `state_dir`
     /// (`blobs::RecordBlobError::MissingFile`, surfaced here as `StoreError::Blob`) fails
-    /// the WHOLE call: neither the events nor any ref-count bump commit. See
-    /// `append_batch_with_blobs`'s (the free function's) own doc comment for the full
-    /// design.
+    /// the WHOLE call: neither the events nor any ref-count bump commit — for every
+    /// member of the batch, not just the one that failed. Retries on `SQLITE_BUSY` with
+    /// the same bounded backoff as `append`/`append_batch`. Every `BlobRef` passed in must
+    /// already have a real file on disk (`blobs::write_blob` already ran for it); this
+    /// does NOT redact blob content, only the reference. See `append_batch_with_blobs`'s
+    /// (the free function's) own doc comment for the full design, including the
+    /// unindexed-orphan-file gap a rolled-back call can leave behind (fix round 1,
+    /// security findings S6/S7).
     pub async fn append_batch_with_blobs(
         &self,
         events: Vec<Event>,

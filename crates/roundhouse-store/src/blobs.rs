@@ -86,14 +86,25 @@ pub enum RecordBlobError {
 /// caller uses to append the owning event** — never a separate one — per
 /// §4.5's "a blob can never be referenced by an event that isn't durably
 /// recorded, and vice versa." Phase 0 delivered this function; `roundhouse-flow`'s
-/// checkpoint commit (`production.rs`) and `writer::append_batch_with_blobs` (Phase 8
-/// Task 19 lane B, Task 5 — the streamed-delta event-append path) are today's two real
-/// call sites wiring it into an actual event/row-append transaction.
+/// checkpoint commit (`production.rs`) is today's one real production call site.
+/// `writer::append_batch_with_blobs` (Phase 8 Task 19 lane B, Task 5) is a second
+/// mechanism wiring this into the streamed-delta event-append transaction, but is not
+/// itself reached from any production code path yet — a later task's engine shell pump
+/// is the intended caller; don't read its existence here as "blob-carrying events already
+/// flow through it today."
 ///
 /// Rejects (`RecordBlobError::MissingFile`) a `blob_ref` whose file isn't
 /// actually present under `state_dir` — e.g. one that arrived via
 /// deserialized/persisted event data rather than a real `write_blob` call
 /// in this process — rather than indexing a row the filesystem can't back.
+///
+/// **Known TOCTOU (fix round 1, security finding S8), not closed by this function:**
+/// the existence check below (`fs::metadata`) and the `INSERT`/`UPDATE` it guards are not
+/// atomic with each other — a file deleted in the window between them (e.g. a concurrent,
+/// misbehaving GC pass, or anything else touching the blob store outside this crate's own
+/// discipline) leaves a `blobs` row (and the event that references it) committed while the
+/// file itself is gone, the mirror image of the gap this check exists to prevent. Not
+/// fixed here; recorded as a known gap.
 pub fn record_blob_write(
     txn: &Transaction,
     state_dir: &Path,
