@@ -111,9 +111,15 @@ pub async fn run_chat_turn(
 /// preserves per-session `seq` order and pushes backpressure onto the provider socket, same
 /// as every other append in this function). The `SplitFn` the coalescer is built with is a
 /// closure over a cloned `EventWriter`, calling its `redaction_split_for_coalescer` —
-/// a single `ArcSwap` load per split decision, so one flush sees one consistent redactor
-/// snapshot for both the holdback and the split point (mirroring `redaction_split_for_flush`'s
-/// own race-closing precedent).
+/// a single `ArcSwap` load per split QUERY, so one query's own holdback and split point always
+/// agree (mirroring `redaction_split_for_flush`'s own race-closing precedent). **Not** a claim
+/// that one whole flush decision (which can make several such queries — a size-shrink loop, or
+/// `carve_final_chunk`'s R13 growth-plus-bisection search) sees a single redactor snapshot
+/// throughout: a `set_redactor` landing between two queries within the same flush is not
+/// serialized against this closure, and doesn't need to be — every returned split point is
+/// still one the redactor actually gave at that call, and the resulting chunk is redacted again
+/// (against whatever redactor is live then) when it's actually persisted. See
+/// `EventWriter::redaction_split_for_coalescer`'s own doc comment for the full account.
 ///
 /// The stream is consumed exactly once: the same loop that mints deltas via
 /// `DeltaCoalescer::push`/`block_stop` also feeds each event into a `StreamFold`

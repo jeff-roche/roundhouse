@@ -785,9 +785,24 @@ impl EventWriter {
 
     /// The production [`crate::delta_sink`]-shaped split primitive (Phase 8 Task 19 lane B,
     /// Task 7): computes BOTH of `roundhouse_engine::delta_sink::SplitFn`'s modes from a
-    /// SINGLE `ArcSwap::load` of the live redactor, so one non-final-or-final flush decision
-    /// sees one consistent redactor snapshot throughout — the same race [`Self::
-    /// redaction_split_for_flush`] closes for its own (no-`max`, non-final-only) caller.
+    /// SINGLE `ArcSwap::load` of the live redactor PER CALL — one non-final-or-final split
+    /// QUERY sees one consistent redactor snapshot for its own holdback-and-split-point pair,
+    /// the same race [`Self::redaction_split_for_flush`] closes for its own (no-`max`,
+    /// non-final-only) caller.
+    ///
+    /// **Residual, stated explicitly (fix round 1, finding M1 — an earlier draft of this
+    /// comment overclaimed the guarantee at the wrong granularity):** one streaming flush
+    /// decision inside `DeltaCoalescer` routinely calls this method SEVERAL times — the
+    /// size-shrink loop in `attempt_nonfinal_flush`/`carve_final_chunk`, and `carve_final_chunk`'s
+    /// own R13 geometric-growth-plus-bisection search — each call an independent `load()`. A
+    /// `set_redactor` landing between two of those calls within the same flush is NOT
+    /// serialized against this method; the two calls can legitimately see different redactor
+    /// snapshots. That is safe regardless: every individual answer this method ever returns is
+    /// still one the live redactor at THAT call actually gave (never a stale or fabricated
+    /// value), and the payload is redacted again, against whatever redactor is live at append
+    /// time, by `redact_event_payload` when the resulting chunk is actually persisted — this
+    /// method's snapshot consistency is about correctness of a single split-point ANSWER, not
+    /// about serializing an entire multi-call flush against redactor rotation.
     ///
     /// `max` is an EXTERNAL cap this method always honors on top of whatever the redactor
     /// itself would allow — never a hint an implementation may ignore. `SplitFn`'s contract
