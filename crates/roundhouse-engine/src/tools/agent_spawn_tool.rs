@@ -250,6 +250,21 @@ pub trait SubAgentHost: Send + Sync {
     /// no handle on anything the implementor built.
     async fn create_child_session(&self, req: ChildSessionRequest)
         -> Result<(), ChildSessionError>;
+
+    /// Cooperatively closes every child session `parent` has spawned through
+    /// this `agent` tool (Phase 8, T19a Task 4's `SessionActor::close`, step
+    /// 4 — closing a session must close its children first, so none of them
+    /// is left running against a parent that no longer exists).
+    ///
+    /// Default no-op: an implementor with no children to worry about (a
+    /// library fixture, or any `SubAgentHost` built before this method
+    /// existed) closes cleanly without having to implement child-closing
+    /// itself. A real daemon-side implementor is expected to override this
+    /// to walk `parent`'s edges in the shared `SpawnTree` and call `close`
+    /// on each child's own `SessionActor` in turn.
+    async fn close_children(&self, parent: SessionId) {
+        let _ = parent;
+    }
 }
 
 /// The model-supplied half of an `agent` call, already validated.

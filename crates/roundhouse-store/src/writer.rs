@@ -1256,3 +1256,14 @@ impl EventWriter {
             .map_err(|_| StoreError::Interact("writer task dropped reply".into()))?
     }
 }
+
+/// Test-only seam for a lane needing to gate/fail `close_session` specifically (Phase 8,
+/// T19a Task 4's fault-injection and retry tests, and a documented future reuse: the
+/// socket server's close-request handling later pausing a close until an external signal
+/// fires). A CHILD module of this one, not a sibling declared from `lib.rs` — that is what
+/// lets it build an `EventWriter` and call `append_one`/`append_batch`/`close_session`
+/// directly from its own private fields/free functions (all private to this module)
+/// without widening any of their visibility for production callers, per this lane's own
+/// constraint against restructuring `writer.rs` for the parallel lane sharing this file.
+#[cfg(feature = "test-util")]
+pub mod test_util;

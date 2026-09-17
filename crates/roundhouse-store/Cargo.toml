@@ -7,6 +7,16 @@ license.workspace = true
 [lints]
 workspace = true
 
+[features]
+# Phase 8, T19a Task 4: gates `writer::test_util` (a gated `EventWriter` for testing
+# `close_session` failure/retry paths), mirroring the identical, security/scope-motivated
+# `test-util` feature already in `roundhouse-policy`, `roundhouse-engine` and
+# `roundhouse-sandbox` — test-only constructors are absent from ordinary production builds.
+# Activated for this crate's own `tests/*.rs` integration tests through the self
+# dev-dependency below (`cfg(test)` alone does not cover them), and for `roundhouse-engine`'s
+# tests through its own dev-dependency on this crate with the same feature.
+test-util = []
+
 [dependencies]
 roundhouse-core = { path = "../roundhouse-core" }
 # Deliberate, tracked deviation from the frozen crate dependency table
@@ -39,3 +49,8 @@ arc-swap = "1"
 tempfile = "3"
 tokio = { version = "1.53", features = ["full"] }
 rusqlite = { workspace = true }
+# Self dev-dependency, activating the `test-util` feature for this crate's own `tests/*.rs`
+# integration-test crates — `cfg(test)` alone does not cover them, only this crate's in-lib
+# `#[cfg(test)] mod tests`. Mirrors the identical pattern in `roundhouse-policy`/
+# `roundhouse-engine`.
+roundhouse-store = { path = ".", features = ["test-util"] }

@@ -3919,6 +3919,7 @@ dependencies = [
  "once_cell",
  "roundhouse-core",
  "roundhouse-provider",
+ "roundhouse-store",
  "rusqlite",
  "rusqlite_migration",
  "serde",

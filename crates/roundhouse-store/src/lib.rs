@@ -51,6 +51,14 @@ pub use writer::{append_event_in_transaction, serialize_payload, spawn_writer, E
 // Phase 8, Task 19a Task 1: session close (sweep + terminator) and its receipt type.
 pub use writer::CloseReceipt;
 
+// Phase 8, Task 19a Task 4: a gated `EventWriter` for testing `close_session` failure/retry
+// paths from another crate (`roundhouse-engine`'s own tests, activated via a self
+// dev-dependency on this crate with `features = ["test-util"]`). Re-exported here rather
+// than accessed as `writer::test_util` directly: `mod writer` above is private, so without
+// this re-export the module would be reachable within this crate but not from outside it.
+#[cfg(feature = "test-util")]
+pub use writer::test_util;
+
 // Task 3 exports
 pub use fold::{fold_task, Task, TaskState};
 

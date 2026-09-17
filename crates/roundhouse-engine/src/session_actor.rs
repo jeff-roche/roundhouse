@@ -26,8 +26,8 @@
 //! session-creation call site.
 
 use roundhouse_core::{
-    CancelReason, NoteLevel, OnDegrade, Origin, SessionId, SessionSpec, SessionState, TaskInput,
-    TaskKind, TaskRunner, Tier, Timestamp,
+    CancelReason, NoteLevel, OnDegrade, Origin, SessionId, SessionOutcome, SessionSpec,
+    SessionState, TaskInput, TaskKind, TaskRunner, Tier, Timestamp,
 };
 use roundhouse_mcp::config::{McpServerConfig, McpTransportKind};
 use roundhouse_net::policy::{EgressPolicy, HostPattern};
@@ -38,10 +38,12 @@ use roundhouse_policy::{Taint, TaskParams};
 use roundhouse_provider::RequestCtx;
 use roundhouse_sandbox::{Attestation, Child, CommandSpec, Handle, Isolate, IsolationError};
 use roundhouse_store::redact::Redactor;
-use roundhouse_store::{EventWriter, StoreError};
+use roundhouse_store::{CloseReceipt, EventWriter, StoreError};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
+use tracing::Instrument;
 
 /// `Timestamp` has no `now()` — read the wall clock ourselves and convert.
 /// Matches the identical helper in `chat.rs`/`roundhouse-store/tests/recovery.rs`.
@@ -312,6 +314,29 @@ pub struct SessionActor {
     /// `Debug` rendering `cancel` also writes into the durable
     /// `SessionStateChanged` event.
     cancel_reason: RwLock<Option<CancelReason>>,
+    /// Phase 8, T19a Task 4: whether `cancel()`'s `SessionStateChanged{
+    /// Cancelling }` event has ever been durably appended for this session —
+    /// set to `true` only AFTER that append succeeds. Neither `state()` nor
+    /// `cancel_reason()` is a safe proxy for "durably recorded": `cancel()`
+    /// flips `state_tx` and stores `cancel_reason` BEFORE it even attempts
+    /// the append (see `cancel`'s own doc comment), so both already read as
+    /// "cancelling" even when the append that was supposed to make that
+    /// durable has failed. [`Self::close`] reads this flag to decide whether
+    /// a retry needs to call `cancel()` again: skipping a durable append
+    /// that already succeeded avoids minting a second, redundant
+    /// `SessionStateChanged` event, while a previous `cancel()` call whose
+    /// append FAILED must still be retried on `close`'s next attempt —
+    /// reading `state()` instead would silently skip that retry forever.
+    cancel_recorded: AtomicBool,
+    /// Phase 8, T19a Task 4: serializes concurrent [`Self::close`] calls
+    /// against this one session, so two callers racing to close the same
+    /// session cannot both observe "not yet Closed" and both run the
+    /// cancel/wait/close-children/append sequence at once. The second caller
+    /// blocks here until the first's entire `close` has finished (including
+    /// publishing `Closed` to `state_tx`), at which point its own `state()
+    /// == Closed` check short-circuits it to `CloseReceipt::AlreadyClosed`
+    /// without repeating any of the rest.
+    close_lock: tokio::sync::Mutex<()>,
     /// Phase 8, T19a Task 3: the number of [`WorkGuard`]s currently held for
     /// this session — one per `run_agent_loop` call presently in flight
     /// against it. [`Self::wait_idle`] resolves once this reaches zero,
@@ -476,6 +501,8 @@ impl SessionActor {
             sub_agent_host: RwLock::new(None),
             taint: RwLock::new(Taint::Trusted),
             cancel_reason: RwLock::new(None),
+            cancel_recorded: AtomicBool::new(false),
+            close_lock: tokio::sync::Mutex::new(()),
             work_tx,
         }
     }
@@ -909,6 +936,13 @@ impl SessionActor {
             1,
         );
         self.writer.append(event).await?;
+        // Only now — after the append genuinely succeeded — is the
+        // Cancelling transition durable. See `cancel_recorded`'s own doc
+        // comment for why `close()` needs this specific flag rather than
+        // `state()`/`cancel_reason()`, both of which are already set above,
+        // before this line, regardless of whether the append below them
+        // succeeds.
+        self.cancel_recorded.store(true, Ordering::SeqCst);
         Ok(())
     }
 
@@ -1105,6 +1139,103 @@ impl SessionActor {
             execute(step).await.map_err(FinallyStepError::Execute)?;
         }
         Ok(())
+    }
+
+    /// Cooperatively closes this session: cancels whatever this session has
+    /// in flight, waits for that work to actually unwind, closes this
+    /// session's children, and only then durably appends the
+    /// `SessionClosed` terminator (Phase 8, T19a Task 4). This is the one
+    /// ordered path allowed to do all four — nothing else in this crate
+    /// calls [`EventWriter::close_session`].
+    ///
+    /// Steps, strictly in this order:
+    /// 1. Take `close_lock`, serializing concurrent `close()` calls against
+    ///    THIS actor — see `close_lock`'s own doc comment. If `state()`
+    ///    already reads `Closed`, return `AlreadyClosed` immediately without
+    ///    touching anything else; closing an already-closed session is a
+    ///    safe, idempotent no-op.
+    /// 2. Enter `Cancelling` via [`Self::cancel`] with
+    ///    [`CancelReason::SessionClosed`], unless a previous `cancel()` call
+    ///    already durably recorded it (`cancel_recorded` — see that field's
+    ///    own doc comment for why `state()`/`cancel_reason()` cannot be used
+    ///    for this check). This is what drives real process-group
+    ///    SIGTERM->SIGKILL for a running shell and races an in-flight
+    ///    provider/MCP call against cancellation — see `run_agent_loop`'s
+    ///    own cancellation handling.
+    /// 3. [`Self::wait_idle`], wrapped in its own tracing span, so this
+    ///    never durably closes the session while a `run_agent_loop` call
+    ///    (or anything else holding a [`WorkGuard`] for this session) is
+    ///    still unwinding.
+    /// 4. `sub_agent_host().close_children(session_id)`, if a host was ever
+    ///    registered for this session ([`Self::register_sub_agent_host`]) —
+    ///    closing a session without first closing its children would leave
+    ///    them running against a parent that no longer exists. A session
+    ///    with no registered host (a library fixture, or any session built
+    ///    before a host was wired in) skips this step entirely, same as
+    ///    every other `sub_agent_host()`-gated call in this crate.
+    /// 5. [`EventWriter::close_session`] — the durable sweep-then-terminator
+    ///    transaction (Task 1): every task still open in this session's
+    ///    `tasks` view is swept into `TaskCancelled`, then `SessionClosed`
+    ///    is appended last, both in one transaction. If this fails, `close`
+    ///    returns `Err` immediately: nothing here has published a
+    ///    terminator, and `state_tx` is never touched — the in-memory state
+    ///    stays exactly `Cancelling`. A caller is free to retry `close`:
+    ///    step 2 will not repeat the (already-durable) `Cancelling` append,
+    ///    and will retry only the step that actually failed.
+    /// 6. Only once that append genuinely succeeds does this publish
+    ///    `Closed` to the state watch (`state_tx.send_replace`) — the one
+    ///    and only place [`SessionState::Closed`] ever becomes observable
+    ///    from this actor.
+    ///
+    /// # This session must never call `close` on itself from inside its own work
+    ///
+    /// Step 3 awaits this same session's live-work count reaching zero. A
+    /// `run_agent_loop` call (or anything else currently holding a
+    /// [`WorkGuard`] for this session) that itself calls `close` would be
+    /// waiting on its own guard to drop — which it never will, since it is
+    /// the very thing doing the waiting. That is a genuine, structural
+    /// deadlock, not merely a slow path, and avoiding it is the caller's
+    /// responsibility: a close request must always be driven from outside
+    /// the session's own work (e.g. a socket server dispatching a client's
+    /// close request from a task other than the session's own agent loop).
+    ///
+    /// # `wait_idle` resolving is not a promise that every real process has exited
+    ///
+    /// `run_agent_loop`'s cancellation race drops its [`WorkGuard`] on every
+    /// exit path, including one where a spawned shell's SIGTERM/SIGKILL
+    /// confirmation itself failed to confirm the process actually died — so
+    /// `wait_idle` resolving only promises that no further *event-appending*
+    /// work remains in flight for this session, never that every OS process
+    /// this session ever spawned has genuinely exited. A caller of `close`
+    /// still owns tearing down this session's real isolation handle
+    /// afterward ([`Self::teardown`]) exactly as it always did; `close`
+    /// closing the event log is not a substitute for that.
+    pub async fn close(&self, outcome: SessionOutcome) -> Result<CloseReceipt, StoreError> {
+        let _close_guard = self.close_lock.lock().await;
+
+        if self.state() == SessionState::Closed {
+            return Ok(CloseReceipt::AlreadyClosed);
+        }
+
+        if !self.cancel_recorded.load(Ordering::SeqCst) {
+            self.cancel(self.runner, CancelReason::SessionClosed)
+                .await?;
+        }
+
+        let span = tracing::info_span!("session_close_wait_idle", session_id = %self.session_id);
+        self.wait_idle().instrument(span).await;
+
+        if let Some(host) = self.sub_agent_host() {
+            host.close_children(self.session_id).await;
+        }
+
+        let receipt = self
+            .writer
+            .close_session(self.runner, self.session_id, now_ts(), outcome)
+            .await?;
+
+        self.state_tx.send_replace(SessionState::Closed);
+        Ok(receipt)
     }
 }
 
