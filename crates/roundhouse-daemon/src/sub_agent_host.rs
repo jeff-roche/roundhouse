@@ -24,10 +24,12 @@
 //!    the floor leaks all three. Something must hold it.
 //! 2. Retiring a sub-agent needs to know which parent's `SpawnTree` edge to
 //!    remove, and `SpawnTree` indexes parent → children only. This is the
-//!    child → parent direction, and it is what
-//!    [`SubAgentSessions::retire_child`] — the one way to end a tracked
-//!    sub-agent — uses to free the parent's fan-out slot as it tears the
-//!    session down.
+//!    child → parent direction, and it is what the two ways to end a
+//!    tracked sub-agent both read: [`SubAgentSessions::retire_child`], which
+//!    drops the edge and tears the session down itself, and
+//!    [`SubAgentSessions::take_for_reap`], which hands both back to a caller
+//!    (`spawn_session_reaper`'s `RetireSubAgent` reap action) that must do
+//!    so itself.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -132,27 +134,32 @@ impl SubAgentSessions {
     ///
     /// **Module-private on purpose.** A caller holding a [`LiveSubAgent`] it
     /// took out of this map owns a live session *and* a spawn-tree edge, and
-    /// handing that pair out is how one of them gets forgotten;
-    /// [`Self::retire_child`] is the one public way to end a tracked
-    /// sub-agent, and it closes both.
+    /// handing that pair out is how one of them gets forgotten. There are
+    /// two public ways to end a tracked sub-agent, and both go through this:
+    /// [`Self::retire_child`], which drops the edge and tears the session
+    /// down itself in one call, and [`Self::take_for_reap`], which hands
+    /// both back to a caller that commits to doing so itself.
     fn take(&self, child: SessionId) -> Option<LiveSubAgent> {
         self.live.lock().ok()?.remove(&child)
     }
 
     /// Removes `child`'s record and hands back its parent id and its live
-    /// session handle, without touching the spawn tree or retiring the
-    /// session itself (Phase 8, T19a Task 5).
+    /// session handle — the edge and the session `Self::retire_child` would
+    /// otherwise drop/tear down itself (Phase 8, T19a Task 5).
     ///
-    /// For [`crate::session_manager::spawn_session_reaper`]'s own
-    /// `RetireSubAgent` reap action, which must run its own
-    /// `SpawnTree::remove_child` and
-    /// [`crate::session_manager::HeadlessSession::teardown_from_reaper`] —
-    /// never through [`Self::retire_child`] (which calls
-    /// [`LiveSubAgent::retire`], i.e.
-    /// [`crate::session_manager::HeadlessSession::teardown`]) — because that
-    /// reap action runs from inside the very reaper task the returned
-    /// `HeadlessSession`'s own `JoinHandle` identifies, and `teardown`
-    /// aborts it.
+    /// **The caller MUST call [`SpawnTree::remove_child`] with the returned
+    /// parent id and `child`, and MUST retire the returned
+    /// [`HeadlessSession`] itself** (via
+    /// [`crate::session_manager::HeadlessSession::teardown_from_reaper`], or
+    /// whichever of that type's teardown paths fits the caller's own
+    /// situation) — this method does neither. Use it instead of
+    /// [`Self::retire_child`] only when the caller cannot safely go through
+    /// [`crate::session_manager::HeadlessSession::teardown`]/
+    /// [`crate::session_manager::HeadlessSession::close_and_teardown`] —
+    /// today, `spawn_session_reaper`'s `RetireSubAgent` reap action, which
+    /// runs from inside the very reaper task the returned session's own
+    /// `JoinHandle` identifies, and for which both of those methods would
+    /// self-abort.
     ///
     /// Idempotent for the same reason [`Self::take`] is: a second call for
     /// an already-taken child finds no record and returns `None`.
@@ -188,16 +195,20 @@ impl SubAgentSessions {
     /// method's own doc comment explains is not safe, since
     /// `Isolate::teardown` is not guaranteed idempotent.
     ///
-    /// # No production caller yet, and why that is the correct state
+    /// # `SessionState::Closed` is not how this method's production caller decides to retire a child
     ///
-    /// Nothing in this workspace drives a session to `SessionState::Closed`
-    /// ([`crate::session_manager::spawn_session_reaper`]'s own doc comment
-    /// says so), and the `agent` tool hands the model a child id rather than
-    /// running the child to completion — so today's callers are this crate's
-    /// tests. That is deliberate rather than an oversight: Phase 8 L5's job
-    /// is to wire this bookkeeping at the seam that owns it, so that whatever
-    /// later drives a sub-agent to completion inherits a correct slot release
-    /// by construction instead of having to remember one.
+    /// `scheduler_driver::drive_workflow_agent_child` is this method's
+    /// production caller: it retires a workflow `agent:` step's child
+    /// unconditionally the moment driving it finishes — success, error,
+    /// timeout, or a vanished session alike — independent of whatever
+    /// `SessionState` the child's own actor is in. Nothing calls
+    /// [`SessionActor::close`](roundhouse_engine::SessionActor::close) on a
+    /// tracked child to reach `SessionState::Closed` that way.
+    /// `spawn_session_reaper`'s `RetireSubAgent` reap action (Phase 8, T19a
+    /// Task 5) exists for that OTHER way a child could end — its own actor
+    /// reaching `Closed` on its own — but nothing yet drives a tracked
+    /// child's actor there, so that reap action still has no production
+    /// caller of its own.
     pub async fn retire_child(
         &self,
         child: SessionId,
@@ -236,6 +247,7 @@ impl SubAgentSessions {
         &self,
         child: SessionId,
         parent: SessionId,
+        depth: u8,
         session: crate::session_manager::HeadlessSession,
     ) {
         if self
@@ -243,7 +255,7 @@ impl SubAgentSessions {
                 child,
                 LiveSubAgent {
                     parent,
-                    depth: 0,
+                    depth,
                     session,
                 },
             )

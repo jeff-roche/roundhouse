@@ -149,6 +149,14 @@ tempfile = "3"
 # workspace's `resolver = "2"` (verified directly for that self-dependency
 # case; same resolver, same mechanism, applies identically here).
 roundhouse-engine = { path = "../roundhouse-engine", features = ["test-util"] }
+# Phase 8, T19a Task 5, fix round 1: `close_and_teardown`'s own timeout test
+# needs `roundhouse_store::test_util::{CloseGate, spawn_gated_writer}` to
+# make a real `SessionActor::close` call hang deterministically (no real
+# sleeping) until the test itself releases it — the same mechanism
+# `roundhouse-engine`'s `tests/session_close.rs` already uses for its own
+# `close()` retry test. Same non-unification-into-normal-builds property the
+# comment above documents for the identical `roundhouse-engine` case.
+roundhouse-store = { path = "../roundhouse-store", features = ["test-util"] }
 # `async-trait` is no longer listed here: Phase 8 L5 promoted it to a real
 # `[dependencies]` entry (see that entry's comment), which dev targets
 # inherit — this crate's fake `McpTransport` test transport still needs it.

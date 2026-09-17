@@ -226,7 +226,9 @@ const SESSION_STATE_CHANGED_PAYLOAD_PREFIX: &str = r#"{"SessionStateChanged":"#;
 /// The second bullet is, as of this task, a filter with no production writer
 /// in front of it. **No code in this workspace appends `SessionClosed` or
 /// `SessionStateChanged { state: Closed, .. }` to the log**:
-/// `SubAgentSessions::retire_child` (the one way a tracked sub-agent ends)
+/// `SubAgentSessions::retire_child` (one of the two ways a tracked sub-agent
+/// ends — the other being `SubAgentSessions::take_for_reap`, used by
+/// `spawn_session_reaper`'s `RetireSubAgent` reap action)
 /// removes the map entry and the tree edge and tears the session down entirely
 /// in memory, writing nothing, and `SessionActor::cancel` — the only
 /// production appender of a session-lifecycle state event at all — writes
