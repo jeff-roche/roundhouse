@@ -845,6 +845,43 @@ impl EventWriter {
         }
     }
 
+    /// Combines [`Self::redaction_split_for_coalescer`]'s split choice and
+    /// [`Self::redact_outbound_bytes`]'s redaction under a SINGLE `ArcSwap::load` of the live
+    /// redactor (Phase 8 Task 19 lane B, Task 8 fix round 1, security finding M4). Two
+    /// independent loads — call `redaction_split_for_coalescer` and then separately
+    /// `redact_outbound_bytes` on the returned prefix — let a `set_redactor` land between them:
+    /// the holdback/cut computed against the OLD redactor and the automaton scan run against the
+    /// NEW one can legitimately disagree (a longer pattern in the new redactor could straddle a
+    /// cut the old one judged safe), which is exactly the race
+    /// [`Self::redaction_split_for_coalescer`]'s own doc comment already closed for computing
+    /// `final_flush`'s two component numbers together — this method closes the identical race one
+    /// level up, for a caller that also needs the redacted bytes themselves under that same
+    /// snapshot.
+    ///
+    /// Returns `(cut, redacted, matches)`: `cut` is exactly what
+    /// `redaction_split_for_coalescer(bytes, max, final_flush)` would have returned under the SAME
+    /// snapshot; `redacted`/`matches` are `redact_bytes(&bytes[..cut])` under that identical
+    /// snapshot. A non-final `cut` of `0` means nothing is safely flushable yet — `redacted` is
+    /// then empty and the caller must not persist it (mirrors
+    /// `redaction_split_for_coalescer`'s own "0 means keep buffering" contract).
+    pub fn redaction_split_and_redact(
+        &self,
+        bytes: &[u8],
+        max: usize,
+        final_flush: bool,
+    ) -> (usize, Vec<u8>, u32) {
+        let redactor = self.redactor.load();
+        let cut = if final_flush {
+            redactor.safe_split_len(bytes, max)
+        } else {
+            let holdback = redactor.max_pattern_len().saturating_sub(1);
+            let capped = max.min(bytes.len().saturating_sub(holdback));
+            redactor.safe_split_len(bytes, capped)
+        };
+        let (redacted, matches) = redactor.redact_bytes(&bytes[..cut]);
+        (cut, redacted, matches)
+    }
+
     /// Append an event to the log. The event's `seq` field is ignored (the writer
     /// assigns a monotonic sequence number per session). Returns the assigned `seq`,
     /// or an error if serialization, database locking, or the writer task fails.

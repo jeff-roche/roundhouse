@@ -71,9 +71,7 @@
 //! an MCP problem."
 
 use crate::session_actor::TaskIsolator;
-use roundhouse_core::{
-    Delta, Progress, SessionId, SessionState, TaskId, TaskKind, TaskRunner, Timestamp,
-};
+use roundhouse_core::{Delta, Progress, SessionId, SessionState, TaskId, TaskKind, TaskRunner};
 use roundhouse_policy::{FsOp, ParsedCommand, TaskParams};
 use roundhouse_provider::ToolResultPart;
 use roundhouse_sandbox::{Child, CommandSpec, IsolationError};
@@ -1019,17 +1017,6 @@ pub(crate) fn isolated_shell_command(cmd: &ParsedCommand, cwd: &Path) -> Command
     }
 }
 
-/// `Timestamp` has no `now()` of its own — read the wall clock and convert.
-/// Mirrors `chat.rs`'s private helper of the same name/shape; not shared
-/// because `chat.rs`'s is private to that module.
-fn now_ts() -> Timestamp {
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .expect("system clock before UNIX epoch")
-        .as_nanos() as i64;
-    Timestamp::from_unix_nanos(nanos)
-}
-
 /// Per-flush chunk-size trigger/cap for streamed shell stdout/stderr deltas
 /// (Phase 8 Task 19 lane B, Task 8) — deliberately distinct from
 /// `crate::delta_sink::FLUSH_SIZE_THRESHOLD` (2 KiB, sized for a provider's
@@ -1161,36 +1148,56 @@ impl ShellDeltaSink {
     }
 }
 
+/// One item on a [`DeltaChannel`] — either a genuine chunk of stream bytes,
+/// or a discontinuity marker (Phase 8 Task 19 lane B, Task 8 fix round 1,
+/// security finding I1): [`try_send_chunk`] sends [`Self::Gap`] whenever it
+/// drops a chunk for being over the shared [`SHELL_DELTA_BUDGET_BYTES`]
+/// budget, and [`drain_to_end`] sends it once more, immediately before
+/// dropping its sender, the instant the [`MAX_SHELL_OUTPUT_BYTES`] cap is
+/// reached. Either way it means "bytes existed here that will never reach
+/// the pump" — see [`handle_stream_event`]'s `Gap` arm for why that must
+/// never be treated the same as a clean, contiguous continuation.
+enum ShellChunk {
+    Data(Vec<u8>),
+    Gap,
+}
+
 /// The shared plumbing [`drain_to_end`] uses to forward a copy of each
-/// non-dropped chunk it reads to [`run_shell_delta_pump`], without ever
-/// awaiting it (R1/R4: the drain must never await the writer, so a stalled
-/// pump/writer can't deadlock a child's own pipes). `in_flight`/`lag` are
-/// each a SINGLE `Arc<AtomicUsize>` shared across BOTH streams' channels —
-/// deliberately one combined budget/lag pair, not one per stream (Controller
-/// ruling): the progress message's "K B not streamed" is one combined
-/// number.
+/// chunk it reads to [`run_shell_delta_pump`], without ever awaiting it
+/// (R1/R4: the drain must never await the writer, so a stalled pump/writer
+/// can't deadlock a child's own pipes). `in_flight`/`lag` are each a SINGLE
+/// `Arc<AtomicUsize>` shared across BOTH streams' channels — deliberately
+/// one combined budget/lag pair, not one per stream (Controller ruling): the
+/// progress message's "K B not streamed" is one combined number.
 struct DeltaChannel {
-    tx: mpsc::UnboundedSender<Vec<u8>>,
+    tx: mpsc::UnboundedSender<ShellChunk>,
     in_flight: Arc<AtomicUsize>,
     lag: Arc<AtomicUsize>,
 }
 
-/// Attempts to forward `chunk` (already known non-empty) into `channel`,
-/// reserving its length against the shared [`SHELL_DELTA_BUDGET_BYTES`]
-/// budget first. Over budget, the chunk is dropped from the delta stream
-/// only — the caller's own `ShellOutput` accumulation is untouched — and its
-/// length is added to the shared lag counter instead. Never awaits anything:
-/// `try_send` and the atomics below are both synchronous.
+/// Attempts to forward `chunk` (already known non-empty; enforced by a
+/// `debug_assert!` rather than a runtime check — every call site already
+/// establishes this, per fix round 1 finding 7) into `channel`, reserving
+/// its length against the shared [`SHELL_DELTA_BUDGET_BYTES`] budget first.
+/// Over budget, the chunk is dropped from the delta stream only — the
+/// caller's own `ShellOutput` accumulation is untouched — its length is
+/// added to the shared lag counter, and a [`ShellChunk::Gap`] marker is sent
+/// in its place (fix round 1, security finding I1) so the pump never
+/// silently concatenates the bytes on either side of the drop as if they
+/// were contiguous. Never awaits anything: `try_send` and the atomics below
+/// are both synchronous.
 fn try_send_chunk(channel: &DeltaChannel, chunk: &[u8]) {
+    debug_assert!(
+        !chunk.is_empty(),
+        "try_send_chunk's only call site (drain_to_end) never offers an empty chunk"
+    );
     let len = chunk.len();
-    if len == 0 {
-        return;
-    }
     let mut current = channel.in_flight.load(Ordering::Relaxed);
     loop {
         let reserved = current + len;
         if reserved > SHELL_DELTA_BUDGET_BYTES {
             channel.lag.fetch_add(len, Ordering::Relaxed);
+            let _ = channel.tx.send(ShellChunk::Gap);
             return;
         }
         match channel.in_flight.compare_exchange_weak(
@@ -1209,23 +1216,25 @@ fn try_send_chunk(channel: &DeltaChannel, chunk: &[u8]) {
     // reserved budget is simply never reclaimed by a pump that no longer
     // exists, which is harmless since the whole `ShellDeltaSink`/budget pair
     // is scoped to this one dispatched call.
-    let _ = channel.tx.send(chunk.to_vec());
+    let _ = channel.tx.send(ShellChunk::Data(chunk.to_vec()));
 }
 
-/// Per-stream mutable pump state: the bytes buffered since the last flush,
-/// the cumulative count of bytes actually flushed (for the progress
-/// message), and the receiving half of this stream's [`DeltaChannel`] —
+/// Per-stream mutable pump state: the bytes buffered since the last flush
+/// (or the last discontinuity — see [`handle_stream_event`]'s `Gap` arm),
+/// the cumulative count of bytes actually, durably flushed (for the
+/// progress message — only ever advanced once `flush_stream` reports
+/// success), and the receiving half of this stream's [`DeltaChannel`] —
 /// `None` once this stream's `drain_to_end` has dropped its sender AND the
 /// resulting final flush has run.
 struct StreamPumpState {
     kind: ShellStream,
     buf: Vec<u8>,
     flushed: u64,
-    rx: Option<mpsc::UnboundedReceiver<Vec<u8>>>,
+    rx: Option<mpsc::UnboundedReceiver<ShellChunk>>,
 }
 
 impl StreamPumpState {
-    fn new(kind: ShellStream, rx: Option<mpsc::UnboundedReceiver<Vec<u8>>>) -> Self {
+    fn new(kind: ShellStream, rx: Option<mpsc::UnboundedReceiver<ShellChunk>>) -> Self {
         StreamPumpState {
             kind,
             buf: Vec::new(),
@@ -1236,7 +1245,7 @@ impl StreamPumpState {
 }
 
 /// Flushes as much of `stream.buf` as the live redactor's
-/// `EventWriter::redaction_split_for_coalescer` currently allows, appending a
+/// `EventWriter::redaction_split_and_redact` currently allows, appending a
 /// `Delta::Blob` plus one `TaskProgress` (Controller ruling: "at most one
 /// TaskProgress" per flush) in a single `append_batch_with_blobs` call. A
 /// no-op if `stream.buf` is empty (both for an idle tick and for a
@@ -1246,16 +1255,38 @@ impl StreamPumpState {
 /// cut is redaction's own non-final holdback-and-split answer, and if that
 /// answer is `0` (nothing safely flushable under the live redactor's
 /// holdback yet — R1), this is a harmless no-op; whatever is buffered is
-/// simply carried into the next flush attempt. `true` for the stream's real
-/// close (EOF) or the [`MAX_SHELL_OUTPUT_BYTES`] cap being reached —
-/// `EventWriter::redaction_split_for_coalescer(bytes, bytes.len(), true)`
-/// always returns exactly `bytes.len()` (no match found by scanning `bytes`
+/// simply carried into the next flush attempt. `true` is reserved for the
+/// stream's genuine, gap-free close (real EOF, or — since fix round 1,
+/// security finding I1 — the tail segment remaining after the LAST
+/// discontinuity was already handled by [`handle_stream_event`]'s `Gap` arm,
+/// which is what makes a subsequent unconditional release safe again):
+/// `EventWriter::redaction_split_and_redact(bytes, bytes.len(), true)`
+/// always returns `cut == bytes.len()` (no match found by scanning `bytes`
 /// itself can ever end past `bytes.len()`, so `Redactor::safe_split_len`'s
 /// straddle check can never trigger at `k = bytes.len()`) — "it releases
 /// everything," per the brief, with no shrink/bisection loop needed the way
 /// `DeltaCoalescer::carve_final_chunk` needs one for `Delta::Text` (that
 /// module also floors to a UTF-8 char boundary, which raw shell bytes never
-/// need to).
+/// need to). **This is only safe because a discontinuity is never allowed to
+/// reach this branch with unhandled pre-gap bytes still concatenated onto
+/// post-gap ones** — see [`handle_stream_event`]'s `Gap` arm, which is the
+/// one place that guarantees it.
+///
+/// **Orphan blobs (security finding M3, controller ruling R17):** this
+/// function calls `write_blob` before `append_batch_with_blobs`, and two
+/// paths can leave a written blob file with no `blobs` row ever
+/// referencing it — an orphan `gc_eligible_blobs` can never discover (that
+/// query only ever sees rows that exist): (1) `append_batch_with_blobs`
+/// itself failing after `write_blob` already succeeded (handled below by
+/// counting the bytes as lag rather than losing them silently — see the
+/// error arm), and (2) this whole future being dropped by
+/// [`run_isolated_shell_dispatch`]'s outer `tokio::select!` on a
+/// timeout/cancel while awaiting `append_batch_with_blobs`, after the
+/// `spawn_blocking(write_blob)` call has already completed (`spawn_blocking`
+/// runs the closure to completion regardless of whether its `JoinHandle` is
+/// still being awaited). Per ruling R10, this task does not add a
+/// `record_unreferenced_blob` pre-pass to close either gap; reclaiming an
+/// unindexed file is a recorded follow-up, not this task's job.
 #[allow(clippy::too_many_arguments)]
 async fn flush_stream(
     writer: &EventWriter,
@@ -1276,29 +1307,55 @@ async fn flush_stream(
     } else {
         stream.buf.len().min(SHELL_FLUSH_CHUNK_BYTES)
     };
-    let cut = writer.redaction_split_for_coalescer(&stream.buf, max, final_flush);
+    let (cut, redacted, _matches) =
+        writer.redaction_split_and_redact(&stream.buf, max, final_flush);
     if cut == 0 {
         // Non-final only (see this function's own doc comment for why a
         // final flush can never land here): nothing is safely flushable yet
         // under the live redactor's holdback requirement — keep buffering.
         return Ok(());
     }
+    stream.buf.drain(..cut); // remove the consumed prefix regardless of what happens below --
+                             // a failure past this point must count these bytes as lag
+                             // (finding M2/9), never silently retry or lose them.
 
-    let chunk: Vec<u8> = stream.buf.drain(..cut).collect();
-    let (redacted, _matches) = writer.redact_outbound_bytes(&chunk);
     let mime = stream.kind.mime().to_string();
     let state_dir_owned = state_dir.to_path_buf();
-    let blob_ref = tokio::task::spawn_blocking(move || {
+    let blob_ref = match tokio::task::spawn_blocking(move || {
         roundhouse_store::blobs::write_blob(&state_dir_owned, &redacted, Some(mime))
     })
     .await
-    .map_err(|e| ToolDispatchError::Isolation(format!("shell delta blob write panicked: {e}")))?
-    .map_err(|e| ToolDispatchError::Isolation(format!("shell delta blob write failed: {e}")))?;
+    {
+        Ok(Ok(blob_ref)) => blob_ref,
+        Ok(Err(e)) => {
+            tracing::warn!(
+                error = %e, dropped_bytes = cut,
+                "shell delta blob write failed; counting the dropped bytes as lag"
+            );
+            lag.fetch_add(cut, Ordering::Relaxed);
+            return Err(ToolDispatchError::Isolation(format!(
+                "shell delta blob write failed: {e}"
+            )));
+        }
+        Err(e) => {
+            tracing::warn!(
+                error = %e, dropped_bytes = cut,
+                "shell delta blob write task panicked; counting the dropped bytes as lag"
+            );
+            lag.fetch_add(cut, Ordering::Relaxed);
+            return Err(ToolDispatchError::Isolation(format!(
+                "shell delta blob write panicked: {e}"
+            )));
+        }
+    };
 
-    stream.flushed += chunk.len() as u64;
+    // Computed but not yet committed to `stream.flushed` (fix round 1,
+    // finding 9): the progress message below must not claim bytes as
+    // flushed until the append that actually records them succeeds.
+    let tentative_flushed = stream.flushed + cut as u64;
     let (stdout_flushed, stderr_flushed) = match stream.kind {
-        ShellStream::Stdout => (stream.flushed, other_flushed),
-        ShellStream::Stderr => (other_flushed, stream.flushed),
+        ShellStream::Stdout => (tentative_flushed, other_flushed),
+        ShellStream::Stderr => (other_flushed, tentative_flushed),
     };
     let lag_bytes = lag.load(Ordering::Relaxed);
     let mut message = format!("stdout {stdout_flushed} B, stderr {stderr_flushed} B");
@@ -1306,7 +1363,7 @@ async fn flush_stream(
         message.push_str(&format!(", {lag_bytes} B not streamed"));
     }
 
-    let now = now_ts();
+    let now = crate::agent_loop::now_ts();
     let delta_event =
         runner.record_task_delta(session_id, 0, now, task_id, Delta::Blob(blob_ref), 1);
     let progress_event = runner.record_task_progress(
@@ -1320,11 +1377,64 @@ async fn flush_stream(
         },
         1,
     );
-    writer
+    match writer
         .append_batch_with_blobs(vec![delta_event, progress_event], state_dir.to_path_buf())
         .await
-        .map_err(|e| ToolDispatchError::Isolation(format!("shell delta append failed: {e}")))?;
-    Ok(())
+    {
+        Ok(_) => {
+            stream.flushed = tentative_flushed;
+            Ok(())
+        }
+        Err(e) => {
+            // The blob is already durably on disk (write_blob above
+            // succeeded) but never indexed/referenced by this failed
+            // append — an orphan file (this function's own doc comment,
+            // M3/R17). From the delta STREAM's perspective, though,
+            // nothing was ever recorded, so these bytes count as lag just
+            // like any other unstreamed bytes.
+            tracing::warn!(
+                error = %e, dropped_bytes = cut,
+                "shell delta append failed; counting the dropped bytes as lag"
+            );
+            lag.fetch_add(cut, Ordering::Relaxed);
+            Err(ToolDispatchError::Isolation(format!(
+                "shell delta append failed: {e}"
+            )))
+        }
+    }
+}
+
+/// Appends a single `TaskProgress` marking a discontinuity (a budget drop or
+/// the output cap) the instant it happens (fix round 1, security finding
+/// M2) — distinct from, and in addition to, the ordinary per-flush
+/// cumulative message `flush_stream` emits: that cumulative message only
+/// ever rides the NEXT successful flush, which may be arbitrarily later, or
+/// may never happen at all (e.g. a discontinuity that turns out to be the
+/// very last thing this stream ever does, once its final buffer is empty).
+/// Best-effort like every other streamed append here — a failure is not
+/// this call's problem to propagate.
+async fn emit_gap_progress(
+    writer: &EventWriter,
+    runner: &TaskRunner,
+    session_id: SessionId,
+    task_id: TaskId,
+    lag: &AtomicUsize,
+) {
+    let lag_bytes = lag.load(Ordering::Relaxed);
+    let event = runner.record_task_progress(
+        session_id,
+        0,
+        crate::agent_loop::now_ts(),
+        task_id,
+        Progress {
+            message: format!(
+                "shell output stream interrupted -- {lag_bytes} B not streamed so far"
+            ),
+            fraction: None,
+        },
+        1,
+    );
+    let _ = writer.append(event).await;
 }
 
 /// Drives both streams' [`StreamPumpState`] to completion: buffers each
@@ -1340,10 +1450,18 @@ async fn flush_stream(
 /// immediate no-op — both `stdout_rx`/`stderr_rx` are `None` too in that
 /// case (see [`run_isolated_shell_dispatch`]), so today's behavior
 /// (single buffered `ShellOutput`, no deltas) is unchanged.
+///
+/// No `biased;` on the `select!` below (fix round 1, finding 11 — an
+/// earlier version had one): with it, a stream that is continuously ready
+/// (a fast, chatty producer) would deterministically starve its sibling
+/// stream's branch and the ticker branch every single time, making the
+/// ticker's cadence load-dependent instead of the fixed interval its own
+/// name promises. Plain (unbiased) `select!` picks pseudo-randomly among
+/// ready branches, so no branch can starve forever.
 async fn run_shell_delta_pump(
     sink: Option<ShellDeltaSink>,
-    stdout_rx: Option<mpsc::UnboundedReceiver<Vec<u8>>>,
-    stderr_rx: Option<mpsc::UnboundedReceiver<Vec<u8>>>,
+    stdout_rx: Option<mpsc::UnboundedReceiver<ShellChunk>>,
+    stderr_rx: Option<mpsc::UnboundedReceiver<ShellChunk>>,
     in_flight: Arc<AtomicUsize>,
     lag: Arc<AtomicUsize>,
 ) {
@@ -1358,7 +1476,6 @@ async fn run_shell_delta_pump(
             return;
         }
         tokio::select! {
-            biased;
             chunk = recv_or_pending(&mut stdout.rx) => {
                 handle_stream_event(
                     &sink.writer, sink.runner, sink.session_id, sink.task_id, &sink.state_dir,
@@ -1387,19 +1504,39 @@ async fn run_shell_delta_pump(
     }
 }
 
-/// One stream's reaction to a channel event: a received chunk is buffered
-/// (and its reserved budget released) and, once large enough, offered to
-/// [`flush_stream`] as a non-final attempt; a closed channel (`None`) is
-/// this stream's real end — `rx` is set to `None` (this stream no longer
-/// participates in the pump's `select!`) and its final flush runs
-/// unconditionally.
+/// One stream's reaction to a channel event.
+///
+/// - `Some(ShellChunk::Data(bytes))`: a genuinely contiguous chunk — buffered
+///   (and its reserved budget released) and, once large enough, offered to
+///   [`flush_stream`] as a non-final attempt.
+/// - `Some(ShellChunk::Gap)` (fix round 1, security finding I1): a
+///   discontinuity — bytes existed on the real stream that will never reach
+///   this buffer (a budget drop, or the output cap). Whatever is currently
+///   buffered is offered to [`flush_stream`] as a non-final attempt (WITH
+///   holdback — this is deliberately never `final_flush = true`, so a
+///   partial match still touching the tail is never released), and
+///   whatever that flush does NOT safely release is then DISCARDED — added
+///   to `lag` and dropped, never carried forward — so the NEXT bytes to
+///   arrive (on the far side of the gap) start a genuinely fresh buffer
+///   rather than getting silently concatenated onto a held-back tail that
+///   was never actually adjacent to them in the real stream. A dedicated
+///   `TaskProgress` (`emit_gap_progress`) marks the moment, independent of
+///   whether anything was flushed or discarded.
+/// - `None`: this stream's real end — `rx` is set to `None` (this stream no
+///   longer participates in the pump's `select!`) and its final flush runs
+///   unconditionally. Safe to release everything unconditionally
+///   (`final_flush = true`) precisely because any discontinuity before this
+///   point already went through the `Gap` arm above, which never leaves
+///   `stream.buf` holding anything but a genuinely contiguous, gap-free
+///   tail.
 ///
 /// Flush failures are deliberately swallowed here (`let _ =`), matching
 /// `flush_stream`'s own callers in [`run_shell_delta_pump`]'s tick arm: a
 /// failed streamed-delta append must never fail the whole dispatched shell
 /// call (whose own `ShellOutput`/exit code the drains/`wait()` already
 /// captured independently) — streaming is a best-effort enrichment of the
-/// task log, not the tool call's result.
+/// task log, not the tool call's result. `flush_stream` itself already
+/// counts a failure's bytes as lag before returning `Err`.
 #[allow(clippy::too_many_arguments)]
 async fn handle_stream_event(
     writer: &EventWriter,
@@ -1409,12 +1546,12 @@ async fn handle_stream_event(
     state_dir: &Path,
     stream: &mut StreamPumpState,
     other: &mut StreamPumpState,
-    chunk: Option<Vec<u8>>,
+    chunk: Option<ShellChunk>,
     in_flight: &AtomicUsize,
     lag: &AtomicUsize,
 ) {
     match chunk {
-        Some(bytes) => {
+        Some(ShellChunk::Data(bytes)) => {
             in_flight.fetch_sub(bytes.len(), Ordering::Relaxed);
             stream.buf.extend_from_slice(&bytes);
             if stream.buf.len() >= SHELL_FLUSH_CHUNK_BYTES {
@@ -1432,6 +1569,31 @@ async fn handle_stream_event(
                 )
                 .await;
             }
+        }
+        Some(ShellChunk::Gap) => {
+            let other_flushed = other.flushed;
+            let _ = flush_stream(
+                writer,
+                runner,
+                session_id,
+                task_id,
+                state_dir,
+                stream,
+                other_flushed,
+                false,
+                lag,
+            )
+            .await;
+            if !stream.buf.is_empty() {
+                // Whatever `flush_stream` just declined to release (a
+                // held-back tail that might be a partial match) must never
+                // be concatenated with bytes that arrive after this gap —
+                // discard it, counted as lag, rather than releasing or
+                // retaining it (finding I1).
+                lag.fetch_add(stream.buf.len(), Ordering::Relaxed);
+                stream.buf.clear();
+            }
+            emit_gap_progress(writer, runner, session_id, task_id, lag).await;
         }
         None => {
             stream.rx = None;
@@ -1456,7 +1618,9 @@ async fn handle_stream_event(
 /// `None` (this stream already closed and ran its final flush) — lets
 /// [`run_shell_delta_pump`]'s `select!` keep polling a still-open sibling
 /// stream without a closed one's branch ever winning again.
-async fn recv_or_pending(rx: &mut Option<mpsc::UnboundedReceiver<Vec<u8>>>) -> Option<Vec<u8>> {
+async fn recv_or_pending(
+    rx: &mut Option<mpsc::UnboundedReceiver<ShellChunk>>,
+) -> Option<ShellChunk> {
     match rx {
         Some(rx) => rx.recv().await,
         None => std::future::pending().await,
@@ -1515,6 +1679,20 @@ async fn run_isolated_shell_dispatch(
         }
         None => (None, None, None, None),
     };
+    // Fix round 1, finding 10: the outer `tokio::select!` below races this
+    // whole `completion` future (both drains AND the delta pump) against
+    // `sleep(timeout)`/`wait_for_session_cancel`. If either of those wins,
+    // `completion` — and everything it's still `join!`ing, including
+    // `run_shell_delta_pump` — is dropped mid-flight: any bytes the pump
+    // was still buffering (not yet flushed) are lost from the delta stream,
+    // and no final flush ever runs for either stream. This is a silent,
+    // by-design truncation relative to `ShellOutput` itself, which the
+    // caller only sees indirectly (a `ShellCancelled`/`ShellSessionCancelled`
+    // error, never an explicit "the delta stream stopped early" signal).
+    // There is no happens-before relationship to preserve here beyond what
+    // `select!` already gives: the delta stream is best-effort and is
+    // allowed to be strictly less complete than the retained `ShellOutput`
+    // buffer on a cancelled/timed-out call.
     let completion = async {
         let (status, stdout, stderr, ()) = tokio::join!(
             child.wait(),
@@ -1735,16 +1913,21 @@ pub(crate) async fn wait_for_session_cancel(cancel: &mut Option<watch::Receiver<
 /// `deltas`, when `Some`, receives a non-blocking copy of every chunk still
 /// under `cap` (Phase 8 Task 19 lane B, Task 8) — see [`try_send_chunk`] for
 /// the budget/lag accounting, and [`DeltaChannel`]'s own doc comment for why
-/// this never awaits anything. The instant `cap` is reached (a chunk that
-/// only partially fits, or any later chunk once `buf.len() == cap`),
-/// `deltas` is dropped right here, exactly once — the brief's "deltas stop
-/// at the cap": [`run_shell_delta_pump`] sees this stream's channel close
-/// and runs its own ordinary final flush (with its accompanying
-/// `TaskProgress`) at that point, the same path a real EOF takes, rather
-/// than this function needing a second, special-cased "cap note." Reading
-/// (and discarding) past `cap` for the underlying pipe's sake — see this
-/// function's own truncation doc comment above — is unaffected: only the
-/// delta side stops early.
+/// this never awaits anything. The instant `cap` is reached — a chunk that
+/// only partially fits, or a chunk that no longer fits at all because an
+/// earlier one already exactly filled `cap` — a [`ShellChunk::Gap`] is sent
+/// and `deltas` is dropped right here, in that SAME iteration, exactly once
+/// (fix round 1, security finding I1; the off-by-one-iteration version this
+/// replaced is finding 6): [`run_shell_delta_pump`] sees the `Gap`, flushes
+/// and discards whatever is still buffered as a safety measure (see
+/// [`handle_stream_event`]'s `Gap` arm), and only then sees the channel
+/// close and runs its own ordinary final flush (with its accompanying
+/// `TaskProgress`) over the genuinely-empty, gap-free remainder — the
+/// brief's "deltas stop at the cap," now with an explicit signal rather than
+/// a bare, indistinguishable-from-EOF channel drop. Reading (and discarding)
+/// past `cap` for the underlying pipe's sake — see this function's own
+/// truncation doc comment above — is unaffected: only the delta side stops
+/// early.
 async fn drain_to_end<R: tokio::io::AsyncRead + Unpin>(
     io: Option<R>,
     cap: u64,
@@ -1766,29 +1949,23 @@ async fn drain_to_end<R: tokio::io::AsyncRead + Unpin>(
             Ok(n) => n,
             Err(_) => break,
         };
-        let under_cap = buf.len() < cap;
-        let take = if under_cap {
-            let remaining = cap - buf.len();
-            let take = remaining.min(n);
+        let remaining = cap.saturating_sub(buf.len());
+        let take = remaining.min(n);
+        if take > 0 {
             buf.extend_from_slice(&scratch[..take]);
-            if take < n {
-                truncated = true;
-            }
-            take
-        } else {
-            truncated = true;
-            0
-        };
-        if under_cap {
             if let Some(channel) = deltas.as_ref() {
                 try_send_chunk(channel, &scratch[..take]);
             }
-        } else {
-            // The cap was already reached by an earlier iteration (or this
-            // one produced `take == 0`) — stop forwarding to deltas from
-            // here on, exactly once (a repeat `= None` on an already-`None`
-            // value is a harmless no-op).
-            deltas = None;
+        }
+        if take < n {
+            // The cap was reached on exactly this iteration (`take > 0` but
+            // less than `n`) or had already been reached before it
+            // (`take == 0`) — mark truncation and signal the discontinuity
+            // in this SAME iteration, not a later one.
+            truncated = true;
+            if let Some(channel) = deltas.take() {
+                let _ = channel.tx.send(ShellChunk::Gap);
+            }
         }
     }
     if truncated {
@@ -3174,12 +3351,42 @@ mod tests {
             .count()
     }
 
-    /// (a) `seq 1 60000` on stdout, the same sequence on stderr (told apart
-    /// only by mime): every blob-backed `Delta` this run produces,
-    /// concatenated and read back via `read_verified_blob`, must equal
-    /// `ShellOutput.stdout`/`.stderr` exactly. Uses `EventWriter`'s default
-    /// (empty) redactor — `shell_delta_test_store` never calls
-    /// `set_redactor` — so no bytes are ever substituted.
+    /// How many of `task_id`'s `TaskProgress` events are `emit_gap_progress`'s
+    /// own standalone discontinuity marker (identified by its distinctive
+    /// message text) rather than an ordinary per-flush progress note paired
+    /// with a `Delta::Blob` (fix round 1, BLOCKING finding 1 / security
+    /// finding M2). A budget drop can fire zero, one, or many times over a
+    /// real run depending on how far the pump falls behind a fast producer,
+    /// so a test must count these by content, never assume a fixed number.
+    fn gap_progress_count(events: &[roundhouse_store::StoredEvent], task_id: TaskId) -> usize {
+        events
+            .iter()
+            .filter(|e| e.task_id == Some(task_id))
+            .filter(|e| match &e.payload {
+                roundhouse_core::EventPayload::TaskProgress { progress } => {
+                    progress.message.contains("shell output stream interrupted")
+                }
+                _ => false,
+            })
+            .count()
+    }
+
+    /// (a) `seq 1 60000` on stdout, a DISJOINT `seq 60001 90000` on stderr
+    /// (fix round 1, BLOCKING finding 3 — the previous version used the
+    /// SAME sequence on both streams "told apart only by mime," which a
+    /// mutation swapping `ShellStream::mime`'s two string literals would
+    /// not have caught, since both streams' expected bytes were identical
+    /// either way): every blob-backed `Delta` this run produces, concatenated
+    /// and read back via `read_verified_blob`, must equal
+    /// `ShellOutput.stdout`/`.stderr` exactly, and stdout/stderr's contents
+    /// must never cross-contaminate. The mime literals themselves are
+    /// spelled out directly here too, never routed back through
+    /// `ShellStream::mime()`, so a mutation to that method's string
+    /// constants is caught by THIS test rather than silently laundered
+    /// through the same function on both the production and assertion
+    /// sides. Uses `EventWriter`'s default (empty) redactor —
+    /// `shell_delta_test_store` never calls `set_redactor` — so no bytes
+    /// are ever substituted.
     #[tokio::test]
     async fn shell_stdout_and_stderr_deltas_round_trip_byte_for_byte_via_blobs() {
         let (writer, db_path, state_dir, _guard) = shell_delta_test_store().await;
@@ -3196,7 +3403,7 @@ mod tests {
             "sh",
             &[
                 "-c".to_string(),
-                "seq 1 60000; seq 1 60000 1>&2".to_string(),
+                "seq 1 60000; seq 60001 90000 1>&2".to_string(),
             ],
             cwd.path(),
             &env,
@@ -3213,21 +3420,41 @@ mod tests {
             .await
             .unwrap();
 
-        let stdout_bytes =
-            concatenated_stream_bytes(&events, task_id, &state_dir, ShellStream::Stdout.mime());
+        let stdout_bytes = concatenated_stream_bytes(
+            &events,
+            task_id,
+            &state_dir,
+            "application/vnd.roundhouse.stdout",
+        );
         assert_eq!(
             stdout_bytes, output.stdout,
             "concatenated stdout blob deltas must equal ShellOutput.stdout exactly"
         );
 
-        let stderr_bytes =
-            concatenated_stream_bytes(&events, task_id, &state_dir, ShellStream::Stderr.mime());
+        let stderr_bytes = concatenated_stream_bytes(
+            &events,
+            task_id,
+            &state_dir,
+            "application/vnd.roundhouse.stderr",
+        );
         assert_eq!(
             stderr_bytes, output.stderr,
             "concatenated stderr blob deltas must equal ShellOutput.stderr exactly"
         );
+        assert_ne!(
+            stdout_bytes, stderr_bytes,
+            "the two streams' disjoint content must never cross-contaminate"
+        );
         assert!(
-            stream_blob_refs(&events, task_id, ShellStream::Stdout.mime()).len() > 1,
+            stdout_bytes.starts_with(b"1\n2\n3\n"),
+            "stdout must hold the low sequence, unmistakably its own"
+        );
+        assert!(
+            stderr_bytes.starts_with(b"60001\n60002\n60003\n"),
+            "stderr must hold the high sequence, unmistakably its own"
+        );
+        assert!(
+            stream_blob_refs(&events, task_id, "application/vnd.roundhouse.stdout").len() > 1,
             "60000 lines of output must have required more than one 64 KiB flush"
         );
     }
@@ -3285,6 +3512,23 @@ mod tests {
             1,
             "exactly one flush happened (the final one), so exactly one TaskProgress must \
              have been recorded alongside it"
+        );
+        let progress_texts: Vec<String> = events
+            .iter()
+            .filter(|e| e.task_id == Some(task_id))
+            .filter_map(|e| match &e.payload {
+                roundhouse_core::EventPayload::TaskProgress { progress } => {
+                    Some(progress.message.clone())
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            progress_texts,
+            vec!["stdout 2 B, stderr 0 B".to_string()],
+            "fix round 1, MAJOR finding 5: the progress message's exact format must be \
+             asserted, not just its count -- both byte totals, and no \", K B not streamed\" \
+             suffix since nothing was ever dropped"
         );
     }
 
@@ -3369,17 +3613,27 @@ mod tests {
     }
 
     /// (d) R4: asserted at the drain/pump seam directly, not through
-    /// `execute_builtin`. Nobody ever reads from the delta channel's
-    /// receiver here (dropped immediately) — simulating a writer/pump that
-    /// never makes progress — yet `drain_to_end` must still read a
-    /// well-over-a-pipe-buffer child (2 MiB, `yes | head`) to its natural
-    /// EOF and return the complete output, because it never awaits
-    /// anything channel-related (`try_send_chunk` is fully synchronous).
+    /// `execute_builtin`. The delta channel's receiver is kept ALIVE here
+    /// but never polled — simulating a writer/pump that never makes
+    /// progress — deliberately NOT dropped (fix round 1, BLOCKING finding
+    /// 2): dropping the receiver makes `tx.send` fail and return
+    /// immediately regardless of whether sending is truly non-blocking, so
+    /// it cannot distinguish `try_send_chunk`'s real synchronous contract
+    /// from a broken version that `.await`s a bounded sender — that exact
+    /// mutation (an `async fn try_send_chunk` doing
+    /// `tx.send(chunk).await` on a bounded channel of capacity 1) passed
+    /// against the old drop-the-receiver version of this test. With the
+    /// receiver alive-but-idle and total output driven well past
+    /// `SHELL_DELTA_BUDGET_BYTES`, `drain_to_end` must still read a
+    /// well-over-a-pipe-buffer child (6 MiB, `yes | head`) to its natural
+    /// EOF and return the complete output, and the shared budget must have
+    /// been exceeded — proving the budget-drop/lag path (also MAJOR finding
+    /// 5) actually ran, not just that nothing panicked.
     #[tokio::test]
     async fn drain_to_end_completes_even_though_nothing_ever_drains_the_delta_channel() {
         let mut child = tokio::process::Command::new("sh")
             .arg("-c")
-            .arg("yes | head -c 2000000")
+            .arg("yes | head -c 6000000")
             .stdout(std::process::Stdio::piped())
             .kill_on_drop(true)
             .spawn()
@@ -3389,7 +3643,9 @@ mod tests {
         let in_flight = Arc::new(AtomicUsize::new(0));
         let lag = Arc::new(AtomicUsize::new(0));
         let (tx, rx) = mpsc::unbounded_channel();
-        drop(rx); // nobody ever drains -- the writer/pump stub that "never completes"
+        // Kept alive but never polled -- see this test's own doc comment
+        // for why dropping it outright would make the test vacuous.
+        let _rx = rx;
         let channel = DeltaChannel {
             tx,
             in_flight: Arc::clone(&in_flight),
@@ -3410,8 +3666,14 @@ mod tests {
         assert!(status.success());
         assert_eq!(
             result.len(),
-            2_000_000,
+            6_000_000,
             "ShellOutput's own buffer must be complete regardless of delta-channel backpressure"
+        );
+        assert!(
+            lag.load(Ordering::Relaxed) > 0,
+            "once in-flight bytes exceed the shared SHELL_DELTA_BUDGET_BYTES budget with \
+             nothing ever draining them, the excess must be counted as lag rather than \
+             silently blocking or vanishing"
         );
     }
 
@@ -3485,9 +3747,261 @@ mod tests {
         );
         assert_eq!(
             task_progress_count(&events, task_id),
-            stdout_refs.len(),
-            "each flush (including the cap-triggered closing one) pairs exactly one Delta \
-             with exactly one TaskProgress"
+            stdout_refs.len() + gap_progress_count(&events, task_id),
+            "every ordinary flush pairs exactly one Delta with exactly one TaskProgress, and \
+             the only progress events NOT so paired are emit_gap_progress's own standalone \
+             discontinuity markers -- no progress event may exist unaccounted for"
+        );
+        assert!(
+            gap_progress_count(&events, task_id) > 0,
+            "the cap being reached must have fired at least one discontinuity marker (fix \
+             round 1, security finding M2)"
+        );
+    }
+
+    /// (e-2) Drain-seam-level, fix round 1 BLOCKING finding 1: the previous
+    /// version of this test only bounded delta bytes loosely from ABOVE
+    /// (`<= cap + one flush chunk`), which a completely different bug --
+    /// forwarding a full extra 64 KiB read past the cap, or never stopping
+    /// at all -- would also have passed. Here the boundary is exact and
+    /// deterministic: `cap` is small, the source is an in-memory
+    /// `tokio::io::duplex` (not a real, timing-sensitive child process), and
+    /// its buffer is deliberately smaller than the total bytes written so
+    /// the cap-crossing chunk is guaranteed to span more than one physical
+    /// read -- exactly the multi-iteration scenario the pre-fix-round-1 code
+    /// (finding 6) handled one iteration too late.
+    #[tokio::test]
+    async fn drain_to_end_forwards_exactly_up_to_the_cap_then_stops() {
+        use tokio::io::AsyncWriteExt;
+
+        let (mut tx_half, rx_half) = tokio::io::duplex(4);
+        let cap: u64 = 10;
+        let in_flight = Arc::new(AtomicUsize::new(0));
+        let lag = Arc::new(AtomicUsize::new(0));
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let channel = DeltaChannel {
+            tx,
+            in_flight: Arc::clone(&in_flight),
+            lag: Arc::clone(&lag),
+        };
+
+        let write_task = tokio::spawn(async move {
+            tx_half.write_all(b"ABCDEF").await.unwrap();
+            tx_half.write_all(b"GHIJKLMNO").await.unwrap();
+            tx_half.shutdown().await.unwrap();
+        });
+
+        let result = drain_to_end(Some(rx_half), cap, Some(channel)).await;
+        write_task.await.expect("the writer task must not panic");
+
+        let mut expected = b"ABCDEFGHIJ".to_vec();
+        expected.extend_from_slice(format!("\n[output truncated at {cap} bytes]").as_bytes());
+        assert_eq!(
+            result, expected,
+            "ShellOutput's own retained buffer must stop exactly at the cap (plus the \
+             existing truncation marker)"
+        );
+
+        let mut forwarded = Vec::new();
+        let mut gap_count = 0;
+        while let Ok(chunk) = rx.try_recv() {
+            match chunk {
+                ShellChunk::Data(bytes) => forwarded.extend_from_slice(&bytes),
+                ShellChunk::Gap => gap_count += 1,
+            }
+        }
+        assert_eq!(
+            forwarded, b"ABCDEFGHIJ",
+            "deltas must be forwarded exactly up to the cap -- neither a partial-chunk's worth \
+             less nor a full extra read past it"
+        );
+        assert_eq!(
+            gap_count, 1,
+            "crossing the cap must send exactly one Gap marker, in the same iteration it \
+             happens, never zero (silently indistinguishable from a clean EOF) nor more than \
+             one"
+        );
+    }
+
+    /// (MAJOR 4a) fix round 1: the original test suite never once registered
+    /// a real secret, so no test could have caught a bug in M4's
+    /// split-then-redact race or in the holdback arithmetic itself. Exercised
+    /// directly against `flush_stream` with a live, non-empty `Redactor` and
+    /// a manually constructed `StreamPumpState`: a secret straddling an
+    /// ordinary (non-final) flush boundary must never let any unredacted
+    /// prefix of it survive in a stored blob, and once both halves are
+    /// reassembled and flushed, the whole secret must come out fully
+    /// redacted.
+    #[tokio::test]
+    async fn a_secret_straddling_a_flush_boundary_is_never_exposed_and_is_fully_redacted() {
+        let (writer, db_path, state_dir, _guard) = shell_delta_test_store().await;
+        writer.set_redactor(roundhouse_store::redact::Redactor::build(&[
+            "SECRET123".to_string()
+        ]));
+        let runner = crate::session_actor::test_runner();
+        let session_id = SessionId::new();
+        let task_id = TaskId::new();
+        let lag = AtomicUsize::new(0);
+
+        let mut stream = StreamPumpState::new(ShellStream::Stdout, None);
+        // The secret's first 7 of its 9 bytes land in this non-final flush;
+        // the live redactor's own holdback (`max_pattern_len() - 1` = 8
+        // bytes) must keep them buffered rather than releasing a naked
+        // "SECRET1" prefix.
+        stream.buf.extend_from_slice(b"before-SECRET1");
+        flush_stream(
+            &writer,
+            runner,
+            session_id,
+            task_id,
+            &state_dir,
+            &mut stream,
+            0,
+            false,
+            &lag,
+        )
+        .await
+        .unwrap();
+
+        let reopened = roundhouse_store::open(&db_path).await.unwrap();
+        let events = roundhouse_store::session_events(&reopened, session_id)
+            .await
+            .unwrap();
+        let so_far = concatenated_stream_bytes(
+            &events,
+            task_id,
+            &state_dir,
+            "application/vnd.roundhouse.stdout",
+        );
+        assert!(
+            !so_far.windows(7).any(|w| w == b"SECRET1"),
+            "the live redactor's holdback must never release a naked, unredacted prefix of a \
+             straddling secret: got {:?}",
+            String::from_utf8_lossy(&so_far)
+        );
+
+        // The rest of the secret, plus trailing bytes, arrives -- then the
+        // stream's real close runs the final, unconditional-release flush.
+        stream.buf.extend_from_slice(b"23-after");
+        flush_stream(
+            &writer,
+            runner,
+            session_id,
+            task_id,
+            &state_dir,
+            &mut stream,
+            0,
+            true,
+            &lag,
+        )
+        .await
+        .unwrap();
+
+        let reopened = roundhouse_store::open(&db_path).await.unwrap();
+        let events = roundhouse_store::session_events(&reopened, session_id)
+            .await
+            .unwrap();
+        let full = concatenated_stream_bytes(
+            &events,
+            task_id,
+            &state_dir,
+            "application/vnd.roundhouse.stdout",
+        );
+        assert_eq!(
+            full,
+            b"before-[REDACTED]-after".to_vec(),
+            "once both halves are reassembled and flushed, the secret must be fully redacted"
+        );
+        assert!(
+            !full.windows(9).any(|w| w == b"SECRET123"),
+            "the raw secret must never appear in any stored blob"
+        );
+    }
+
+    /// (MAJOR 4b) The mirror image of the above, at the discontinuity path
+    /// (fix round 1, security finding I1): a secret straddling a gap/cap
+    /// discontinuity must never have any proper prefix of it survive
+    /// unredacted, NOR reconstitute across the gap -- exercised directly
+    /// against `handle_stream_event`'s `Gap` arm.
+    #[tokio::test]
+    async fn a_secret_straddling_a_discontinuity_never_leaks_a_partial_prefix() {
+        let (writer, db_path, state_dir, _guard) = shell_delta_test_store().await;
+        writer.set_redactor(roundhouse_store::redact::Redactor::build(&[
+            "SECRET123".to_string()
+        ]));
+        let runner = crate::session_actor::test_runner();
+        let session_id = SessionId::new();
+        let task_id = TaskId::new();
+        let in_flight = AtomicUsize::new(0);
+        let lag = AtomicUsize::new(0);
+
+        let mut stream = StreamPumpState::new(ShellStream::Stdout, None);
+        let mut other = StreamPumpState::new(ShellStream::Stderr, None);
+        // The secret is only half-received when a discontinuity (a budget
+        // drop or the output cap) arrives.
+        stream.buf.extend_from_slice(b"before-SECRET1");
+        handle_stream_event(
+            &writer,
+            runner,
+            session_id,
+            task_id,
+            &state_dir,
+            &mut stream,
+            &mut other,
+            Some(ShellChunk::Gap),
+            &in_flight,
+            &lag,
+        )
+        .await;
+
+        assert!(
+            stream.buf.is_empty(),
+            "the Gap arm must never carry a held-back buffer across the discontinuity -- \
+             bytes on the far side of a gap were never actually adjacent to it in the real \
+             stream"
+        );
+        assert!(
+            lag.load(Ordering::Relaxed) > 0,
+            "the discarded held-back tail must be counted as lag"
+        );
+
+        // Bytes that arrive AFTER the gap must never combine with the
+        // discarded pre-gap tail to reconstitute the secret.
+        stream.buf.extend_from_slice(b"23-after");
+        handle_stream_event(
+            &writer,
+            runner,
+            session_id,
+            task_id,
+            &state_dir,
+            &mut stream,
+            &mut other,
+            None,
+            &in_flight,
+            &lag,
+        )
+        .await;
+
+        let reopened = roundhouse_store::open(&db_path).await.unwrap();
+        let events = roundhouse_store::session_events(&reopened, session_id)
+            .await
+            .unwrap();
+        let full = concatenated_stream_bytes(
+            &events,
+            task_id,
+            &state_dir,
+            "application/vnd.roundhouse.stdout",
+        );
+        assert_eq!(
+            full,
+            b"before23-after".to_vec(),
+            "the pre-gap tail must have been discarded entirely (never stored), and only the \
+             genuinely gap-free segments -- \"before\" and \"23-after\" -- must ever reach a \
+             blob"
+        );
+        assert!(
+            !full.windows(9).any(|w| w == b"SECRET123"),
+            "the secret must never reconstitute across the discontinuity"
         );
     }
 }
