@@ -59,8 +59,15 @@
 //! [`DeltaCoalescer::carve_final_chunk`] no longer jumps straight to asking
 //! about the whole remaining buffer. It grows the ask geometrically
 //! (doubling, capped at the buffer's length) until the splitter answers
-//! non-zero, and uses that first non-zero answer -- the narrowest cut that
-//! clears the match, not the widest one available. Only when the ask at the
+//! non-zero, then bisects the gap between the last refused ask and that
+//! first accepting one for the *narrowest* ask the splitter still accepts,
+//! and takes that ask's answer. Growth alone would stop wherever the
+//! doubling happened to land, overshooting a match's own end by up to 2x;
+//! the bisection is what makes this the narrowest clearing cut rather than
+//! merely a narrower one. For a splitter whose refusals are monotone in
+//! `max` -- as `Redactor::safe_split_len`'s are, since it answers `0`
+//! exactly when a match starting at offset `0` extends past `max` -- that
+//! narrowest accepted ask is the match's own end. Only when the ask at the
 //! buffer's own length is itself still `0` (a match spanning the entire
 //! remaining buffer) does this fall back to releasing everything as one
 //! delta.
@@ -155,14 +162,20 @@ const ENVELOPE_OVERHEAD_UPPER_BOUND: usize = 64;
 ///   reports a match straddling `max` by returning `m.start()`, which is
 ///   exactly `0` whenever a match begins at offset `0` and extends past
 ///   `max`). `0` here means "no safe cut at or below `max`".
-///   `DeltaCoalescer::carve_final_chunk` handles it by re-asking with
-///   `max = bytes.len()` and using whatever comes back as-is -- even if the
-///   resulting delta then exceeds `BLOB_INLINE_THRESHOLD`, which can
-///   legitimately happen (e.g. a registered secret value, such as a PEM key
-///   or a PKCS#12 blob, whose own serialized form alone exceeds ~4 KiB --
-///   `Redactor::build` filters only empty patterns, so there is no length
-///   floor). Content integrity beats the size limit here, the same
-///   trade-off R3 already makes for an oversized thinking signature.
+///   `DeltaCoalescer::carve_final_chunk` recovers by searching *upward* for
+///   the narrowest ask this closure still accepts, and takes that ask's own
+///   answer (controller ruling R13); see that method's doc comment for the
+///   search and its guarantees -- that is the authoritative account, and
+///   this bullet should not be read as a second, competing one. An
+///   implementation must therefore expect to be asked about several
+///   widening candidates after it answers `0`, and must answer each on its
+///   own merits. The delta that recovery finally produces may still exceed
+///   `BLOB_INLINE_THRESHOLD`, which can legitimately happen (e.g. a
+///   registered secret value, such as a PEM key or a PKCS#12 blob, whose
+///   own serialized form alone exceeds ~4 KiB -- `Redactor::build` filters
+///   only empty patterns, so there is no length floor). Content integrity
+///   beats the size limit here, the same trade-off R3 already makes for an
+///   oversized thinking signature.
 ///
 /// `roundhouse_store::EventWriter` supplies the production implementation
 /// (Task 7): a single additive method computing both modes from one
@@ -490,10 +503,22 @@ impl DeltaCoalescer {
     /// -- typically a reported match starting before `max` and extending
     /// past it. When that happens, this grows the ask geometrically
     /// (doubling, capped at `bytes.len()`) until the splitter answers
-    /// non-zero, and uses that first non-zero answer rather than jumping
-    /// straight to the widest possible ask (controller ruling R13, fix
-    /// round 3) -- so a narrow match doesn't drag the rest of an otherwise
-    /// ordinary buffer into one oversized delta. Only when the ask at
+    /// non-zero, rather than jumping straight to the widest possible ask
+    /// (controller ruling R13, fix round 3) -- so a narrow match doesn't
+    /// drag the rest of an otherwise ordinary buffer into one oversized
+    /// delta -- and then bisects `(last refused ask, first accepting ask]`
+    /// for the narrowest ask the splitter still accepts, taking that ask's
+    /// own answer (fix round 4). Without the bisection the cut would land
+    /// wherever the doubling happened to stop, which overshoots a match's
+    /// end by up to 2x. The bisection assumes nothing: every probe goes
+    /// through the splitter and only an answer the splitter itself gave is
+    /// ever used (R1/R11), so the cut is safe whatever the splitter does.
+    /// It is *narrowest* only for a splitter whose refusals are monotone in
+    /// `max`, which `Redactor::safe_split_len` is (it answers `0` exactly
+    /// when a match starting at offset `0` extends past `max`), and for
+    /// which the narrowest accepted ask is the match's own end; a
+    /// non-monotone splitter still gets a safe cut, just not necessarily
+    /// the narrowest one. Only when the ask at
     /// `bytes.len()` itself is still `0` (a match spanning the whole
     /// remaining buffer) does this release everything as one delta, even if
     /// the resulting chunk then exceeds `BLOB_INLINE_THRESHOLD` -- content
@@ -507,7 +532,9 @@ impl DeltaCoalescer {
     /// between iterations there -- without that clamp a non-conforming
     /// splitter can wedge this in an infinite loop. Between the B1 clamp,
     /// the R13 geometric growth (itself bounded above by `bytes.len()`, so
-    /// it also terminates in `O(log n)` steps), and the B2/R12 whole-buffer
+    /// it also terminates in `O(log n)` steps), the bisection that follows
+    /// it (each probe strictly shrinks the interval it is searching, so it
+    /// too terminates in `O(log n)` steps), and the B2/R12 whole-buffer
     /// floor, this always terminates and always returns at least one byte
     /// for non-empty `text`, regardless of what the injected splitter does.
     fn carve_final_chunk(&self, text: &str, make: &impl Fn(String) -> Delta) -> usize {
@@ -524,24 +551,58 @@ impl DeltaCoalescer {
                 // match itself is far narrower than what's left to
                 // release. Instead, grow the ask geometrically (doubling,
                 // capped at `bytes.len()`) until the splitter answers
-                // non-zero, and use that first non-zero answer -- the
-                // narrowest cut that clears the match, not the widest one
-                // available. Only when the ask at `bytes.len()` itself is
-                // still `0` (a match spanning the whole remaining buffer)
-                // does this fall back to releasing everything as one
-                // delta; per R14, that delta still stays inline -- it is
-                // never routed to the blob store, the same exemption R3
-                // and R12 already make.
+                // non-zero, then (fix round 4) bisect the gap between the
+                // last refused ask and that first accepting one for the
+                // narrowest ask the splitter still accepts, and use its
+                // answer. Growth alone stops wherever the doubling happens
+                // to land, which overshoots a match's own end by up to 2x;
+                // the bisection is what makes this the narrowest clearing
+                // cut rather than merely a narrower one. Only when the ask
+                // at `bytes.len()` itself is still `0` (a match spanning
+                // the whole remaining buffer) does this fall back to
+                // releasing everything as one delta; per R14, that delta
+                // still stays inline -- it is never routed to the blob
+                // store, the same exemption R3 and R12 already make.
+                let mut refused = max;
                 let mut grow = max.saturating_mul(2).max(1).min(bytes.len());
-                let recovered = loop {
+                let accepted = loop {
                     let ask = (self.splitter)(bytes, grow, true);
                     if ask != 0 {
-                        break ask.min(bytes.len());
+                        break Some((grow, ask.min(bytes.len())));
                     }
                     if grow >= bytes.len() {
-                        break bytes.len();
+                        break None;
                     }
+                    refused = grow;
                     grow = grow.saturating_mul(2).min(bytes.len());
+                };
+                let recovered = match accepted {
+                    Some((mut accepted_ask, mut answer)) => {
+                        // Every probe goes through the splitter and only an
+                        // answer the splitter itself gave is ever used
+                        // (R1/R11), so the cut is safe whatever the splitter
+                        // does; the bisection only narrows *which* accepted
+                        // answer is taken. `refused` is strictly below
+                        // `accepted_ask` except in the degenerate
+                        // `max == bytes.len()` case, where the interval is
+                        // empty and the body never runs (so the subtraction
+                        // cannot underflow either), and each iteration
+                        // strictly shrinks `accepted_ask - lo`, so this
+                        // terminates in `O(log bytes.len())` probes.
+                        let mut lo = refused;
+                        while accepted_ask - lo > 1 {
+                            let mid = lo + (accepted_ask - lo) / 2;
+                            let ask = (self.splitter)(bytes, mid, true);
+                            if ask != 0 {
+                                accepted_ask = mid;
+                                answer = ask.min(bytes.len());
+                            } else {
+                                lo = mid;
+                            }
+                        }
+                        answer
+                    }
+                    None => bytes.len(),
                 };
                 let k = floor_char_boundary(text, recovered);
                 return if k == 0 { first_char_len(text) } else { k };
@@ -718,9 +779,21 @@ mod tests {
     fn max_json_escape_inflation_covers_every_single_byte_character() {
         // Fix round 3: the 6x escape-inflation constant itself had no
         // direct coverage -- only the fixed envelope overhead did, above.
-        // Pin it directly: no single byte's JSON-escaped form, plus the
-        // fixed envelope, can exceed
-        // `MAX_JSON_ESCAPE_INFLATION + ENVELOPE_OVERHEAD_UPPER_BOUND`.
+        // Pin it directly: one byte of text can add at most
+        // `MAX_JSON_ESCAPE_INFLATION` bytes to a `Delta`'s serialization.
+        //
+        // Fix round 4: measured against the *empty-text* baseline rather
+        // than against `MAX_JSON_ESCAPE_INFLATION +
+        // ENVELOPE_OVERHEAD_UPPER_BOUND`. That sum is 70, while the real
+        // worst case is 26 (a 20-byte empty `Delta::Text` envelope plus a
+        // six-byte `\u00XX` escape), so the old form left 44 bytes of slack
+        // -- it would still have passed if a byte's escaped form grew to 50
+        // bytes, which is precisely the inflation that
+        // `should_attempt_flush`'s cheap pre-check depends on being at most
+        // `MAX_JSON_ESCAPE_INFLATION`.
+        let baseline = serialized_len(&Delta::Text {
+            text: String::new(),
+        });
         for byte in 0u8..=255 {
             let bytes = [byte];
             let Ok(s) = std::str::from_utf8(&bytes) else {
@@ -729,13 +802,12 @@ mod tests {
             let size = serialized_len(&Delta::Text {
                 text: s.to_string(),
             });
+            let inflation = size - baseline;
             assert!(
-                size <= MAX_JSON_ESCAPE_INFLATION + ENVELOPE_OVERHEAD_UPPER_BOUND,
-                "byte {byte:#04x} serialized to {size} bytes, exceeding \
-                 MAX_JSON_ESCAPE_INFLATION + ENVELOPE_OVERHEAD_UPPER_BOUND \
-                 ({} + {})",
-                MAX_JSON_ESCAPE_INFLATION,
-                ENVELOPE_OVERHEAD_UPPER_BOUND
+                inflation <= MAX_JSON_ESCAPE_INFLATION,
+                "byte {byte:#04x} added {inflation} bytes over the \
+                 {baseline}-byte empty-text envelope, exceeding \
+                 MAX_JSON_ESCAPE_INFLATION ({MAX_JSON_ESCAPE_INFLATION})"
             );
         }
     }
@@ -1354,23 +1426,21 @@ mod tests {
         let released = sink.finish();
 
         assert_eq!(
-            released.len(),
-            1,
-            "the only way to keep the whole match in one delta is to emit \
-             everything as a single (oversized) delta: {released:?}"
-        );
-        assert_eq!(
             concat_text(&released),
             text,
             "no bytes may be lost or reordered"
         );
-        assert!(
-            text_of(&released[0]).contains(&"S".repeat(SECRET_LEN)),
-            "the whole match must land intact, not split across chunks"
+        assert_eq!(
+            text_of(&released[0]),
+            "S".repeat(SECRET_LEN),
+            "the whole match must land intact in one delta, not split across \
+             chunks -- and, since fix round 4 bisects R13's recovery, that \
+             delta is exactly the match and nothing more: {released:?}"
         );
         assert!(
             serialized_len(&released[0]) >= BLOB_INLINE_THRESHOLD,
-            "test premise: the emitted delta is expected to be oversized here"
+            "test premise: keeping a match this wide whole means accepting \
+             an oversized delta -- that is the exemption R12 grants"
         );
     }
 
@@ -1382,8 +1452,16 @@ mod tests {
         // still refuses at `bytes.len()`, that meant releasing the *entire*
         // remaining buffer as one oversized delta, even when the actual
         // match is far narrower than what's left. R13 grows the ask
-        // geometrically instead, converging on the match's own end rather
-        // than the end of the whole buffer.
+        // geometrically instead, then binary-searches the gap between the
+        // last refused ask and the first accepting one, converging on the
+        // match's own end rather than the end of the whole buffer.
+        //
+        // Fix round 4: geometric growth alone stops at the *first* accepting
+        // ask, which overshoots the match's end by up to 2x (measured here
+        // before the binary search: a first chunk of 7,366 bytes for a
+        // 5,000-byte match). The binary search below the first accepting ask
+        // is what makes the "narrowest cut that clears the match" claim in
+        // `carve_final_chunk`'s doc comment actually true.
         const SECRET_LEN: usize = 5000;
         const TRAILING_LEN: usize = 20000;
         let splitter: SplitFn = Box::new(move |bytes, max, final_flush| {
@@ -1425,6 +1503,14 @@ mod tests {
         assert!(
             first.contains(&"S".repeat(SECRET_LEN)),
             "the whole match must still land intact in the first chunk"
+        );
+        assert_eq!(
+            first.len(),
+            SECRET_LEN,
+            "R13's recovery must cut at the narrowest ask this splitter \
+             accepts -- the match's own end -- not at the first ask the \
+             geometric growth happens to land on, which overshoots it by up \
+             to 2x"
         );
         assert_eq!(
             concat_text(&released),
