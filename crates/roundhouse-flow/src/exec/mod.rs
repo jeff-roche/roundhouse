@@ -922,11 +922,9 @@ impl<'a> Executor<'a> {
         for idx in order {
             let step = &step_defs[idx];
             self.ctx.set_with_secret_paths(
-                "steps",
+                STEPS_ROOT_NAME,
                 Value::Object(steps_context.clone()),
-                secret_derived_steps
-                    .iter()
-                    .map(|id| vec![id.clone(), "output".to_string()]),
+                secret_derived_steps.iter().map(secret_output_path),
             );
 
             // `when:` handling is a shared helper (fix round 2, item 1) —
@@ -1518,6 +1516,32 @@ fn step_body_kind_name(body: &StepBody) -> &'static str {
         StepBody::Emit { .. } => "emit",
         StepBody::Report { .. } => "report",
     }
+}
+
+/// The `${{ }}` root every step's recorded outcome is read through —
+/// `${{ steps.<id>.output }}`.
+///
+/// Named once because **three** bindings write it, and a typo in any of them
+/// would silently bind a root nothing reads: [`Executor::run_to_completion`]'s
+/// own per-step fold (the in-memory sequencer, below),
+/// `crate::exec::run_loop::Loop::bind_steps_context` (a real run's), and
+/// `crate::exec::run_loop::ItemStepsContext::bind` (one `map` item's own,
+/// Phase 8 Task 25.7 Task 10).
+pub(crate) const STEPS_ROOT_NAME: &str = "steps";
+
+/// The secret path [`ExprContext::set_with_secret_paths`] marks for one step's
+/// output — `["<id>", "output"]`, never the whole root, so
+/// `${{ steps.<id>.status }}` stays readable in the log.
+///
+/// Shared by the same three binding sites [`STEPS_ROOT_NAME`] lists, for a
+/// sharper reason than tidiness: this projection's *shape* is what decides
+/// which leaf is redacted, and a site that wrote `["<id>"]` or
+/// `["<id>", "value"]` instead would mark the wrong path — leaving a
+/// secret-derived output unmarked, which reaches the append-only log in
+/// cleartext (see `Loop::bind_steps_context`'s own doc comment for the
+/// measured shape of that hazard).
+pub(crate) fn secret_output_path(step_id: impl AsRef<str>) -> Vec<String> {
+    vec![step_id.as_ref().to_string(), "output".to_string()]
 }
 
 /// Builds the `steps.<id>` entry folded into [`ExprContext`]'s `steps` root

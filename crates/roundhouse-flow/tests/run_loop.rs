@@ -9073,6 +9073,124 @@ fn a_failed_inner_step_declaring_continue_on_error_lets_its_item_go_on() {
     );
 }
 
+/// A `map` whose item is `[review, notify]` and whose **last** inner step is
+/// the one declaring `continue_on_error: true` — the position the flag used to
+/// be silently ignored in, because nothing ran afterwards to move the item's
+/// running outcome off the failure.
+///
+/// `max_parallel: 1` so the wave sequence says, unambiguously, whether the
+/// fan-out went on to start the next item.
+fn map_with_a_continuing_final_failure(on_item_error: &str) -> String {
+    format!(
+        "steps:\n\
+         \x20 - id: fan\n\
+         \x20   map:\n\
+         \x20     over: \"${{{{ inputs.items }}}}\"\n\
+         \x20     as: item\n\
+         \x20     max_parallel: 1\n\
+         \x20     on_item_error: {on_item_error}\n\
+         \x20   steps:\n\
+         \x20     - id: review\n\
+         \x20       tool: shell\n\
+         \x20       with: {{ cmd: [echo, review] }}\n\
+         \x20     - id: notify\n\
+         \x20       tool: shell\n\
+         \x20       with: {{ cmd: [echo, notify] }}\n\
+         \x20       continue_on_error: true\n"
+    )
+}
+
+/// **`fail_fast` does not fire on a failure the step declared non-fatal, even
+/// when it is the item's last** — the position `continue_on_error:` is easiest
+/// to get wrong, because the item's outcome is whatever the fold left behind
+/// and nothing runs afterwards to correct it.
+///
+/// `run_phase`'s standard is positional-independent: a top-level step's
+/// `continue_on_error` failure never fails the phase, wherever it sits. §8.9
+/// says why — the flag *"distinguishes 'the command may fail, keep going' from
+/// 'a failure here is fatal'"* — and "fatal" cannot mean something different
+/// for the last step of an item than for the others.
+#[test]
+fn a_continuing_failure_as_an_items_last_step_does_not_stop_the_fan_out() {
+    let (conn, run_id, _sink, waves, result) = drive_waves(
+        &map_with_a_continuing_final_failure("fail_fast"),
+        serde_json::json!({ "items": map_items(2) }),
+        &[("notify", 0)],
+    );
+    let outcome = result.expect("the run drives");
+
+    assert_eq!(
+        waves,
+        vec![
+            vec![("review".to_string(), Some(0))],
+            vec![("notify".to_string(), Some(0))],
+            vec![("review".to_string(), Some(1))],
+            vec![("notify".to_string(), Some(1))],
+        ],
+        "item 1 must still be started: `fail_fast` stops the fan-out when an ITEM fails, and \
+         no item did — item 0's only failure was one its author declared non-fatal: {waves:?}"
+    );
+    let output = map_output(&outcome, "fan");
+    let entries = output["items"].as_array().expect("one entry per item");
+    assert_eq!(
+        entries[0],
+        serde_json::json!({ "status": "completed", "output": { "dispatched": 0 } }),
+        "the item keeps the outcome it had before the non-fatal failure — `review`'s — rather \
+         than reporting a failure that was declared not to matter: {entries:?}"
+    );
+    assert_eq!(
+        entries[1]["status"], "completed",
+        "and the sibling item ran to completion: {entries:?}"
+    );
+    let (state, error) = item_step_row(&conn, run_id, "notify", 0)
+        .expect("the failed inner step still gets its own durable row");
+    assert_eq!(
+        state,
+        StepRunState::Failed,
+        "what changes is what the *item* reports, never what is on the record: the step's own \
+         row still says it failed"
+    );
+    assert!(
+        error
+            .unwrap_or_default()
+            .contains("could not be dispatched"),
+        "with its real message"
+    );
+}
+
+/// The same position under `on_item_error: collect`: a failure the step
+/// declared non-fatal is not one of the failures `collect` gathers onto the
+/// `map`'s own output, because the item did not fail.
+///
+/// `collect` is the more visible half of the same bug — a fan-out that
+/// reported every item completed while listing errors beside them would be
+/// self-contradictory on its own output.
+#[test]
+fn a_continuing_failure_as_an_items_last_step_is_not_collected() {
+    let (_conn, _run_id, _sink, _waves, result) = drive_waves(
+        &map_with_a_continuing_final_failure("collect"),
+        serde_json::json!({ "items": map_items(2) }),
+        &[("notify", 0)],
+    );
+    let outcome = result.expect("the run drives");
+
+    let output = map_output(&outcome, "fan");
+    assert_eq!(
+        output["collected_errors"],
+        serde_json::json!([]),
+        "`collect` gathers finished *items'* failures, and no item failed: {output:?}"
+    );
+    let entries = output["items"].as_array().expect("one entry per item");
+    assert_eq!(
+        entries
+            .iter()
+            .map(|e| e["status"].as_str().unwrap_or("?"))
+            .collect::<Vec<_>>(),
+        vec!["completed", "completed"],
+        "{entries:?}"
+    );
+}
+
 /// The three-inner-step fixture the two sibling-reading tests below share:
 /// two `tool:` steps that really suspend, then an `emit:` that reads both of
 /// their outputs back through `${{ steps.* }}`, and a **top-level** step after
@@ -9081,6 +9199,13 @@ fn a_failed_inner_step_declaring_continue_on_error_lets_its_item_go_on() {
 /// `drive_waves` answers every dispatch with `{ "dispatched": <item index> }`,
 /// so every value read below names the item it came from — which is what makes
 /// "item 1 did not see item 0's answer" an assertion rather than a hope.
+///
+/// `read` also reads **itself** (`own`), which must be `null`: an inner step is
+/// recorded into the item's view *after* it is decided, so nothing can see its
+/// own not-yet-existing output. That is structural today, and the assertion is
+/// what makes it stay so — a refactor that bound the view after recording but
+/// before the step ran would turn this red instead of quietly letting a step
+/// read a stale or self-referential entry.
 fn map_reading_its_own_siblings() -> String {
     "steps:\n\
      \x20 - id: fan\n\
@@ -9099,6 +9224,7 @@ fn map_reading_its_own_siblings() -> String {
      \x20       emit:\n\
      \x20         from_build: \"${{ steps.build.output.dispatched }}\"\n\
      \x20         from_publish: \"${{ steps.publish.output.dispatched }}\"\n\
+     \x20         own: \"${{ steps.read.output }}\"\n\
      \x20 - id: after\n\
      \x20   emit: { saw: \"${{ steps.build.output }}\" }\n"
         .to_string()
@@ -9142,13 +9268,13 @@ fn an_items_later_inner_step_reads_a_sibling_decided_in_an_earlier_segment() {
     let entries = output["items"].as_array().expect("one entry per item");
     assert_eq!(
         entries[0]["output"],
-        serde_json::json!({ "from_build": "0", "from_publish": "0" }),
+        serde_json::json!({ "from_build": "0", "from_publish": "0", "own": "null" }),
         "item 0's `read` must see both siblings — `build` reconstructed from its durable row, \
-         `publish` from the answer this segment carries: {entries:?}"
+         `publish` from the answer this segment carries — and must not see itself: {entries:?}"
     );
     assert_eq!(
         entries[1]["output"],
-        serde_json::json!({ "from_build": "1", "from_publish": "1" }),
+        serde_json::json!({ "from_build": "1", "from_publish": "1", "own": "null" }),
         "and item 1 must see its OWN siblings, not the values item 0 left bound: {entries:?}"
     );
 }

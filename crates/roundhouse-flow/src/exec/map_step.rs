@@ -1004,22 +1004,35 @@ pub(crate) fn nested_report_refusal(inner: &StepDef) -> Option<ItemOutcome> {
 /// `tool: shell` with `continue_on_error: true`, so that a red test suite
 /// still lets the review be posted.
 ///
-/// What the flag changes is **only** whether the walk stops. The assignment
-/// above it is unconditional, so `last` still reports "the last inner step
-/// that ran failed" for as long as that is true — and is then legitimately
-/// overwritten by whatever the item's next inner step returns, exactly as a
-/// top-level phase that continues past a non-fatal failure still ends
-/// `Completed`. An item allowed to continue is therefore not a *failed item*,
-/// so [`ItemErrorPolicy`] neither collects its message nor lets it trip
-/// `fail_fast` — the same thing "non-fatal" means one level up.
+/// **A continuing failure leaves `last` alone — it does not write itself into
+/// the item's outcome at all** (Task 10, fix round 1). The first version of
+/// this arm assigned `last` on both branches, reasoning that the item should
+/// report "the last inner step that ran failed" until a later step overwrote
+/// it. That is right for every position but the one that matters: when the
+/// continuing step is the item's **last**, nothing comes after to overwrite it,
+/// so the item reported `Failed` — which [`ItemErrorPolicy`] then collected
+/// under `collect` and tripped `fail_fast` on, stopping the fan-out over a
+/// failure the author had declared non-fatal. `run_phase`'s standard is
+/// positional-independent — a top-level step's `continue_on_error` failure
+/// never fails the phase, wherever it sits — and §8.9's own wording is why:
+/// the flag *"distinguishes 'the command may fail, keep going' from 'a failure
+/// here is fatal'"*, and "fatal" cannot mean one thing for an item's last step
+/// and another for the rest. So the item keeps the outcome it had before the
+/// step ran (the previous step's, or the initial `Completed(Value::Null)` if
+/// the continuing step was its first), and an item allowed to continue is not
+/// a *failed item* at all: [`ItemErrorPolicy`] neither collects its message nor
+/// lets it trip `fail_fast`. Measured in `tests/run_loop.rs`:
+/// `a_continuing_failure_as_an_items_last_step_does_not_stop_the_fan_out` and
+/// `a_continuing_failure_as_an_items_last_step_is_not_collected`.
 ///
-/// Where the continued failure *is* kept is the step's own durable
-/// `workflow_step_run` row, which
-/// `crate::exec::run_loop::Loop::checkpoint_map_item_step` has already written
-/// by the time this is called. The in-memory fan-out
-/// ([`Executor::dispatch_map_step`]) has no such rows, so there a continued
-/// failure's message is kept nowhere at all — the cost of declaring a failure
-/// non-fatal in a loop with no durable record, recorded rather than repaired.
+/// **This changes what the item reports, never what is on the record.** The
+/// step's own durable `workflow_step_run` row still says `Failed`, with its
+/// real message: `crate::exec::run_loop::Loop::checkpoint_map_item_step` has
+/// written it before this is called, and nothing here can reach it. The
+/// in-memory fan-out ([`Executor::dispatch_map_step`]) has no such rows, so
+/// there a continued failure's message is kept nowhere at all — the cost of
+/// declaring a failure non-fatal in a loop with no durable record, recorded
+/// rather than repaired.
 ///
 /// **Fix round 3, item 1: both taint bits are folded, not just the output
 /// one.** [`ItemOutcome`] has no field for an inner step's
@@ -1039,8 +1052,13 @@ pub(crate) fn fold_inner_step_outcome(
     *any_item_secret_derived |= outcome.gate_condition_was_secret_derived;
     match outcome.status {
         StepStatus::Failed { message } => {
+            if continue_on_error {
+                // Deliberately without touching `last` — see this function's
+                // own doc comment, "A continuing failure leaves `last` alone".
+                return false;
+            }
             *last = ItemOutcome::Failed(message);
-            !continue_on_error
+            true
         }
         StepStatus::Skipped { reason } => {
             *last = ItemOutcome::Skipped { reason };
