@@ -222,6 +222,81 @@ async fn redaction_count_accumulates_on_the_tasks_row_for_task_delta_and_note_ev
     );
 }
 
+// ---------------------------------------------------------------------------------------
+// Phase 8 Task 19 lane B, Task 5: EventWriter byte-redaction and split-safety pass-throughs
+// ---------------------------------------------------------------------------------------
+
+/// `EventWriter::redact_outbound_bytes` must mirror `redact_outbound`, but over raw bytes
+/// (including non-UTF-8 input) — the same live, hot-swappable redactor, just a byte-typed
+/// entry point for callers scanning something that isn't guaranteed-valid text (e.g. a
+/// streamed shell chunk before it's wrapped in a `Delta`).
+#[tokio::test]
+async fn redact_outbound_bytes_mirrors_redact_outbound_over_raw_non_utf8_bytes() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = open(&dir.path().join("events.db")).await.unwrap();
+    let writer = spawn_writer(store).await;
+    writer.set_redactor(Redactor::build(&["sk-live-abc123".to_string()]));
+
+    let mut bytes = vec![0x80, 0xFF];
+    bytes.extend_from_slice(b"sk-live-abc123");
+
+    let (redacted, count) = writer.redact_outbound_bytes(&bytes);
+    assert_eq!(count, 1);
+    assert!(!redacted.windows(14).any(|w| w == b"sk-live-abc123"));
+}
+
+/// `EventWriter::redaction_holdback` reads the LIVE redactor, not one snapshotted at
+/// construction time — `set_redactor` must change the reported holdback for future calls.
+#[tokio::test]
+async fn redaction_holdback_tracks_the_live_redactors_longest_pattern() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = open(&dir.path().join("events.db")).await.unwrap();
+    let writer = spawn_writer(store).await;
+
+    assert_eq!(
+        writer.redaction_holdback(),
+        0,
+        "the default empty redactor has no patterns, so holdback must be 0"
+    );
+
+    writer.set_redactor(Redactor::build(&[
+        "short".to_string(),
+        "a-much-longer-secret-value".to_string(),
+    ]));
+    assert_eq!(
+        writer.redaction_holdback(),
+        "a-much-longer-secret-value".len() - 1,
+        "holdback must be the longest live pattern's byte length minus one"
+    );
+}
+
+/// `EventWriter::redaction_safe_split_len` is a pass-through to the live redactor's
+/// `Redactor::safe_split_len` — proven here by observing it move a split point off a
+/// secret it's told about via `set_redactor`, then react to `set_redactor` changing which
+/// value counts as a secret.
+#[tokio::test]
+async fn redaction_safe_split_len_pass_through_uses_the_live_redactor() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = open(&dir.path().join("events.db")).await.unwrap();
+    let writer = spawn_writer(store).await;
+
+    let bytes = b"prefix sk-live-abc123 suffix";
+    // Before any secret is registered, nothing straddles — the naive split stands.
+    assert_eq!(writer.redaction_safe_split_len(bytes, 10), 10);
+
+    writer.set_redactor(Redactor::build(&["sk-live-abc123".to_string()]));
+    let secret_start = bytes
+        .windows(14)
+        .position(|w| w == b"sk-live-abc123")
+        .unwrap();
+    let naive_split = secret_start + 5;
+    assert_eq!(
+        writer.redaction_safe_split_len(bytes, naive_split),
+        secret_start,
+        "once the live redactor knows the secret, the split must move to its start"
+    );
+}
+
 #[tokio::test]
 async fn outbound_payload_containing_a_live_secret_is_ask_by_default_and_deny_hardened() {
     let dir = tempfile::tempdir().unwrap();

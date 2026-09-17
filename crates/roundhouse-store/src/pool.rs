@@ -60,6 +60,16 @@ pub fn open_memory_connection() -> rusqlite::Connection {
 ///   tasks in a real session, not a data-consistency error — callers that need to treat
 ///   it as non-fatal (`cost::session_cost_rollup`) match on this variant specifically
 ///   rather than on `NotFound`.
+/// - `Blob`: a batch member's `Delta::Blob`/`TaskInput::Blob`/`TaskOutput::Blob` ref failed
+///   `blobs::record_blob_write` inside `writer::append_batch_with_blobs` (Phase 8 Task 19
+///   lane B, Task 5) — see that type's own variants (`MissingFile`, or a `Sqlite` error
+///   from the same `INSERT`/`UPDATE`, which stays nested inside `RecordBlobError::Sqlite`
+///   here rather than flattening into this enum's own `Sqlite` variant).
+///
+/// Not `#[non_exhaustive]` today, so this list is exhaustive as written — a new variant is
+/// a breaking change to whatever code matches on this type. Appended, not inserted:
+/// keeps a diff additive at the enum's tail, which matters when more than one lane's task
+/// adds a variant against the same base.
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
     #[error("io error: {0}")]
@@ -76,6 +86,8 @@ pub enum StoreError {
     NotFound(String),
     #[error("unattributable: {0}")]
     Unattributable(String),
+    #[error(transparent)]
+    Blob(#[from] crate::blobs::RecordBlobError),
 }
 
 /// A WAL-mode SQLite connection pool. The `pool` field is public (not `pub(crate)`) because

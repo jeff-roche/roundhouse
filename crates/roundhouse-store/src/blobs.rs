@@ -85,10 +85,10 @@ pub enum RecordBlobError {
 /// `blobs` row for `blob_ref`. **Must be called in the same transaction the
 /// caller uses to append the owning event** — never a separate one — per
 /// §4.5's "a blob can never be referenced by an event that isn't durably
-/// recorded, and vice versa." Phase 0 delivers this function; wiring the
-/// call site into the real event-append transaction is Phase 1's
-/// `roundhouse-store` work (the same deferral Task 10's Interfaces note
-/// already states for the event-append path itself).
+/// recorded, and vice versa." Phase 0 delivered this function; `roundhouse-flow`'s
+/// checkpoint commit (`production.rs`) and `writer::append_batch_with_blobs` (Phase 8
+/// Task 19 lane B, Task 5 — the streamed-delta event-append path) are today's two real
+/// call sites wiring it into an actual event/row-append transaction.
 ///
 /// Rejects (`RecordBlobError::MissingFile`) a `blob_ref` whose file isn't
 /// actually present under `state_dir` — e.g. one that arrived via

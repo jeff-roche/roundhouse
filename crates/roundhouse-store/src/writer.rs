@@ -1,8 +1,9 @@
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use arc_swap::ArcSwap;
-use roundhouse_core::{Event, EventPayload};
+use roundhouse_core::{Delta, Event, EventPayload, TaskInput, TaskOutput};
 use tokio::sync::{mpsc, oneshot};
 
 use crate::redact::Redactor;
@@ -18,6 +19,15 @@ pub(crate) enum WriteCmd {
     },
     AppendBatch {
         events: Vec<Event>,
+        reply: oneshot::Sender<Result<Vec<u64>, StoreError>>,
+    },
+    /// Phase 8 Task 19 lane B, Task 5: same batching as `AppendBatch`, plus indexing every
+    /// `Delta::Blob`/`TaskInput::Blob`/`TaskOutput::Blob` ref the batch's events carry, in
+    /// the SAME transaction as the events insert. See `append_batch_with_blobs` (the free
+    /// function).
+    AppendBatchWithBlobs {
+        events: Vec<Event>,
+        state_dir: PathBuf,
         reply: oneshot::Sender<Result<Vec<u64>, StoreError>>,
     },
 }
@@ -163,6 +173,15 @@ pub async fn spawn_writer(store: StorePool) -> EventWriter {
                 WriteCmd::AppendBatch { events, reply } => {
                     let redactor = redactor_for_task.load_full();
                     let result = append_batch(&store, events, &redactor).await;
+                    let _ = reply.send(result);
+                }
+                WriteCmd::AppendBatchWithBlobs {
+                    events,
+                    state_dir,
+                    reply,
+                } => {
+                    let redactor = redactor_for_task.load_full();
+                    let result = append_batch_with_blobs(&store, events, state_dir, redactor).await;
                     let _ = reply.send(result);
                 }
             }
@@ -480,6 +499,86 @@ async fn append_batch(
     Ok(seqs)
 }
 
+/// The single `BlobRef` a payload carries, if any — `Delta::Blob` (streamed shell output
+/// routed to a blob, per Task 19b's convention), `TaskInput::Blob`, or `TaskOutput::Blob`
+/// are the only three shapes in `EventPayload` that carry one (see each type's own
+/// definition in `roundhouse-core`), and none of them can carry more than one at a time.
+fn blob_ref_in_payload(payload: &EventPayload) -> Option<&roundhouse_core::BlobRef> {
+    match payload {
+        EventPayload::TaskDelta {
+            delta: Delta::Blob(blob_ref),
+        } => Some(blob_ref),
+        EventPayload::TaskCreated {
+            input: TaskInput::Blob(blob_ref),
+            ..
+        } => Some(blob_ref),
+        EventPayload::TaskCompleted {
+            output: TaskOutput::Blob(blob_ref),
+            ..
+        } => Some(blob_ref),
+        _ => None,
+    }
+}
+
+/// Batched append that also indexes every blob reference the batch's events carry, in the
+/// SAME transaction as the events insert — extending §4.5's "a blob can never be
+/// referenced by an event that isn't durably recorded, and vice versa" to the batch path
+/// (Phase 8 Task 19 lane B, Task 5). This is what `record_blob_write`'s own doc comment
+/// names as the deferred call site: Phase 0 delivered the function, this wires it into a
+/// real event-append transaction.
+///
+/// Reuses `append_event_in_transaction` per event — same redaction, seq-assignment, and
+/// `tasks`-view upkeep as a single `append` — then, for whichever of
+/// `Delta::Blob`/`TaskInput::Blob`/`TaskOutput::Blob` that event's payload carries (if
+/// any; see `blob_ref_in_payload`), calls `blobs::record_blob_write` in the SAME
+/// transaction. Blob refs are never mutated by redaction (a `BlobRef` is a content hash,
+/// not inline text — see `Redactor::redact_event_payload`'s handling of the same three
+/// shapes), so scanning the ORIGINAL, pre-redaction `event.payload` for a ref to index is
+/// equivalent to scanning the redacted one and cheaper.
+///
+/// A `RecordBlobError` (including `MissingFile` — a `BlobRef` with no backing file under
+/// `state_dir`) propagates before `tx.commit()` runs, so the whole batch rolls back:
+/// neither the events nor any ref-count bump from this call commits. Unlike `append_batch`,
+/// this does not retry on `SQLITE_BUSY` — matching every other caller of
+/// `append_event_in_transaction` today (`scheduler_driver.rs`, `workflow_host.rs`,
+/// `sub_agent_host.rs`), none of which wrap it in a busy-retry loop either.
+async fn append_batch_with_blobs(
+    store: &StorePool,
+    events: Vec<Event>,
+    state_dir: PathBuf,
+    redactor: Arc<Redactor>,
+) -> Result<Vec<u64>, StoreError> {
+    if events.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let conn = store.pool.get().await?;
+
+    let write_result = conn
+        .interact(move |c| -> Result<Vec<u64>, StoreError> {
+            let tx = begin_immediate(c).map_err(StoreError::Sqlite)?;
+            let mut seqs = Vec::with_capacity(events.len());
+            for event in &events {
+                let seq = append_event_in_transaction(&tx, event, &redactor)?;
+                if let Some(blob_ref) = blob_ref_in_payload(&event.payload) {
+                    crate::blobs::record_blob_write(
+                        &tx,
+                        &state_dir,
+                        blob_ref,
+                        event.ts.as_unix_nanos(),
+                    )?;
+                }
+                seqs.push(seq);
+            }
+            tx.commit().map_err(StoreError::Sqlite)?;
+            Ok(seqs)
+        })
+        .await
+        .map_err(|e| StoreError::Interact(e.to_string()))?;
+
+    write_result
+}
+
 impl EventWriter {
     /// Hot-swaps the redactor consulted on every future `append`/`append_batch` call
     /// (Task 19, §6.7). Does not affect already-committed rows, only writes from this
@@ -501,6 +600,38 @@ impl EventWriter {
     /// boundary guarantee is unaffected by this method's existence.
     pub fn redact_outbound(&self, text: &str) -> (String, u32) {
         self.redactor.load().redact(text)
+    }
+
+    /// Byte-oriented counterpart to [`Self::redact_outbound`] — same live redactor, same
+    /// never-mutates-anything-persisted contract, but over raw bytes rather than validated
+    /// UTF-8 text (Phase 8 Task 19 lane B, Task 5: shell stdout/stderr and other
+    /// non-text-guaranteed streamed content). See `Redactor::redact_bytes`.
+    pub fn redact_outbound_bytes(&self, bytes: &[u8]) -> (Vec<u8>, u32) {
+        self.redactor.load().redact_bytes(bytes)
+    }
+
+    /// The number of bytes a streaming caller must hold back, unflushed, at every
+    /// non-final split point so that no live secret value can straddle it undetected: the
+    /// live redactor's longest pattern length minus one (0 for the default empty
+    /// redactor). Reads the LIVE redactor via `ArcSwap::load` on every call, exactly like
+    /// `redact_outbound`/`redact_outbound_bytes` — a `set_redactor` mid-stream changes the
+    /// holdback a caller sees on its very next call, same as it changes what gets matched.
+    ///
+    /// On its own this bounds how far a match can straddle a boundary a caller already
+    /// committed to — it does not choose that boundary. Pair it with
+    /// [`Self::redaction_safe_split_len`], which does: see that method's, and
+    /// `Redactor::safe_split_len`'s, own doc comments for why holdback alone isn't enough
+    /// and why the split point must be chosen with the buffered bytes in view.
+    pub fn redaction_holdback(&self) -> usize {
+        self.redactor.load().max_pattern_len().saturating_sub(1)
+    }
+
+    /// Pass-through to the live redactor's `Redactor::safe_split_len` — the split-point
+    /// choice `redaction_holdback`'s doc comment says to pair it with. Same hot-swap
+    /// semantics as every other method here: reads whichever `Redactor` is live at call
+    /// time via `ArcSwap::load`.
+    pub fn redaction_safe_split_len(&self, bytes: &[u8], max: usize) -> usize {
+        self.redactor.load().safe_split_len(bytes, max)
     }
 
     /// Append an event to the log. The event's `seq` field is ignored (the writer
@@ -536,6 +667,34 @@ impl EventWriter {
         let (reply, rx) = oneshot::channel();
         self.tx
             .send(WriteCmd::AppendBatch { events, reply })
+            .await
+            .map_err(|_| StoreError::Interact("writer task shut down".into()))?;
+        rx.await
+            .map_err(|_| StoreError::Interact("writer task dropped reply".into()))?
+    }
+
+    /// Same as `append_batch`, plus indexing every `Delta::Blob`/`TaskInput::Blob`/
+    /// `TaskOutput::Blob` ref the batch's events carry, in the SAME transaction as the
+    /// events insert (Phase 8 Task 19 lane B, Task 5). `state_dir` is the workspace's blob
+    /// root — the same directory `blobs::write_blob`/`record_blob_write` use elsewhere.
+    ///
+    /// A blob ref whose file isn't actually present under `state_dir`
+    /// (`blobs::RecordBlobError::MissingFile`, surfaced here as `StoreError::Blob`) fails
+    /// the WHOLE call: neither the events nor any ref-count bump commit. See
+    /// `append_batch_with_blobs`'s (the free function's) own doc comment for the full
+    /// design.
+    pub async fn append_batch_with_blobs(
+        &self,
+        events: Vec<Event>,
+        state_dir: PathBuf,
+    ) -> Result<Vec<u64>, StoreError> {
+        let (reply, rx) = oneshot::channel();
+        self.tx
+            .send(WriteCmd::AppendBatchWithBlobs {
+                events,
+                state_dir,
+                reply,
+            })
             .await
             .map_err(|_| StoreError::Interact("writer task shut down".into()))?;
         rx.await

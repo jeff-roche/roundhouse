@@ -40,9 +40,16 @@ const MAX_JSON_REDACT_DEPTH: usize = 64;
 ///
 /// Two known, tracked gaps in what's actually implemented, vs. §6.7's frozen description:
 ///
-/// - **Lossy against transformed secrets** (base64-encoded, chunk-split across multiple
-///   deltas, etc.) — this is an exact-substring match over known live values, not a
-///   semantic secret detector.
+/// - **Lossy against transformed secrets** (base64-encoded, etc.) — this is an
+///   exact-substring match over known live values, not a semantic secret detector. The
+///   chunk-split-across-multiple-deltas half of this gap (a secret straddling the boundary
+///   between two streamed deltas, so neither delta's own payload contains the full match)
+///   is closed for streaming callers by [`Self::safe_split_len`] plus
+///   `EventWriter::redaction_holdback` (Task 19b, Phase 8 Task 19 lane B): a caller that
+///   holds back at least `redaction_holdback()` bytes at every non-final split point, and
+///   picks the split itself via `safe_split_len`, never emits a delta boundary strictly
+///   inside a match. Base64-/otherwise-transformed secrets remain unaddressed by either
+///   mechanism.
 /// - **Literal-value matching only.** §6.7 describes the automaton as running "over live
 ///   secret values PLUS high-confidence patterns" (e.g. regex-shaped detection of
 ///   API-key-looking strings that were never registered as a known live value). Only the
@@ -54,6 +61,11 @@ const MAX_JSON_REDACT_DEPTH: usize = 64;
 /// them is real follow-up work, not something this type quietly claims to already do.
 pub struct Redactor {
     automaton: aho_corasick::AhoCorasick,
+    /// The longest live secret value's byte length (0 when built with no non-empty
+    /// patterns). Computed once here, at `build`, rather than walked out of the automaton
+    /// on every call — `EventWriter::redaction_holdback` reads it via
+    /// [`Self::max_pattern_len`] on every streamed flush, so it needs to be O(1).
+    max_pattern_len: usize,
 }
 
 impl Redactor {
@@ -79,11 +91,21 @@ impl Redactor {
     /// this is filtered defensively rather than assumed never to happen.
     pub fn build(secret_values: &[String]) -> Self {
         let patterns: Vec<&String> = secret_values.iter().filter(|s| !s.is_empty()).collect();
+        let max_pattern_len = patterns.iter().map(|s| s.len()).max().unwrap_or(0);
         let automaton = aho_corasick::AhoCorasickBuilder::new()
             .match_kind(aho_corasick::MatchKind::LeftmostLongest)
             .build(patterns)
             .expect("valid patterns");
-        Self { automaton }
+        Self {
+            automaton,
+            max_pattern_len,
+        }
+    }
+
+    /// The longest live secret value's byte length, 0 for an empty/no-op redactor. See the
+    /// field's own doc comment for why this is precomputed rather than derived on demand.
+    pub(crate) fn max_pattern_len(&self) -> usize {
+        self.max_pattern_len
     }
 
     /// Replaces every match of a known secret value in `text` with `[REDACTED]`. Returns
@@ -101,6 +123,75 @@ impl Redactor {
         }
         out.push_str(&text[last..]);
         (out, count)
+    }
+
+    /// Byte-oriented counterpart to [`Self::redact`], for payload shapes that carry raw
+    /// bytes rather than validated UTF-8 text (`Delta::Stdout`/`Delta::Stderr`): shell
+    /// output can legitimately contain invalid UTF-8 sequences (binary output, a truncated
+    /// multi-byte character at a chunk boundary, etc.), and this must redact known secret
+    /// values in it without ever assuming (or requiring) the input decodes as `str`. Uses
+    /// the same automaton, `MatchKind::LeftmostLongest` semantics, and `[REDACTED]`
+    /// placeholder as `redact` — only the haystack/output type differs (`&[u8]`/`Vec<u8>`
+    /// instead of `&str`/`String`).
+    pub fn redact_bytes(&self, bytes: &[u8]) -> (Vec<u8>, u32) {
+        let mut count = 0u32;
+        let mut out = Vec::with_capacity(bytes.len());
+        let mut last = 0;
+        for m in self.automaton.find_iter(bytes) {
+            out.extend_from_slice(&bytes[last..m.start()]);
+            out.extend_from_slice(REDACTED_PLACEHOLDER.as_bytes());
+            last = m.end();
+            count += 1;
+        }
+        out.extend_from_slice(&bytes[last..]);
+        (out, count)
+    }
+
+    /// Returns the largest `k <= min(max, bytes.len())` such that no automaton match over
+    /// the WHOLE of `bytes` has `start < k < end` — i.e., a streaming caller that flushes
+    /// `bytes[..k]` now and holds back `bytes[k..]` for the next chunk never cuts a live
+    /// secret in half at the boundary.
+    ///
+    /// **Why holding back `redaction_holdback()` bytes alone isn't enough, and why this
+    /// exists:** holding back the longest pattern's length minus one only bounds how far a
+    /// match can straddle a FIXED boundary chosen without looking at the buffered bytes —
+    /// it does not tell the caller where to put that boundary. A secret can still lie
+    /// wholly inside the bytes a caller was about to flush and straddle whatever split
+    /// point it naively picked (e.g. a fixed chunk size), landing half in one delta and
+    /// half in the next; per-payload redaction (`redact`/`redact_event_payload`) matches
+    /// neither half. This method picks the split point itself, so that can't happen.
+    ///
+    /// **Correctness argument (leftmost-longest, non-overlapping matches):**
+    /// `AhoCorasick::find_iter` yields matches in strictly increasing `start` order, and
+    /// (per its own contract) never overlapping — so `matches[i+1].start() >=
+    /// matches[i].end() > matches[i].start()`. A single ordered pass therefore suffices:
+    /// walk matches in order, and the moment a match's `start()` is `>= k` (the current
+    /// candidate), every later match's `start()` is too (strictly increasing), so none of
+    /// them can straddle `k` either — stop. Otherwise, if the match's `end()` is `> k`, it
+    /// straddles the candidate; move `k` down to that match's `start()`. Because
+    /// `matches[i+1].start() >= matches[i].end() > matches[i].start()` and we just set
+    /// `k = matches[i].start()`, the very next match already satisfies the stop condition
+    /// (`matches[i+1].start() > k`), so at most one adjustment ever happens.
+    ///
+    /// **Why callers can rely on this instead of re-scanning the NEXT chunk too:** any
+    /// match that could extend past `bytes` (i.e. whose true end lies beyond what's
+    /// buffered so far) necessarily starts at or after `bytes.len() - holdback` — a shorter
+    /// match can't reach further than `holdback` (`redaction_holdback()`) bytes past its
+    /// start. So as long as a caller only ever asks for `max <= bytes.len() - holdback`
+    /// (never releasing the held-back tail early), a match this method can already see in
+    /// full is the only kind that can straddle the returned `k` — there is nothing hiding
+    /// just past the end of `bytes` that this pass could miss.
+    pub fn safe_split_len(&self, bytes: &[u8], max: usize) -> usize {
+        let mut k = max.min(bytes.len());
+        for m in self.automaton.find_iter(bytes) {
+            if m.start() >= k {
+                break;
+            }
+            if m.end() > k {
+                k = m.start();
+            }
+        }
+        k
     }
 
     /// Covers six fields as of this merge (fix round A, Phase 7 Task 5, plus Phase 7
@@ -148,14 +239,20 @@ impl Redactor {
     /// safe indefinitely.
     ///
     /// **Known, tracked gap — NOT a safety property, just an honest inventory of what's
-    /// still unprotected:** `Delta::Thinking.text`, `Delta::ToolArgs.fragment`,
-    /// `Delta::Stdout`/`Delta::Stderr` (raw byte arrays — substring text-matching
-    /// doesn't apply to them the same way and would need a different approach),
-    /// `TaskFailed.error.category`, `Message{envelope}`, `SessionStateChanged.reason`,
-    /// `TaskSuspended.reason`, and `SessionCreated.spec` still pass through completely
-    /// unredacted. A live secret in any of those fields reaches the append-only log
-    /// unredacted and permanently, the moment something actually writes real
-    /// (non-empty, non-placeholder) text into them.
+    /// still unprotected:** `TaskFailed.error.category`, `Message{envelope}`,
+    /// `SessionStateChanged.reason`, `TaskSuspended.reason`, and `SessionCreated.spec`
+    /// still pass through completely unredacted. A live secret in any of those fields
+    /// reaches the append-only log unredacted and permanently, the moment something
+    /// actually writes real (non-empty, non-placeholder) text into them.
+    ///
+    /// **Closed by this method (Phase 8 Task 19 lane B, Task 5):** `Delta::Thinking.text`
+    /// and `Delta::ToolArgs.fragment` go through [`Self::redact`] like `Delta::Text`;
+    /// `Delta::Stdout.bytes`/`Delta::Stderr.bytes` go through [`Self::redact_bytes`]
+    /// instead, since raw shell output is not guaranteed to be valid UTF-8 and
+    /// substring text-matching over `&str` doesn't apply to it directly. `Delta::Child`
+    /// (a pointer, not text) and `Delta::Blob` (a content hash, not inline content — see
+    /// this method's `TaskInput`/`TaskOutput::Blob` handling below for the same reasoning)
+    /// are not scanned, matching every other blob-reference shape in this method.
     pub fn redact_event_payload(&self, payload: EventPayload) -> (EventPayload, u32) {
         match payload {
             EventPayload::TaskDelta {
@@ -165,6 +262,57 @@ impl Redactor {
                 (
                     EventPayload::TaskDelta {
                         delta: Delta::Text { text: redacted },
+                    },
+                    n,
+                )
+            }
+            EventPayload::TaskDelta {
+                delta: Delta::Thinking { text, signature },
+            } => {
+                let (redacted, n) = self.redact(&text);
+                (
+                    EventPayload::TaskDelta {
+                        delta: Delta::Thinking {
+                            text: redacted,
+                            signature,
+                        },
+                    },
+                    n,
+                )
+            }
+            EventPayload::TaskDelta {
+                delta: Delta::ToolArgs { fragment },
+            } => {
+                let (redacted, n) = self.redact(&fragment);
+                (
+                    EventPayload::TaskDelta {
+                        delta: Delta::ToolArgs { fragment: redacted },
+                    },
+                    n,
+                )
+            }
+            EventPayload::TaskDelta {
+                delta: Delta::Stdout { bytes },
+            } => {
+                let (redacted, n) = self.redact_bytes(&bytes);
+                (
+                    EventPayload::TaskDelta {
+                        delta: Delta::Stdout {
+                            bytes: redacted.into(),
+                        },
+                    },
+                    n,
+                )
+            }
+            EventPayload::TaskDelta {
+                delta: Delta::Stderr { bytes },
+            } => {
+                let (redacted, n) = self.redact_bytes(&bytes);
+                (
+                    EventPayload::TaskDelta {
+                        delta: Delta::Stderr {
+                            bytes: redacted.into(),
+                        },
                     },
                     n,
                 )
@@ -514,4 +662,241 @@ pub async fn debug_read_raw_payload_text(
         .map_err(|e| StoreError::Interact(e.to_string()))?;
 
     row_result.map_err(StoreError::Sqlite)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // -----------------------------------------------------------------------------------
+    // redact_bytes
+    // -----------------------------------------------------------------------------------
+
+    /// The core `redact_bytes` guarantee: a secret embedded in a byte stream that is NOT
+    /// valid UTF-8 (a lone continuation byte on either side of the match) must still be
+    /// found and replaced — `redact_bytes` operates on `&[u8]` directly and never assumes
+    /// (or requires) the input decodes as `str`, unlike `redact`.
+    #[test]
+    fn redact_bytes_finds_a_secret_in_non_utf8_input_and_leaves_the_rest_untouched() {
+        let redactor = Redactor::build(&["sk-live-abc123".to_string()]);
+        let mut bytes = vec![0x80, 0xFF]; // invalid UTF-8 on its own
+        bytes.extend_from_slice(b"sk-live-abc123");
+        bytes.extend_from_slice(&[0xFE]);
+
+        let (redacted, count) = redactor.redact_bytes(&bytes);
+
+        assert_eq!(count, 1);
+        let mut expected = vec![0x80, 0xFF];
+        expected.extend_from_slice(REDACTED_PLACEHOLDER.as_bytes());
+        expected.push(0xFE);
+        assert_eq!(
+            redacted, expected,
+            "the non-UTF-8 bytes surrounding the match must survive untouched, and the \
+             match itself must become the placeholder"
+        );
+    }
+
+    #[test]
+    fn redact_bytes_returns_zero_count_and_unchanged_bytes_when_nothing_matches() {
+        let redactor = Redactor::build(&["sk-live-abc123".to_string()]);
+        let bytes = vec![0x80, 0xFF, b'h', b'i'];
+
+        let (redacted, count) = redactor.redact_bytes(&bytes);
+
+        assert_eq!(count, 0);
+        assert_eq!(redacted, bytes);
+    }
+
+    // -----------------------------------------------------------------------------------
+    // safe_split_len
+    // -----------------------------------------------------------------------------------
+
+    /// The motivating case: a naive fixed split point that lands strictly inside a match
+    /// must be moved back to the match's own start, never left where it would cut the
+    /// secret in half.
+    #[test]
+    fn safe_split_len_moves_a_straddling_split_back_to_the_secrets_start() {
+        let redactor = Redactor::build(&["sk-live-abc123".to_string()]);
+        let bytes = b"prefix sk-live-abc123 suffix";
+        let secret_start = bytes
+            .windows(14)
+            .position(|w| w == b"sk-live-abc123")
+            .unwrap();
+        let secret_end = secret_start + 14;
+        let naive_split = secret_start + 5; // strictly inside the match
+
+        let k = redactor.safe_split_len(bytes, naive_split);
+
+        assert_eq!(
+            k, secret_start,
+            "a split point inside the match must move back to the match's own start"
+        );
+        assert!(k < secret_end);
+    }
+
+    /// A secret sitting entirely BEFORE the naive split point (fully flushed either way)
+    /// must not move the split at all.
+    #[test]
+    fn safe_split_len_is_unaffected_by_a_secret_wholly_before_the_split() {
+        let redactor = Redactor::build(&["sk-live-abc123".to_string()]);
+        let bytes = b"sk-live-abc123 then plain text after it";
+        let naive_split = bytes.len(); // well past the match's end
+
+        let k = redactor.safe_split_len(bytes, naive_split);
+
+        assert_eq!(k, naive_split.min(bytes.len()));
+    }
+
+    /// A secret sitting entirely AFTER the naive split point (not flushed yet either way)
+    /// must not move the split at all.
+    #[test]
+    fn safe_split_len_is_unaffected_by_a_secret_wholly_after_the_split() {
+        let redactor = Redactor::build(&["sk-live-abc123".to_string()]);
+        let bytes = b"plain text before it, then sk-live-abc123";
+        let naive_split = 10; // well before the match's start
+
+        let k = redactor.safe_split_len(bytes, naive_split);
+
+        assert_eq!(k, naive_split);
+    }
+
+    /// An empty redactor (no live secret values) matches nothing, so the split point is
+    /// always exactly `min(max, bytes.len())` — never adjusted.
+    #[test]
+    fn safe_split_len_with_an_empty_redactor_returns_min_of_max_and_len() {
+        let redactor = Redactor::build(&[]);
+        let bytes = b"arbitrary content, no secrets here";
+
+        assert_eq!(redactor.safe_split_len(bytes, 5), 5);
+        assert_eq!(redactor.safe_split_len(bytes, 1_000), bytes.len());
+        assert_eq!(redactor.safe_split_len(bytes, 0), 0);
+    }
+
+    /// Non-UTF-8 input must work exactly like valid UTF-8 input — `safe_split_len` never
+    /// decodes its haystack as `str`.
+    #[test]
+    fn safe_split_len_works_on_non_utf8_input() {
+        let redactor = Redactor::build(&["sk-live-abc123".to_string()]);
+        let mut bytes = vec![0x80, 0xFF];
+        let secret_start = bytes.len();
+        bytes.extend_from_slice(b"sk-live-abc123");
+        bytes.push(0xFE);
+        let naive_split = secret_start + 5; // inside the match
+
+        let k = redactor.safe_split_len(&bytes, naive_split);
+
+        assert_eq!(k, secret_start);
+    }
+
+    // -----------------------------------------------------------------------------------
+    // redact_event_payload: the new delta kinds
+    // -----------------------------------------------------------------------------------
+
+    #[test]
+    fn thinking_delta_text_is_redacted_and_counted() {
+        let redactor = Redactor::build(&["sk-live-abc123".to_string()]);
+        let (redacted, count) = redactor.redact_event_payload(EventPayload::TaskDelta {
+            delta: Delta::Thinking {
+                text: "reasoning about sk-live-abc123 now".into(),
+                signature: Some("sig".into()),
+            },
+        });
+        assert_eq!(count, 1);
+        match redacted {
+            EventPayload::TaskDelta {
+                delta: Delta::Thinking { text, signature },
+            } => {
+                assert!(!text.contains("sk-live-abc123"));
+                assert!(text.contains("[REDACTED]"));
+                assert_eq!(
+                    signature,
+                    Some("sig".into()),
+                    "signature must round-trip untouched"
+                );
+            }
+            other => panic!("unexpected payload: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn tool_args_delta_fragment_is_redacted_and_counted() {
+        let redactor = Redactor::build(&["sk-live-abc123".to_string()]);
+        let (redacted, count) = redactor.redact_event_payload(EventPayload::TaskDelta {
+            delta: Delta::ToolArgs {
+                fragment: "{\"key\": \"sk-live-abc123\"".into(),
+            },
+        });
+        assert_eq!(count, 1);
+        match redacted {
+            EventPayload::TaskDelta {
+                delta: Delta::ToolArgs { fragment },
+            } => {
+                assert!(!fragment.contains("sk-live-abc123"));
+                assert!(fragment.contains("[REDACTED]"));
+            }
+            other => panic!("unexpected payload: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn stdout_delta_bytes_are_redacted_and_counted_including_non_utf8() {
+        let redactor = Redactor::build(&["sk-live-abc123".to_string()]);
+        let mut raw = vec![0x80, 0xFF];
+        raw.extend_from_slice(b"sk-live-abc123");
+        let (redacted, count) = redactor.redact_event_payload(EventPayload::TaskDelta {
+            delta: Delta::Stdout { bytes: raw.into() },
+        });
+        assert_eq!(count, 1);
+        match redacted {
+            EventPayload::TaskDelta {
+                delta: Delta::Stdout { bytes },
+            } => {
+                assert!(!bytes.windows(14).any(|w| w == b"sk-live-abc123"));
+                assert!(bytes
+                    .windows(REDACTED_PLACEHOLDER.len())
+                    .any(|w| w == REDACTED_PLACEHOLDER.as_bytes()));
+            }
+            other => panic!("unexpected payload: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn stderr_delta_bytes_are_redacted_and_counted_including_non_utf8() {
+        let redactor = Redactor::build(&["sk-live-abc123".to_string()]);
+        let mut raw = vec![0x80, 0xFF];
+        raw.extend_from_slice(b"sk-live-abc123");
+        let (redacted, count) = redactor.redact_event_payload(EventPayload::TaskDelta {
+            delta: Delta::Stderr { bytes: raw.into() },
+        });
+        assert_eq!(count, 1);
+        match redacted {
+            EventPayload::TaskDelta {
+                delta: Delta::Stderr { bytes },
+            } => {
+                assert!(!bytes.windows(14).any(|w| w == b"sk-live-abc123"));
+                assert!(bytes
+                    .windows(REDACTED_PLACEHOLDER.len())
+                    .any(|w| w == REDACTED_PLACEHOLDER.as_bytes()));
+            }
+            other => panic!("unexpected payload: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn stdout_delta_with_no_match_has_zero_count_and_unchanged_bytes() {
+        let redactor = Redactor::build(&["sk-live-abc123".to_string()]);
+        let raw = vec![0x80, 0xFF, b'o', b'k'];
+        let (redacted, count) = redactor.redact_event_payload(EventPayload::TaskDelta {
+            delta: Delta::Stdout {
+                bytes: raw.clone().into(),
+            },
+        });
+        assert_eq!(count, 0);
+        match redacted {
+            EventPayload::TaskDelta {
+                delta: Delta::Stdout { bytes },
+            } => assert_eq!(bytes.as_ref(), raw.as_slice()),
+            other => panic!("unexpected payload: {other:?}"),
+        }
+    }
 }
