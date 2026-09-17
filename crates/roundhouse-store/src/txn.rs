@@ -17,21 +17,32 @@ pub fn begin_immediate(conn: &mut Connection) -> rusqlite::Result<Transaction<'_
 /// busy handler. The caller owns the bounded retry loop; leaving the default
 /// busy timeout enabled would multiply that loop's bound by five seconds per
 /// attempt.
-pub(crate) fn with_bounded_busy_attempt<T>(
+///
+/// Generic over the operation's error type `E` (Task 19a): `workspaces.rs`'s callers still
+/// instantiate this at `E = rusqlite::Error` (the blanket reflexive `impl<T> From<T> for T`
+/// makes every `E::from` below a no-op there, so their behavior is unchanged), while
+/// `writer.rs`'s `append_one`/`append_batch`/`close_session` instantiate it at
+/// `E = StoreError` so a `StoreError::SessionClosed` minted deep inside `operation` (the
+/// tail guard) can propagate out of this retry wrapper without being flattened into a
+/// generic `StoreError::Sqlite`.
+pub(crate) fn with_bounded_busy_attempt<T, E>(
     conn: &mut Connection,
-    operation: impl FnOnce(&mut Connection) -> rusqlite::Result<T>,
-) -> rusqlite::Result<T> {
-    conn.busy_timeout(Duration::ZERO)?;
+    operation: impl FnOnce(&mut Connection) -> Result<T, E>,
+) -> Result<T, E>
+where
+    E: From<rusqlite::Error>,
+{
+    conn.busy_timeout(Duration::ZERO).map_err(E::from)?;
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| operation(conn)));
     let restore = conn.busy_timeout(BUSY_TIMEOUT);
     match result {
         Err(payload) => {
             std::panic::resume_unwind(payload);
         }
-        Ok(Ok(value)) => restore.map(|()| value),
+        Ok(Ok(value)) => restore.map(|()| value).map_err(E::from),
         Ok(Err(error)) => match restore {
             Ok(()) => Err(error),
-            Err(restore_error) => Err(restore_error),
+            Err(restore_error) => Err(E::from(restore_error)),
         },
     }
 }

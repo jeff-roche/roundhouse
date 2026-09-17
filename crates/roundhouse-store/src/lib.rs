@@ -48,6 +48,9 @@ pub use pool::{InteractError, PooledConnection, SqliteConnection};
 // Task 2 exports
 pub use writer::{append_event_in_transaction, serialize_payload, spawn_writer, EventWriter};
 
+// Phase 8, Task 19a Task 1: session close (sweep + terminator) and its receipt type.
+pub use writer::CloseReceipt;
+
 // Task 3 exports
 pub use fold::{fold_task, Task, TaskState};
 
