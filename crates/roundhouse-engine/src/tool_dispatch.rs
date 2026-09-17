@@ -1250,14 +1250,21 @@ fn try_send_chunk(channel: &DeltaChannel, chunk: &[u8]) {
 /// (or the last discontinuity — see [`handle_stream_event`]'s `Gap` arm),
 /// the cumulative count of bytes actually, durably flushed (for the
 /// progress message — only ever advanced once `flush_stream` reports
-/// success), and the receiving half of this stream's [`DeltaChannel`] —
-/// `None` once this stream's `drain_to_end` has dropped its sender AND the
-/// resulting final flush has run.
+/// success), the receiving half of this stream's [`DeltaChannel`] — `None`
+/// once this stream's `drain_to_end` has dropped its sender AND the
+/// resulting final flush has run — and `in_budget_gap_run`, tracking
+/// whether the most recent event on this stream was already a
+/// [`GapReason::Budget`] gap (fix round 2, N1: coalesces the standalone
+/// progress marker across a whole RUN of consecutive budget-drop gaps —
+/// see [`handle_stream_event`]'s `Gap` arm for why an uncoalesced version
+/// of this made a falling-behind pump fall further behind, one more
+/// serialized `EventWriter::append` per dropped chunk).
 struct StreamPumpState {
     kind: ShellStream,
     buf: Vec<u8>,
     flushed: u64,
     rx: Option<mpsc::UnboundedReceiver<ShellChunk>>,
+    in_budget_gap_run: bool,
 }
 
 impl StreamPumpState {
@@ -1267,6 +1274,7 @@ impl StreamPumpState {
             buf: Vec::new(),
             flushed: 0,
             rx,
+            in_budget_gap_run: false,
         }
     }
 }
@@ -1585,6 +1593,10 @@ async fn handle_stream_event(
 ) {
     match chunk {
         Some(ShellChunk::Data(bytes)) => {
+            // A genuine chunk ends any run of budget-drop gaps this stream
+            // was in -- the NEXT `Budget` gap (if any) starts a fresh run
+            // and so gets its own marker (fix round 2, N1).
+            stream.in_budget_gap_run = false;
             in_flight.fetch_sub(bytes.len(), Ordering::Relaxed);
             stream.buf.extend_from_slice(&bytes);
             if stream.buf.len() >= SHELL_FLUSH_CHUNK_BYTES {
@@ -1626,7 +1638,27 @@ async fn handle_stream_event(
                 lag.fetch_add(stream.buf.len(), Ordering::Relaxed);
                 stream.buf.clear();
             }
-            emit_gap_progress(writer, runner, session_id, task_id, reason, lag).await;
+            // Fix round 2, N1: a `Cap` gap always gets its own marker (at
+            // most one per stream, ever — the exactly-one guarantee the
+            // BLOCKING-1/finding-8 tests pin). A `Budget` gap only gets one
+            // if it's the FIRST of a run: once falling behind starts
+            // dropping chunks, every subsequent drop until the pump catches
+            // up would otherwise be its own serialized `EventWriter::append`
+            // — pure overhead that makes a backlogged pump fall further
+            // behind, with no informational value over the first marker
+            // (the lag counter itself, not the marker count, is what stays
+            // exact — see the `lag.fetch_add` calls above and in
+            // `try_send_chunk`).
+            let should_emit = match reason {
+                GapReason::Cap => true,
+                GapReason::Budget => !stream.in_budget_gap_run,
+            };
+            if should_emit {
+                emit_gap_progress(writer, runner, session_id, task_id, reason, lag).await;
+            }
+            if reason == GapReason::Budget {
+                stream.in_budget_gap_run = true;
+            }
         }
         None => {
             stream.rx = None;
@@ -1712,20 +1744,43 @@ async fn run_isolated_shell_dispatch(
         }
         None => (None, None, None, None),
     };
-    // Fix round 1, finding 10: the outer `tokio::select!` below races this
-    // whole `completion` future (both drains AND the delta pump) against
+    // Fix round 1, finding 10 (corrected fix round 2, MINOR 10 -- the
+    // original version of this comment denied a real, security-relevant
+    // invariant): the outer `tokio::select!` below races this whole
+    // `completion` future (both drains AND the delta pump) against
     // `sleep(timeout)`/`wait_for_session_cancel`. If either of those wins,
     // `completion` — and everything it's still `join!`ing, including
     // `run_shell_delta_pump` — is dropped mid-flight: any bytes the pump
     // was still buffering (not yet flushed) are lost from the delta stream,
-    // and no final flush ever runs for either stream. This is a silent,
-    // by-design truncation relative to `ShellOutput` itself, which the
-    // caller only sees indirectly (a `ShellCancelled`/`ShellSessionCancelled`
-    // error, never an explicit "the delta stream stopped early" signal).
-    // There is no happens-before relationship to preserve here beyond what
-    // `select!` already gives: the delta stream is best-effort and is
-    // allowed to be strictly less complete than the retained `ShellOutput`
-    // buffer on a cancelled/timed-out call.
+    // and no further flush ever runs for either stream after the drop. This
+    // is a silent, by-design truncation relative to `ShellOutput` itself,
+    // which the caller only sees indirectly (a
+    // `ShellCancelled`/`ShellSessionCancelled` error, never an explicit "the
+    // delta stream stopped early" signal).
+    //
+    // There IS a happens-before relationship that survives this drop, and it
+    // is a Global Constraint: every delta/progress event for a task commits
+    // before that task's terminal event. `EventWriter::append`/
+    // `append_batch_with_blobs` both work the same way — send a `WriteCmd`
+    // over the writer actor's channel, THEN `.await` a oneshot reply. If a
+    // `flush_stream`/`emit_gap_progress` future is dropped by the `select!`
+    // above AFTER its `send(...).await` has already returned (i.e. the
+    // command is already enqueued) but BEFORE the reply arrives, the write
+    // still executes on the writer task — only the now-dropped reply
+    // channel's send fails silently, never the write itself. That event
+    // still commits, even though `run_isolated_shell_dispatch` has already
+    // returned an error to its caller, and it is GUARANTEED to land before
+    // the task's terminal event: `ShellDeltaSink` holds a `Clone` of the
+    // exact same `EventWriter` (a derived `Clone` over the same underlying
+    // `mpsc::Sender<WriteCmd>`) that records the terminal event, so both
+    // enqueue onto the SAME actor FIFO — whichever `send(...).await`
+    // returns (enqueues) first is guaranteed to be processed first, and the
+    // terminal event's `send` cannot happen until after this function has
+    // already returned its error up the call stack. This invariant holds
+    // ONLY because the sink shares the very `EventWriter` the terminal event
+    // uses; a caller that gave `ShellDeltaSink` a writer backed by a
+    // DIFFERENT actor/channel would lose this ordering guarantee entirely,
+    // even if that other writer targeted the same underlying store.
     let completion = async {
         let (status, stdout, stderr, ()) = tokio::join!(
             child.wait(),
@@ -3816,6 +3871,124 @@ mod tests {
              (fix round 1 follow-up, finding 8) -- distinct from the possibly-many \
              GapReason::Budget ones a fast producer can also trigger before the cap is even \
              reached"
+        );
+        // Fix round 2, finding 9: the `[, K B not streamed]` half of the
+        // ordinary per-flush progress format was previously asserted only
+        // negatively (never appearing when lag is zero, in test (b)) -- here,
+        // where a fast `yes | head` producer against the shared
+        // SHELL_DELTA_BUDGET_BYTES budget reliably drops SOME bytes well
+        // before the cap even closes the stream, assert the suffix actually
+        // appears on at least one ordinary flush's own message (distinct
+        // from `emit_gap_progress`'s differently-worded standalone marker).
+        let ordinary_flush_messages: Vec<String> = events
+            .iter()
+            .filter(|e| e.task_id == Some(task_id))
+            .filter_map(|e| match &e.payload {
+                roundhouse_core::EventPayload::TaskProgress { progress }
+                    if progress.message.starts_with("stdout ") =>
+                {
+                    Some(progress.message.clone())
+                }
+                _ => None,
+            })
+            .collect();
+        assert!(
+            ordinary_flush_messages
+                .iter()
+                .any(|m| m.ends_with(" B not streamed")),
+            "at least one ordinary per-flush progress message must carry the \", K B not \
+             streamed\" suffix once lag is non-zero -- got: {ordinary_flush_messages:?}"
+        );
+    }
+
+    /// (N1) fix round 2: an uncoalesced pump made every single budget-drop
+    /// gap its own inline `writer.append(...).await` -- observed on this
+    /// very test's over-cap scenario as 157 standalone gap markers against
+    /// 73 delta blobs for ONE shell call, each extra append making an
+    /// already-backlogged pump fall further behind. Asserted directly
+    /// against `handle_stream_event`, bypassing real process timing
+    /// entirely: three consecutive `Budget` gaps in a row must coalesce
+    /// into exactly one marker, a real `Data` chunk must end that run, and
+    /// the next `Budget` gap after it must start a fresh run (and so get
+    /// its own marker).
+    #[tokio::test]
+    async fn consecutive_budget_gaps_coalesce_into_one_progress_marker() {
+        let (writer, db_path, state_dir, _guard) = shell_delta_test_store().await;
+        let runner = crate::session_actor::test_runner();
+        let session_id = SessionId::new();
+        let task_id = TaskId::new();
+        let in_flight = AtomicUsize::new(0);
+        let lag = AtomicUsize::new(0);
+
+        let mut stream = StreamPumpState::new(ShellStream::Stdout, None);
+        let mut other = StreamPumpState::new(ShellStream::Stderr, None);
+
+        for _ in 0..3 {
+            handle_stream_event(
+                &writer,
+                runner,
+                session_id,
+                task_id,
+                &state_dir,
+                &mut stream,
+                &mut other,
+                Some(ShellChunk::Gap(GapReason::Budget)),
+                &in_flight,
+                &lag,
+            )
+            .await;
+        }
+
+        let reopened = roundhouse_store::open(&db_path).await.unwrap();
+        let events = roundhouse_store::session_events(&reopened, session_id)
+            .await
+            .unwrap();
+        assert_eq!(
+            gap_progress_count(&events, task_id),
+            1,
+            "three consecutive Budget gaps in a row must coalesce into exactly one standalone \
+             progress marker"
+        );
+
+        // A real chunk arrives, ending the run.
+        handle_stream_event(
+            &writer,
+            runner,
+            session_id,
+            task_id,
+            &state_dir,
+            &mut stream,
+            &mut other,
+            Some(ShellChunk::Data(b"x".to_vec())),
+            &in_flight,
+            &lag,
+        )
+        .await;
+
+        // A fresh Budget gap after the run ended must get its own marker.
+        handle_stream_event(
+            &writer,
+            runner,
+            session_id,
+            task_id,
+            &state_dir,
+            &mut stream,
+            &mut other,
+            Some(ShellChunk::Gap(GapReason::Budget)),
+            &in_flight,
+            &lag,
+        )
+        .await;
+
+        let reopened = roundhouse_store::open(&db_path).await.unwrap();
+        let events = roundhouse_store::session_events(&reopened, session_id)
+            .await
+            .unwrap();
+        assert_eq!(
+            gap_progress_count(&events, task_id),
+            2,
+            "a real chunk between two gap runs must end the first run -- the next Budget gap \
+             starts a fresh run and gets its own marker"
         );
     }
 
