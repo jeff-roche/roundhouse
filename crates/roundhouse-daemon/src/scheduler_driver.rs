@@ -1928,7 +1928,7 @@ impl DeliveryExecutor {
     ///   terminator written here would precede those later events and trip
     ///   the store's own tail guard (`StoreError::SessionClosed`) the
     ///   moment that redrive tried to append anything.
-    /// - `execute_pending_with_context`'s `PendingKind::ChildRun` arm calls
+    /// - `dispatch_one_pending`'s `PendingKind::ChildRun` arm calls
     ///   it twice more (fix round 1, C1), for a `call:` child whose own run
     ///   reached a terminal `RunState` but whose join back to the parent's
     ///   step did not: `join_terminal_child` returning `Ok(None)` (no
@@ -3102,12 +3102,20 @@ impl DeliveryExecutor {
                 //
                 // # Reachability: does a later boot re-enter this arm for the SAME child?
                 //
-                // No. `create_child_run` (`SqliteWorkflowHost`, via
+                // No. `SqliteWorkflowHost::create_child_run` (called from
                 // `roundhouse_flow::exec::run_loop::Loop::dispatch_call`)
-                // commits the child's own `WorkflowRun` row, its
-                // `SessionCreated` event, and the parent step's own
-                // `StepRunState::Running` checkpoint together, atomically,
-                // before this arm ever runs — so by the time a boot-time
+                // commits, in one transaction: `persist_child_session`
+                // (the child's `SessionCreated` event),
+                // `insert_workflow_run_in_transaction` (the child's own
+                // `WorkflowRun` row), `checkpoint_step_in_transaction` (the
+                // parent step's own `StepRunState::Running` checkpoint),
+                // `persist_parent_call_task` (the parent's own call task),
+                // and `insert_workflow_child_call_in_transaction` (the
+                // `WorkflowChildCall` join row) — all before this arm ever
+                // runs. That last insert is exactly what makes `join_
+                // terminal_child`'s `Ok(None)` effectively unreachable in
+                // production: a `WorkflowChildCall` row always exists for a
+                // child dispatched this way. So by the time a boot-time
                 // redrive of the PARENT reaches this same `Call` step again,
                 // that step is already checkpointed `Running`, not
                 // undecided. `dispatch_call` always mints a brand-new
@@ -7042,7 +7050,7 @@ mod child_run_tests {
     /// tripped by the failed attempt: rehydrating the SAME `child_session_id`
     /// and calling `close_and_retire` on it directly (there being no
     /// production path that redrives this exact child — see
-    /// `execute_pending_with_context`'s `PendingKind::ChildRun` arm for why)
+    /// `dispatch_one_pending`'s `PendingKind::ChildRun` arm for why)
     /// still succeeds and writes a real terminator.
     #[tokio::test]
     async fn a_child_whose_join_fails_gets_no_terminator_and_can_still_be_closed_later() {
@@ -7240,16 +7248,19 @@ mod child_run_tests {
             second_refund,
             parent_spend_before_second_refund,
             parent_spend_after_second_refund,
+            child_session_id,
         ) = conn
             .interact(move |connection| {
                 let parent_steps = recover_run(connection, parent_run_id).unwrap().steps;
-                let child_run_id: String = connection
+                let (child_run_id, child_session_id): (String, String) = connection
                     .query_row(
-                        "SELECT id FROM workflow_run WHERE parent_run_id = ?1",
+                        "SELECT id, session_id FROM workflow_run WHERE parent_run_id = ?1",
                         [parent_run_id.to_string()],
-                        |row| row.get(0),
+                        |row| Ok((row.get(0)?, row.get(1)?)),
                     )
                     .unwrap();
+                let child_session_id =
+                    SessionId::from_uuid(Uuid::parse_str(&child_session_id).unwrap());
                 let child_run_id = RunId::from_uuid(Uuid::parse_str(&child_run_id).unwrap());
                 let child_refunded_at =
                     roundhouse_flow::ledger::run_ledger(connection, child_run_id)
@@ -7311,6 +7322,7 @@ mod child_run_tests {
                     second_refund,
                     parent_spend_before_second_refund,
                     parent_spend_after_second_refund,
+                    child_session_id,
                 )
             })
             .await
@@ -7352,6 +7364,18 @@ mod child_run_tests {
             parent_spend_after_second_refund, parent_spend_before_second_refund,
             "a refused second refund must not change the parent ledger"
         );
+        // Phase 8, T19a Task 7, fix round 2 (3): a `call:` child reaching
+        // `Failed` closes with the same mapped terminator as any other
+        // terminal path — coverage symmetry with the `Completed` case
+        // `a_pending_child_run_drives_using_its_own_session` already pins.
+        match harness.session_close_outcome(child_session_id).await {
+            Some(SessionOutcome::Failed { reason }) => {
+                assert_eq!(reason, RunState::Failed.wire_name());
+            }
+            other => panic!(
+                "a call: child whose own run failed must close its session Failed, got {other:?}"
+            ),
+        }
     }
 
     #[tokio::test]
@@ -7438,10 +7462,11 @@ mod child_run_tests {
         let row = harness.delivery_row().await;
         let parent_session_id = row.session_id.expect("reserve stamps a session id");
         let conn = harness.store.pool.get().await.unwrap();
-        let (parent_steps, child_state, parent_events) = conn
+        let (parent_steps, child_state, child_session_id, parent_events) = conn
             .interact(move |connection| {
                 let parent_steps = recover_run(connection, parent_run_id).unwrap().steps;
-                let child_state = recover_run(connection, child_run_id).unwrap().run.state;
+                let child_run = recover_run(connection, child_run_id).unwrap().run;
+                let (child_state, child_session_id) = (child_run.state, child_run.session_id);
                 let parent_events = connection
                     .prepare(
                         "SELECT task_id, seq, payload FROM events WHERE session_id = ?1 ORDER BY seq",
@@ -7457,7 +7482,7 @@ mod child_run_tests {
                     .unwrap()
                     .map(Result::unwrap)
                     .collect::<Vec<_>>();
-                (parent_steps, child_state, parent_events)
+                (parent_steps, child_state, child_session_id, parent_events)
             })
             .await
             .unwrap();
@@ -7538,6 +7563,17 @@ mod child_run_tests {
             (child_step.first_task_seq, child_step.last_task_seq),
             (Some(parent_agent_bounds[0]), Some(parent_agent_bounds[1]))
         );
+        // Phase 8, T19a Task 7, fix round 2 (3): a `call:` child reaching
+        // `Cancelled` closes with the same mapped terminator as any other
+        // terminal path — coverage symmetry with the `Completed`/`Failed`
+        // cases pinned elsewhere in this module.
+        match harness.session_close_outcome(child_session_id).await {
+            Some(SessionOutcome::Cancelled) => {}
+            other => panic!(
+                "a call: child whose own run was cancelled must close its session Cancelled, \
+                 got {other:?}"
+            ),
+        }
     }
 
     /// The call task was created before child dispatch. Its terminal event must
