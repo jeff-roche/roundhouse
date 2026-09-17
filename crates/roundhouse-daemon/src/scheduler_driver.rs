@@ -1796,7 +1796,12 @@ impl DeliveryExecutor {
             })
             .await;
             self.release(binding_id);
-            self.close_and_retire(session, SessionOutcome::Cancelled)
+            // Phase 8, T19a Task 7, fix round 1 (M7): routed through the
+            // same `session_outcome_for_terminal` every other terminal
+            // mapping uses, rather than hardcoding `SessionOutcome::
+            // Cancelled` here too — one function owns the `RunState` ->
+            // `SessionOutcome` mapping.
+            self.close_and_retire(session, session_outcome_for_terminal(RunState::Cancelled))
                 .await;
             return outcome;
         }
@@ -1827,13 +1832,13 @@ impl DeliveryExecutor {
             RunConclusion::Failed(reason) => {
                 self.fail(delivery_id, binding_id, "workflow_failed", reason)
                     .await;
-                // Task 7: only a genuinely reached terminal `RunState` (this
-                // arm also catches `Cancelled` when `cancelled_handling` is
-                // `AsFailure` — the ordinary live-claim shape, where
-                // `Cancelled` is not carved out above) gets a `SessionClosed`
-                // terminator; a driver `Err` that never reached one gets
-                // `release_session` instead, per that method's own doc
-                // comment.
+                // Phase 8, T19a Task 7: only a genuinely reached terminal
+                // `RunState` (this arm also catches `Cancelled` when
+                // `cancelled_handling` is `AsFailure` — the ordinary
+                // live-claim shape, where `Cancelled` is not carved out
+                // above) gets a `SessionClosed` terminator; a driver `Err`
+                // that never reached one gets `release_session` instead,
+                // per that method's own doc comment.
                 match terminal_run_state(&outcome) {
                     Some(state) => {
                         self.close_and_retire(session, session_outcome_for_terminal(state))
@@ -1878,20 +1883,63 @@ impl DeliveryExecutor {
     /// delivery's own end is what bounds it, and the bound is the
     /// concurrency cap rather than the daemon's uptime.
     ///
-    /// # Why this writes no terminator (Task 7)
+    /// # Why this writes no terminator (Phase 8, T19a Task 7)
     ///
     /// This is [`Self::close_and_retire`]'s counterpart for every path that
     /// never reached a genuine `Ok(DrivenRun::Outcome(RunOutcome::Terminal
-    /// { .. }))`: a pre-run infra failure (`Err(DeliveryError)` — workspace/
-    /// job resolution, session construction, a store error) and a boot-time
-    /// redrive whose own infra failed the same way. Both recreate a session
-    /// under the SAME `session_id` on a later attempt — the infra failure
-    /// leaves the underlying `workflow_run` row non-terminal, so a future
-    /// boot's Mechanism 2/3 redrive rebuilds a `HeadlessSession` for that
-    /// same `session_id` and keeps appending to its event log. A terminator
-    /// written here would precede those later events and trip the store's
-    /// own tail guard (`StoreError::SessionClosed`) the moment that redrive
-    /// tried to append anything.
+    /// { .. }))`. Six call sites reach it, each for its own reason —
+    /// fix round 1 (I2) corrected an earlier version of this doc, which
+    /// claimed all four it then knew about "recreate a session under the
+    /// same `session_id` on a later attempt", true of only one of them:
+    ///
+    /// - [`Self::run_claimed`]'s own `Err(DeliveryError)` branch (a pre-run
+    ///   infra failure — workspace/job resolution, session construction, a
+    ///   `mark_delivery_running` race) and [`redrive_reserved_or_running`]'s
+    ///   identically-shaped `Err(DeliveryError)` branch (the same class of
+    ///   infra failure, reached during a boot-time redrive instead of a live
+    ///   claim): both call `self.fail(..)` first, moving the delivery to
+    ///   terminal `failed` — every mechanism in this module lists deliveries
+    ///   by delivery state, so a `failed` delivery, and the `session_id`
+    ///   its row named, is never revisited by Mechanism 2 or 3. The session
+    ///   is genuinely over; there is simply no terminal `RunState` to name
+    ///   for it (most of these paths hold no session at all — `session` is
+    ///   `None` before the failure is even reached).
+    /// - [`Self::handle_run_outcome`]'s `RunConclusion::Failed` arm when
+    ///   [`terminal_run_state`] is `None` (a driver `Err(RunLoopError)` that
+    ///   never reached any `RunState`): `self.fail(..)` also runs here,
+    ///   moving the delivery to terminal `failed` the same way — so this
+    ///   `session_id` is likewise never revisited by Mechanism 2 or 3
+    ///   either. The real residual risk is the **orphaned run row** this
+    ///   module's own top-level doc names as a known gap: `run_workflow_
+    ///   from_storage` returning `Err` leaves the underlying `workflow_run`
+    ///   row `Running`, with no driver attached and no `ended_at` — §8.11's
+    ///   reaper, whenever it exists, is what would eventually redrive that
+    ///   orphaned row directly (independent of delivery state), against
+    ///   this same `session_id`. Giving it no terminator now is what keeps
+    ///   that future redrive possible.
+    /// - [`finish_cancellation_requested_delivery`]'s `Err(DeliveryError)`
+    ///   branch (Mechanism 3's own infra failure, reached only after
+    ///   `control::cancel` already committed `Cancelling`) is the one site
+    ///   that is genuinely, immediately retryable: the delivery is
+    ///   deliberately left `cancellation_requested` rather than failed, so
+    ///   the run's `Cancelling` state can still reach `Cancelled` on a later
+    ///   boot. That later boot's Mechanism 3 rebuilds a `HeadlessSession`
+    ///   for the SAME `session_id` and keeps appending to its event log — a
+    ///   terminator written here would precede those later events and trip
+    ///   the store's own tail guard (`StoreError::SessionClosed`) the
+    ///   moment that redrive tried to append anything.
+    /// - `execute_pending_with_context`'s `PendingKind::ChildRun` arm calls
+    ///   it twice more (fix round 1, C1), for a `call:` child whose own run
+    ///   reached a terminal `RunState` but whose join back to the parent's
+    ///   step did not: `join_terminal_child` returning `Ok(None)` (no
+    ///   durable `WorkflowChildCall` row to join against) or `Err(_)` (a
+    ///   store error mid-join). Both leave the parent step checkpointed
+    ///   `Running` with no `SessionCreated`-adjacent record of the child's
+    ///   fate, and — per that arm's own reachability note — no later boot
+    ///   ever redrives this exact `child_session_id` either way, so there is
+    ///   no "later attempt" this is protecting; it costs nothing to release
+    ///   with no terminator, and nothing downstream is known to need this
+    ///   `session_id` open again.
     ///
     /// Never called on the parked path — see [`Self::run_claimed`].
     async fn release_session(&self, session: Option<HeadlessSession>) {
@@ -1906,9 +1954,9 @@ impl DeliveryExecutor {
     /// Durably closes a finished delivery's headless session with `outcome`
     /// as its `SessionClosed` terminator, then tears it down — [`Self::
     /// release_session`]'s counterpart for the paths that reached a genuine
-    /// `Ok(DrivenRun::Outcome(RunOutcome::Terminal { .. }))` (Task 7): the
-    /// delivery is done and this `session_id` will never be redriven again,
-    /// so recording how it ended is safe.
+    /// `Ok(DrivenRun::Outcome(RunOutcome::Terminal { .. }))` (Phase 8, T19a
+    /// Task 7): the delivery is done and this `session_id` will never be
+    /// redriven again, so recording how it ended is safe.
     ///
     /// A close failure (a durable store error, or [`HeadlessSession::
     /// close_and_teardown`]'s own timeout) is already logged at error level
@@ -3042,13 +3090,55 @@ impl DeliveryExecutor {
                 let joined = self
                     .join_terminal_child(child_run_id, state, self.now())
                     .await;
-                child_session
-                    .teardown(&self.sessions, &self.resources.proxy)
-                    .await;
+                // Phase 8, T19a Task 7, fix round 1 (C1): only a join that
+                // actually succeeded gets the terminal-state mapping.
+                // `Ok(None)` (no durable `WorkflowChildCall` association —
+                // see `join_terminal_child`'s own doc comment) and `Err(_)`
+                // (a store error mid-join, e.g. `DeliveryError::ChildJoin`)
+                // both leave the PARENT's own step checkpointed `Running`
+                // with nothing recorded against it, so `release_session` is
+                // the correct, conservative choice for both — see this
+                // arm's own reachability note below.
+                //
+                // # Reachability: does a later boot re-enter this arm for the SAME child?
+                //
+                // No. `create_child_run` (`SqliteWorkflowHost`, via
+                // `roundhouse_flow::exec::run_loop::Loop::dispatch_call`)
+                // commits the child's own `WorkflowRun` row, its
+                // `SessionCreated` event, and the parent step's own
+                // `StepRunState::Running` checkpoint together, atomically,
+                // before this arm ever runs — so by the time a boot-time
+                // redrive of the PARENT reaches this same `Call` step again,
+                // that step is already checkpointed `Running`, not
+                // undecided. `dispatch_call` always mints a brand-new
+                // `RunId`/session on any FRESH dispatch, and it has no
+                // "resume this existing child" path — so whatever a redrive
+                // does with a `Running`-checkpointed `Call` step (§8.10's
+                // `crash_policy`: re-decide it fresh, minting a new child, or
+                // refuse the step as a crash failure) never touches THIS
+                // `child_session_id` again either way. A child whose join
+                // failed is therefore abandoned, not redriven — release
+                // it with no terminator anyway, since (a) it costs nothing
+                // (the session is torn down regardless) and (b) no future
+                // caller other than the boot-time paths just ruled out is
+                // known to still need this exact `session_id` open.
                 match joined {
-                    Ok(Some((_, joined))) => joined,
-                    Ok(None) => return ItemOutcome::ChildParked,
-                    Err(_) => return park_child_after_failure(ChildDispatchFailure::Driver),
+                    Ok(Some((_, joined))) => {
+                        self.close_and_retire(
+                            Some(child_session),
+                            session_outcome_for_terminal(state),
+                        )
+                        .await;
+                        joined
+                    }
+                    Ok(None) => {
+                        self.release_session(Some(child_session)).await;
+                        return ItemOutcome::ChildParked;
+                    }
+                    Err(_) => {
+                        self.release_session(Some(child_session)).await;
+                        return park_child_after_failure(ChildDispatchFailure::Driver);
+                    }
                 }
             }
         };
@@ -3183,13 +3273,23 @@ impl DeliveryExecutor {
         // later timing out or erroring still genuinely tainted its parent.
         apply_taint_boundary_merge(parent_actor, &child_actor);
 
-        // Task 7: `retire_child` durably closes the child with whichever
-        // outcome it is handed, so that outcome has to say what actually
-        // happened rather than the placeholder `Cancelled` every path used
-        // to pass unconditionally — a run loop that genuinely succeeded was
-        // being recorded as cancelled in an append-only log. Computed from a
-        // borrow of `outcome` so the value itself is still intact for the
-        // `match outcome` below, which builds this step's `WorkDone`.
+        // Phase 8, T19a Task 7: `retire_child` durably closes the child with
+        // whichever outcome it is handed, so that outcome has to say what
+        // actually happened rather than the placeholder `Cancelled` every
+        // path used to pass unconditionally — a run loop that genuinely
+        // succeeded was being recorded as cancelled in an append-only log.
+        // Computed from a borrow of `outcome` so the value itself is still
+        // intact for the `match outcome` below, which builds this step's
+        // `WorkDone`.
+        //
+        // Fix round 1 (M9): `Ok(Ok(_)) => Completed` also covers a loop that
+        // itself succeeded while the STEP outcome built from its blocks
+        // failed (a declared `output_schema` the transcript did not satisfy,
+        // or a failed `record_workflow_task_completed` append, both handled
+        // below by the `match outcome` this borrow leaves intact) — that is
+        // the right reading, not a bug: this outcome describes the SESSION
+        // (did `run_agent_loop` itself finish without erroring?), not the
+        // step's own separate pass/fail.
         let child_session_outcome = match &outcome {
             Ok(Ok(_)) => SessionOutcome::Completed,
             Ok(Err(loop_err)) => SessionOutcome::Failed {
@@ -3854,7 +3954,7 @@ fn conclusion_for(
 /// Terminal`, or `None` for every other shape (`Err`, `Parked`,
 /// `AwaitingWork`, `ChildParked`).
 ///
-/// Task 7: this is the exact boundary between [`DeliveryExecutor::
+/// Phase 8, T19a Task 7: this is the exact boundary between [`DeliveryExecutor::
 /// close_and_retire`] and [`DeliveryExecutor::release_session`] —
 /// `conclusion_for`'s [`RunConclusion::Failed`] arm alone cannot tell them
 /// apart, since it also collapses a driver `Err` (which never reached any
@@ -3870,11 +3970,11 @@ fn terminal_run_state(
 }
 
 /// Maps a genuinely reached terminal `RunState` onto the `SessionOutcome`
-/// its session's `SessionClosed` terminator records (Task 7's mapping):
-/// `Completed` to `Completed`, `Cancelled` to `Cancelled`, and anything else
-/// (in practice only `Failed`, `RunState`'s one other terminal variant) to
-/// `Failed` carrying the state's own wire name — never a free-text sentence,
-/// since [`RunState::wire_name`] already names it.
+/// its session's `SessionClosed` terminator records (Phase 8, T19a Task 7's
+/// mapping): `Completed` to `Completed`, `Cancelled` to `Cancelled`, and
+/// anything else (in practice only `Failed`, `RunState`'s one other
+/// terminal variant) to `Failed` carrying the state's own wire name — never
+/// a free-text sentence, since [`RunState::wire_name`] already names it.
 fn session_outcome_for_terminal(state: RunState) -> SessionOutcome {
     match state {
         RunState::Completed => SessionOutcome::Completed,
@@ -6868,6 +6968,17 @@ mod child_run_tests {
             roundhouse_flow::durability::StepRunState::Completed,
             "the parent call receives the terminal child's result"
         );
+        // Phase 8, T19a Task 7, fix round 1 (C1): a `call:` child whose join
+        // back to its parent genuinely succeeded must close with the same
+        // terminal-state mapping every other terminal path uses, not just
+        // be torn down in memory.
+        match harness.session_close_outcome(child_session_id).await {
+            Some(SessionOutcome::Completed) => {}
+            other => panic!(
+                "a call: child that finished and joined successfully must close its session \
+                 Completed, got {other:?}"
+            ),
+        }
 
         let conn = harness.store.pool.get().await.unwrap();
         let (parent_task_kinds, child_task_kinds) = conn
@@ -6913,6 +7024,139 @@ mod child_run_tests {
             1,
             "the real read task must be filed under the child session"
         );
+    }
+
+    /// Phase 8, T19a Task 7, fix round 1 (C1): a `call:` child whose OWN run
+    /// genuinely reaches a terminal `RunState`, but whose JOIN back to the
+    /// parent's log fails (a store error inside `join_terminal_child`), must
+    /// get NO `SessionClosed` terminator — `release_session`, not
+    /// `close_and_retire`.
+    ///
+    /// The forced failure uses the same real-trigger technique
+    /// `a_driver_failure_during_same_process_continuation_keeps_the_parent_for_retry`
+    /// already established: a `BEFORE UPDATE` trigger on the exact row
+    /// `join_terminal_child` needs to write, installed before the delivery
+    /// ever runs, so the abort is deterministic rather than a race.
+    ///
+    /// The second half proves the store's own tail guard was never
+    /// tripped by the failed attempt: rehydrating the SAME `child_session_id`
+    /// and calling `close_and_retire` on it directly (there being no
+    /// production path that redrives this exact child — see
+    /// `execute_pending_with_context`'s `PendingKind::ChildRun` arm for why)
+    /// still succeeds and writes a real terminator.
+    #[tokio::test]
+    async fn a_child_whose_join_fails_gets_no_terminator_and_can_still_be_closed_later() {
+        let harness = harness_with_overlap_and_rules(
+            parent_calling_child_workflow(),
+            OverlapPolicy::Skip,
+            allow_read_rules(),
+        )
+        .await;
+        std::fs::write(harness.workspace_root.join("greeting.txt"), "hello child").unwrap();
+        let child_source = harness.workspace_root.join("child.yaml");
+        std::fs::write(&child_source, child_reading_workflow()).unwrap();
+        let root = harness.workspace_root.clone();
+        let conn = harness.store.pool.get().await.unwrap();
+        conn.interact(move |connection| {
+            register_workflow_file(connection, &root, &child_source, template()).unwrap();
+            connection
+                .execute_batch(
+                    "CREATE TRIGGER reject_child_call_join
+                     BEFORE UPDATE ON workflow_child_call
+                     BEGIN SELECT RAISE(ABORT, 'forced child call join failure'); END;",
+                )
+                .unwrap();
+        })
+        .await
+        .unwrap();
+
+        harness
+            .executor
+            .claim_and_run(harness.delivery.clone(), harness.stored.clone())
+            .await;
+
+        let row = harness.delivery_row().await;
+        assert_eq!(
+            row.state,
+            DeliveryState::Running,
+            "a join failure must park the delivery exactly like any other ChildParked \
+             outcome, not fail it outright"
+        );
+        let parent_run_id = RunId::from_uuid(
+            Uuid::parse_str(row.run_id.as_deref().expect("reserve stamps a run id")).unwrap(),
+        );
+        let conn = harness.store.pool.get().await.unwrap();
+        let (child_run_id, child_session_id) = conn
+            .interact(move |connection| {
+                let (child_run_id, child_session_id): (String, String) = connection
+                    .query_row(
+                        "SELECT id, session_id FROM workflow_run WHERE parent_run_id = ?1",
+                        [parent_run_id.to_string()],
+                        |row| Ok((row.get(0)?, row.get(1)?)),
+                    )
+                    .unwrap();
+                (
+                    RunId::from_uuid(Uuid::parse_str(&child_run_id).unwrap()),
+                    SessionId::from_uuid(Uuid::parse_str(&child_session_id).unwrap()),
+                )
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            harness.run_state(child_run_id).await,
+            RunState::Completed,
+            "the child itself must have genuinely finished — only its JOIN back failed"
+        );
+        assert!(
+            harness.sessions.actor(child_session_id).is_none(),
+            "a failed join must still tear the child's session down"
+        );
+        assert!(
+            harness
+                .session_close_outcome(child_session_id)
+                .await
+                .is_none(),
+            "a child whose join failed must get no SessionClosed terminator"
+        );
+
+        // The direct proof: a session `release_session` tore down but never
+        // closed can still be closed for real afterward — the store's own
+        // tail guard was never tripped.
+        let workspace = harness
+            .resources
+            .workspace_registry
+            .as_ref()
+            .unwrap()
+            .resolve_by_id(harness.stored.workspace)
+            .unwrap();
+        let rehydrated = create_headless_session(
+            &harness.resources,
+            &harness.sessions,
+            child_session_id,
+            SessionSpec {
+                workspace: harness.stored.workspace,
+                name: Some(workspace.name.clone()),
+                requested_tier: Tier::Sandbox,
+                on_degrade: OnDegrade::Refuse,
+                parent: None,
+            },
+            workspace.root.clone(),
+            workspace.root_device,
+            workspace.root_inode,
+        )
+        .await
+        .unwrap();
+        harness
+            .executor
+            .close_and_retire(Some(rehydrated), SessionOutcome::Completed)
+            .await;
+        match harness.session_close_outcome(child_session_id).await {
+            Some(SessionOutcome::Completed) => {}
+            other => panic!(
+                "a later close of the same child session_id must still succeed — the earlier \
+                 release_session must not have tripped the store's tail guard, got {other:?}"
+            ),
+        }
     }
 
     /// A completed child is a call result, not merely a terminal row: the
@@ -7604,7 +7848,7 @@ mod child_run_tests {
             "the spawned child's fan-out slot must be released once it is driven to completion"
         );
 
-        // Task 7: `retire_child`'s own terminator must reflect the child's
+        // Phase 8, T19a Task 7: `retire_child`'s own terminator must reflect the child's
         // real outcome — `run_agent_loop` genuinely succeeded here.
         let child_session_id = harness.only_other_session_id(session_id).await;
         match harness.session_close_outcome(child_session_id).await {
@@ -7724,7 +7968,7 @@ mod child_run_tests {
             "a driving FAILURE must still release the spawned child's fan-out slot, not just success"
         );
 
-        // Task 7: a run loop error is `SessionOutcome::Failed`, naming what
+        // Phase 8, T19a Task 7: a run loop error is `SessionOutcome::Failed`, naming what
         // happened — not the placeholder `Cancelled` `retire_child` used to
         // be handed unconditionally.
         let parent_session_id = row.session_id.expect("reserve stamps a session id");
@@ -7792,7 +8036,7 @@ mod child_run_tests {
         }
     }
 
-    /// Task 7's full `drive_workflow_agent_child` mapping, exercised by
+    /// Phase 8, T19a Task 7's full `drive_workflow_agent_child` mapping, exercised by
     /// calling it directly rather than through a whole driven workflow —
     /// `dispatch_agent_for_workflow` alone is enough to build a real,
     /// registered child, and this method's own outer `tokio::time::timeout`
@@ -7869,11 +8113,12 @@ mod child_run_tests {
         }
     }
 
-    /// The fourth arm of Task 7's mapping: a child whose own `SessionRegistry`
-    /// entry is gone by the time this method tries to drive it (evicted by
-    /// something else, while `SubAgentSessions` still tracks it as a live
-    /// child pending drive) still gets a durable terminator — `Cancelled`,
-    /// since nothing here ever learns how it actually ended.
+    /// The fourth arm of Phase 8, T19a Task 7's mapping: a child whose own
+    /// `SessionRegistry` entry is gone by the time this method tries to
+    /// drive it (evicted by something else, while `SubAgentSessions` still
+    /// tracks it as a live child pending drive) still gets a durable
+    /// terminator — `Cancelled`, since nothing here ever learns how it
+    /// actually ended.
     #[tokio::test]
     async fn drive_workflow_agent_child_maps_a_vanished_child_to_a_cancelled_terminator() {
         let harness = harness_with_overlap_and_rules_and_provider(
@@ -9359,6 +9604,32 @@ mod child_run_tests {
             RunState::Running,
             "this driver must not fake a terminal transition on the run row — P112's \
              exactly-one-report invariant belongs to finish_run"
+        );
+    }
+
+    /// Phase 8, T19a Task 7, fix round 1 (I3): a NON-vacuous proof that
+    /// `release_session` itself writes no terminator. Every `release_session`
+    /// call site `delivery_tests` pins hands it a session that was never
+    /// constructed in the first place (`session: None`, a no-op regardless
+    /// of which of `release_session`/`close_and_retire` it calls) — so none
+    /// of those tests can actually tell the two apart. This calls
+    /// `release_session` directly against a REAL, registered session.
+    #[tokio::test]
+    async fn release_session_writes_no_terminator_for_a_real_session() {
+        let harness = harness(completing_workflow()).await;
+        let (session, _spec) = harness.headless_parent(&harness.sessions).await;
+        let session_id = session.session_id();
+
+        harness.executor.release_session(Some(session)).await;
+
+        assert!(
+            harness.sessions.actor(session_id).is_none(),
+            "release_session must still tear a real session down"
+        );
+        assert!(
+            harness.session_close_outcome(session_id).await.is_none(),
+            "release_session must write no SessionClosed terminator for a real session, \
+             unlike close_and_retire"
         );
     }
 

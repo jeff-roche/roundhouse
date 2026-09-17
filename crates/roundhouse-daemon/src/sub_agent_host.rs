@@ -287,8 +287,8 @@ impl SubAgentSessions {
     /// drive_workflow_agent_child`, which retires a workflow `agent:` step's
     /// child on every path driving it can finish — success, loop error,
     /// timeout, or a vanished session — mapping which one onto the
-    /// terminator's own outcome (Task 7) rather than passing the same value
-    /// unconditionally; `DaemonSubAgentHost::
+    /// terminator's own outcome (Phase 8, T19a Task 7) rather than passing
+    /// the same value unconditionally; `DaemonSubAgentHost::
     /// close_children`, which retires a closing session's own tracked
     /// children as one step of that session's own close; and
     /// `spawn_session_reaper`'s `RetireSubAgent` reap action, for a tracked
