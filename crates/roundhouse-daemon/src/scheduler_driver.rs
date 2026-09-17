@@ -9960,3 +9960,6 @@ mod child_run_tests {
 
 #[cfg(test)]
 mod delivery_tests;
+
+#[cfg(test)]
+mod pr_review_e2e_tests;

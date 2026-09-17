@@ -284,6 +284,34 @@ pub(crate) mod test_support {
         .await
     }
 
+    /// [`daemon_resources_with_rules_and_provider`] and
+    /// [`daemon_resources_with_real_bwrap`] at once — the one fixture that
+    /// needs *both* a provider that can answer for real and an isolate that
+    /// can spawn for real.
+    ///
+    /// That combination is not a convenience: `scheduler_driver`'s
+    /// `pr_review_e2e_tests` drives a `map` whose items nest an `agent:`
+    /// step (which reaches `Provider::stream_chat`, so `NoopProvider`
+    /// panics) *and* a `tool: shell` step (which reaches a real
+    /// `bwrap` exec, so the production-install-path isolate fails closed).
+    /// Neither existing four-argument fixture can serve a workflow that
+    /// does both in one run.
+    pub(crate) async fn daemon_resources_with_rules_and_provider_and_real_bwrap(
+        dir: &std::path::Path,
+        workspace_registry: Option<Arc<crate::workspace_registry::WorkspaceRegistry>>,
+        policy_rules: crate::session_bootstrap::PolicyRuleSource,
+        provider: Arc<dyn roundhouse_provider::Provider>,
+    ) -> crate::session_bootstrap::DaemonResources {
+        daemon_resources_with_rules_and_isolate(
+            dir,
+            workspace_registry,
+            policy_rules,
+            available_isolate_with_real_bwrap(),
+            provider,
+        )
+        .await
+    }
+
     /// [`daemon_resources_with_rules`], but with a real, genuinely-spawning
     /// `bwrap` ([`available_isolate_with_real_bwrap`]) instead of the
     /// production-install-path isolate that cannot spawn anything in a dev
