@@ -8,6 +8,7 @@
 //! frames rather than a daemon-pre-summarized shape.
 
 use std::path::Path;
+use std::time::Duration;
 
 use roundhouse_core::{EventPayload, SessionId};
 use roundhouse_proto::{ClientEvent, ClientRequest};
@@ -38,6 +39,21 @@ use crate::protocol::TuiError;
 /// `workspace_name`), while still bounding the worst case to a fixed
 /// multiple of this client's own buffering.
 const MAX_FRAME_BYTES: usize = 1024 * 1024;
+
+/// Bounds [`DaemonClient::close_session`]'s wait for the `Ack`. Every
+/// refusal path `roundhouse_daemon::socket_server::
+/// drive_established_session` designs for `CloseSession` (wrong connection,
+/// wrong session, a close already in flight, the session no longer being
+/// live, or a failed durable append) is deliberately silent on the wire —
+/// no frame at all, connection kept open, retryable — so without a bound
+/// here, a well-formed `CloseSession` sent from a connection that can never
+/// have it honored (e.g. one built via `connect_attach`, not
+/// `connect_create`) hangs this call forever. Chosen with margin over the
+/// daemon's own close budget (`roundhouse_daemon::socket_server::
+/// CLOSE_SESSION_TIMEOUT`, 30s — not reusable directly, since this crate
+/// does not depend on `roundhouse-daemon`) so a close that is genuinely
+/// progressing, just slowly, is not mistaken for a silently refused one.
+const CLOSE_SESSION_ACK_TIMEOUT: Duration = Duration::from_secs(40);
 
 /// What `connect` should announce itself as on a fresh handshake: mint a new
 /// session, or attach to one that already exists.
@@ -228,16 +244,35 @@ impl DaemonClient {
     /// then waits for the daemon's `Ack` confirming the durable close,
     /// skipping any other frame that arrives first — the same "wait for the
     /// specific reply, not just any frame" shape [`connect_attach`] already
-    /// uses for its own `Ack`.
+    /// uses for its own `Ack`. `Some(_) => continue` below discards every
+    /// non-`Ack` frame while waiting, which will matter once a parallel lane
+    /// starts publishing real deltas over this same connection — a task
+    /// delta arriving while a close is in flight is silently dropped by
+    /// this call, not buffered for a later `recv`.
+    ///
+    /// # No wire NAK exists
+    ///
+    /// A refusal on the daemon side (see `# Errors` below) produces no frame
+    /// at all — a distinct wire-level NAK variant would be the durable fix,
+    /// but adding one is a frozen-contract (`roundhouse-proto`) change
+    /// outside this lane's scope, so this call can only ever distinguish
+    /// "the daemon is silently refusing this" from "the close is genuinely
+    /// still in progress" by timing out, not by reading an explicit answer.
     ///
     /// # Errors
-    /// Returns whatever [`Self::send`]/[`Self::recv`] returns. Also returns
-    /// `TuiError::Io` if the daemon closes the connection without ever
-    /// sending an `Ack` — see `roundhouse_daemon::socket_server::
-    /// drive_established_session`'s `CloseSession` handling: a refusal
-    /// (wrong connection, wrong session, a close already in flight, or the
-    /// session no longer being live) never sends an `Ack` and leaves the
-    /// connection open, and a failed durable append never sends one either.
+    /// Returns whatever [`Self::send`]/[`Self::recv`] returns. Returns
+    /// `TuiError::Io` (`ErrorKind::UnexpectedEof`) if the daemon closes the
+    /// connection without ever sending an `Ack`. Returns `TuiError::Io`
+    /// (`ErrorKind::TimedOut`) if no `Ack` arrives within
+    /// [`CLOSE_SESSION_ACK_TIMEOUT`] — the case that actually matters in
+    /// practice: every refusal `roundhouse_daemon::socket_server::
+    /// drive_established_session` designs for `CloseSession` (wrong
+    /// connection — e.g. this client having been built via
+    /// [`connect_attach`] rather than [`connect_create`] — wrong session, a
+    /// close already in flight, the session no longer being live, or a
+    /// failed durable append) sends **no frame at all** and leaves the
+    /// connection open, so a refusal is observed here as a timeout, never as
+    /// a distinct error naming the reason.
     ///
     /// # Panics
     /// Panics under the same condition [`Self::session_id`] does: this
@@ -246,17 +281,30 @@ impl DaemonClient {
         let session_id = self.session_id();
         self.send(&ClientRequest::CloseSession { session_id })
             .await?;
-        loop {
-            match self.recv().await? {
-                Some(ClientEvent::Ack { .. }) => return Ok(()),
-                Some(_) => continue,
-                None => {
-                    return Err(TuiError::Io(std::io::Error::new(
-                        std::io::ErrorKind::UnexpectedEof,
-                        "daemon closed the connection instead of acknowledging CloseSession",
-                    )));
+        let wait = async {
+            loop {
+                match self.recv().await? {
+                    Some(ClientEvent::Ack { .. }) => return Ok(()),
+                    Some(_) => continue,
+                    None => {
+                        return Err(TuiError::Io(std::io::Error::new(
+                            std::io::ErrorKind::UnexpectedEof,
+                            "daemon closed the connection instead of acknowledging CloseSession",
+                        )));
+                    }
                 }
             }
+        };
+        match tokio::time::timeout(CLOSE_SESSION_ACK_TIMEOUT, wait).await {
+            Ok(result) => result,
+            Err(_elapsed) => Err(TuiError::Io(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                format!(
+                    "no Ack for CloseSession within {CLOSE_SESSION_ACK_TIMEOUT:?}; the daemon \
+                     may be silently refusing it (wrong connection, wrong session, or the \
+                     session is no longer live)"
+                ),
+            ))),
         }
     }
 

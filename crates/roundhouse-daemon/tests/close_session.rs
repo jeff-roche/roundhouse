@@ -25,17 +25,18 @@ use roundhouse_proto::{ApiVersion, ClientEvent, ClientRequest};
 use roundhouse_store::test_util::{spawn_gated_writer, CloseGate};
 use tokio::sync::mpsc;
 
-/// How long a test waits for a reply that a correct implementation sends
-/// promptly (an in-memory actor close against a tiny sqlite file, with
-/// nothing genuinely in flight, completes in well under a millisecond) —
-/// generous for CI load, small enough to keep a genuine regression's
-/// failure fast rather than hanging the suite.
-const REFUSAL_WAIT: Duration = Duration::from_millis(300);
-
 /// **Ruling W1-R37, applied to `CloseSession`.** An attached (non-creating)
 /// connection is read-only, exactly as it already is for `SubmitTurn`: its
 /// `CloseSession` must be refused — no `Ack`, and the session itself must be
 /// left completely undisturbed.
+///
+/// Deterministic, no wall clock: rather than waiting out a fixed window and
+/// asserting nothing arrived, this drops `requests_tx` after sending the
+/// refused request and awaits the driver's own `JoinHandle`. `mpsc`
+/// preserves send order, so the loop cannot observe this drop
+/// (`requests_rx.recv()` returning `None`, ending the loop) until AFTER it
+/// has already handled the `CloseSession` send strictly before it — there
+/// is no window in which the assertion below could run too early.
 #[tokio::test]
 async fn an_attached_connections_close_session_is_refused() {
     let dir = tempfile::tempdir().unwrap();
@@ -49,7 +50,7 @@ async fn an_attached_connections_close_session_is_refused() {
     let (requests_tx, requests_rx) = mpsc::channel::<ClientRequest>(8);
     let (events_tx, mut events_rx) = mpsc::channel::<ClientEvent>(8);
 
-    tokio::spawn(drive_established_session(
+    let driver = tokio::spawn(drive_established_session(
         session_id,
         subscription,
         session_events,
@@ -64,10 +65,14 @@ async fn an_attached_connections_close_session_is_refused() {
         .send(ClientRequest::CloseSession { session_id })
         .await
         .unwrap();
+    drop(requests_tx);
+    driver
+        .await
+        .expect("drive_established_session must not panic");
 
-    let reply = tokio::time::timeout(REFUSAL_WAIT, events_rx.recv()).await;
+    let reply = events_rx.recv().await;
     assert!(
-        reply.is_err(),
+        reply.is_none(),
         "an attached connection's CloseSession must never be acknowledged, got {reply:?}"
     );
     assert_eq!(
@@ -80,6 +85,10 @@ async fn an_attached_connections_close_session_is_refused() {
 /// A `CloseSession` naming a session other than the one this connection
 /// established must be refused — the same "wrong session" guard
 /// `SubmitTurn` already enforces — even from the creating connection.
+///
+/// Deterministic, no wall clock — see the sibling test above for why
+/// dropping `requests_tx` and awaiting the driver's `JoinHandle` is a
+/// complete, race-free proof rather than a best-effort one.
 #[tokio::test]
 async fn a_close_naming_a_different_session_is_refused() {
     let dir = tempfile::tempdir().unwrap();
@@ -93,7 +102,7 @@ async fn a_close_naming_a_different_session_is_refused() {
     let (requests_tx, requests_rx) = mpsc::channel::<ClientRequest>(8);
     let (events_tx, mut events_rx) = mpsc::channel::<ClientEvent>(8);
 
-    tokio::spawn(drive_established_session(
+    let driver = tokio::spawn(drive_established_session(
         session_id,
         subscription,
         session_events,
@@ -111,10 +120,14 @@ async fn a_close_naming_a_different_session_is_refused() {
         })
         .await
         .unwrap();
+    drop(requests_tx);
+    driver
+        .await
+        .expect("drive_established_session must not panic");
 
-    let reply = tokio::time::timeout(REFUSAL_WAIT, events_rx.recv()).await;
+    let reply = events_rx.recv().await;
     assert!(
-        reply.is_err(),
+        reply.is_none(),
         "a CloseSession naming a session other than the one this connection established must \
          never be acknowledged, got {reply:?}"
     );
@@ -192,6 +205,20 @@ async fn the_ack_arrives_only_after_the_durable_close_append() {
     assert!(
         events_rx.recv().now_or_never().is_none(),
         "no Ack may arrive before the durable SessionClosed append completes"
+    );
+
+    // The store side of the same claim, checked while the gate is still
+    // held: no `SessionClosed` terminator exists yet either.
+    let query_store = roundhouse_store::open(&db_path).await.unwrap();
+    let events_while_held = roundhouse_store::session_events(&query_store, session_id)
+        .await
+        .unwrap();
+    assert!(
+        !events_while_held
+            .iter()
+            .any(|e| matches!(e.payload, EventPayload::SessionClosed { .. })),
+        "no SessionClosed terminator may exist while the durable append is still gated: \
+         {events_while_held:?}"
     );
 
     gate.release().await;

@@ -120,6 +120,33 @@ const SUBMIT_TURN_MODEL: &str = "claude-sonnet-5";
 const SUBMIT_TURN_SYSTEM_PROMPT: &str =
     "You are Roundhouse, a careful coding agent. Use the provided tools when they help.";
 
+/// Bounds one `CloseSession` request's spawned `SessionActor::close` call
+/// (Phase 8, T19a Task 8, fix round 1) — the first client-triggered caller
+/// of that method. `SessionActor::close`'s own doc comment is explicit that
+/// its `wait_idle` step has no timeout of its own and that "a caller that
+/// needs a bound on how long it will wait must apply its own
+/// `tokio::time::timeout` around the whole `close` call." Without this, one
+/// `WorkGuard` that outlives cancellation (an uninterruptible tool
+/// subprocess, or a future guard leak) means `wait_idle` never resolves:
+/// `close_task` (see `drive_established_session`) latches `Some` forever, no
+/// Ack is ever sent, the loop never breaks, the actor never reaches
+/// `Closed`, and `spawn_session_reaper` never fires — the isolate, MCP
+/// children, registry entry, and proxy token are retained for the daemon's
+/// whole remaining life with no route left to reclaim them.
+///
+/// A distinct constant from `session_manager`'s own `SESSION_CLOSE_TIMEOUT`
+/// (private to that module, so not reusable here directly) rather than a
+/// shared one: chosen at the identical value and for the identical
+/// reasoning — long enough that a legitimate in-flight shell or provider
+/// call's own cancellation sequence has room to unwind normally, short
+/// enough that a genuinely wedged close does not leave this connection
+/// hanging indefinitely. Unlike `HeadlessSession::close_and_teardown`, an
+/// elapsed timeout here does **not** force a teardown: it only reports the
+/// close as failed (see the spawn site below), so `close_task` resets to
+/// `None` and this connection's client can retry, or simply keep the
+/// session running.
+const CLOSE_SESSION_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// Default ceiling on concurrent accepted connections one `accept_loop` will
 /// serve at once (security review Important 3 / ruling W1-R33). Bounds the
 /// worst-case fd and per-connection memory (two 64-slot channels, one task)
@@ -944,59 +971,19 @@ async fn handle_connection(
 
 /// Reads this connection's first `ClientRequest` to decide whether it is
 /// creating a new session or attaching to an existing one (§7's handshake),
-/// registers it with `registry` accordingly, then forwards every event the
-/// session produces down `events_tx` — which [`serve_connection`] is, at the
-/// same time, draining and writing to the socket — until either side ends.
+/// registers it with `registry` accordingly, then hands off to
+/// [`drive_established_session`] for everything after — forwarding this
+/// session's events out to `events_tx` and routing `requests_rx` — until
+/// either side ends.
 ///
-/// # No branch body ever blocks on `events_tx` (rulings W1-R31/W1-R32/W1-R38)
-///
-/// **This carry-forward corrects an earlier version of this very doc
-/// comment.** That version claimed: "this function's `select!` loop ...
-/// always has an outstanding `requests_rx.recv()` in flight, so
-/// `serve_connection`'s `requests_out.send(..).await` can never find that
-/// channel permanently full." That claim is false, and it is exactly the
-/// mechanism a security-lens review round independently asserted (as CF-4
-/// being closed) and this lane's adjudication (ruling W1-R31) rejected after
-/// reading the source directly: the loop's first arm sent a received session
-/// event via `events_tx.send(event).await` **inside that arm's branch
-/// body**. Once `tokio::select!` commits to a branch, the body is no longer
-/// racing the other arm — a task parked in that `.await` is *not* polling
-/// `requests_rx.recv()` at all, "outstanding" or not, for as long as the
-/// send is pending. Paired with `serve_connection` blocking symmetrically on
-/// `requests_out.send(..)` inside its own read-arm body, the two form a
-/// circular wait — both parked forever, inside one `tokio::join!`
-/// ([`handle_connection`]), 64 slots deep on each side: this function stops
-/// draining `requests_rx` (which `serve_connection` needs to send into), and
-/// `serve_connection` stops draining `events_in` (which this function needs
-/// to send into). The connection wedges permanently and never observes peer
-/// EOF — and the sharp registry-level consequence is that this
-/// subscription's `detach` (below) never runs, while `publish` sees the
-/// subscriber channel as `Full`, not `Closed`, so it is never pruned either:
-/// a zombie registry entry that `attach` keeps succeeding against.
-///
-/// The fix (mirroring [`serve_connection`]'s own, symmetric fix) holds a
-/// received session event in a `pending_event: Option<..>` slot and only
-/// *reserves* `events_tx` capacity — `reserve()`, cancel-safe, awaited as
-/// its own `select!` **arm**, gated by `if pending_event.is_some()` — rather
-/// than blocking on `send()` in a body. `requests_rx.recv()` stays a live,
-/// unconditional arm the entire time, so `serve_connection`'s
-/// `requests_out.send(..)` (a `reserve()`+permit pair, post-fix) can always
-/// make progress. The naive alternative — reserve, then `.await`
-/// `session_events.recv()` inside that same arm's body — merely relocates
-/// the bug: it starves `requests_rx` draining the moment the session goes
-/// idle with `events_tx` capacity available, since the permit is grabbed
-/// speculatively before there is anything to send (see this crate's
-/// `drive_session_keeps_draining_requests_while_the_session_is_idle` test).
-///
-/// **This is a property of the loop's shape, not a one-time patch**
-/// (ruling W1-R38). Everything received past the handshake is *currently*
-/// discarded (see the `Some(_request)` arm below) — a placeholder, since
-/// Task 5/7's real `SessionActor` is the eventual consumer. That no-op is
-/// exactly why nothing in this loop's body can block indefinitely *today*.
-/// The invariant that must survive whoever replaces it: no `select!` branch
-/// body in this loop may await anything that can block indefinitely — hand
-/// the work to a spawned task, or reserve capacity as a `select!` arm the
-/// way this function now does for `events_tx`.
+/// The "no branch body ever blocks on `events_tx`" invariant this function's
+/// own doc comment used to carry in full now lives on
+/// [`drive_established_session`], which is where that loop actually runs —
+/// see that function's own doc comment for the full mechanism and why it
+/// matters. This function's own body, below, needs no such invariant of its
+/// own: its one send, `events_tx.send(created).await`, runs exactly once,
+/// before any loop, and its failure path simply ends this function rather
+/// than racing anything.
 ///
 /// # Handshake framing (ruling W1-R6)
 ///
@@ -1376,6 +1363,60 @@ pub async fn drive_session(
 /// `CloseSession` handlers, once the handshake above has already decided
 /// `session_id`/`is_creator` — until either side ends, then detaches.
 ///
+/// # No branch body ever blocks on `events_tx` (rulings W1-R31/W1-R32/W1-R38)
+///
+/// **This carry-forward corrects an earlier version of this doc comment,
+/// written when this loop still lived directly inside `drive_session`
+/// itself, and moved here since that is where the loop now actually
+/// runs.** That version claimed: "this
+/// function's `select!` loop ... always has an outstanding
+/// `requests_rx.recv()` in flight, so `serve_connection`'s
+/// `requests_out.send(..).await` can never find that channel permanently
+/// full." That claim is false, and it is exactly the mechanism a
+/// security-lens review round independently asserted (as CF-4 being closed)
+/// and this lane's adjudication (ruling W1-R31) rejected after reading the
+/// source directly: the loop's first arm sent a received session event via
+/// `events_tx.send(event).await` **inside that arm's branch body**. Once
+/// `tokio::select!` commits to a branch, the body is no longer racing the
+/// other arm — a task parked in that `.await` is *not* polling
+/// `requests_rx.recv()` at all, "outstanding" or not, for as long as the
+/// send is pending. Paired with `serve_connection` blocking symmetrically on
+/// `requests_out.send(..)` inside its own read-arm body, the two form a
+/// circular wait — both parked forever, inside one `tokio::join!`
+/// ([`handle_connection`]), 64 slots deep on each side: this function stops
+/// draining `requests_rx` (which `serve_connection` needs to send into), and
+/// `serve_connection` stops draining `events_in` (which this function needs
+/// to send into). The connection wedges permanently and never observes peer
+/// EOF — and the sharp registry-level consequence is that this
+/// subscription's `detach` (below) never runs, while `publish` sees the
+/// subscriber channel as `Full`, not `Closed`, so it is never pruned either:
+/// a zombie registry entry that `attach` keeps succeeding against.
+///
+/// The fix (mirroring [`serve_connection`]'s own, symmetric fix) holds a
+/// received session event in a `pending_event: Option<..>` slot and only
+/// *reserves* `events_tx` capacity — `reserve()`, cancel-safe, awaited as
+/// its own `select!` **arm**, gated by `if pending_event.is_some()` — rather
+/// than blocking on `send()` in a body. `requests_rx.recv()` stays a live,
+/// unconditional arm the entire time, so `serve_connection`'s
+/// `requests_out.send(..)` (a `reserve()`+permit pair, post-fix) can always
+/// make progress. The naive alternative — reserve, then `.await`
+/// `session_events.recv()` inside that same arm's body — merely relocates
+/// the bug: it starves `requests_rx` draining the moment the session goes
+/// idle with `events_tx` capacity available, since the permit is grabbed
+/// speculatively before there is anything to send (see this crate's
+/// `drive_session_keeps_draining_requests_while_the_session_is_idle` test).
+///
+/// **This is a property of the loop's shape, not a one-time patch**
+/// (ruling W1-R38). `SubmitTurn` and `CloseSession`, below, are today's two
+/// real implementations of it: each hands its own potentially-blocking work
+/// (a real `SessionActor` call) to a spawned task rather than awaiting it
+/// inline, and observes completion via its own `select!` arm
+/// (`turn_done_rx`/`close_task` respectively) rather than blocking this
+/// loop. The invariant that must survive whoever adds the next handler: no
+/// `select!` branch body in this loop may await anything that can block
+/// indefinitely — hand the work to a spawned task, or reserve capacity as a
+/// `select!` arm the way this function already does for `events_tx`.
+///
 /// Factored out of `drive_session`'s own body (Phase 8, T19a Task 8) so a
 /// test that needs a hand-built `SessionActor` (e.g. one wired to a
 /// `roundhouse_store::test_util`-gated writer, to pin down exactly when a
@@ -1385,6 +1426,12 @@ pub async fn drive_session(
 /// handshake and real session construction it does not need. `pub`, not
 /// `pub(crate)`, for the same reason `drive_session`/`serve_connection` are:
 /// this crate's integration tests are their own crate.
+///
+/// `is_creator` must only ever be `true` for a connection that genuinely
+/// completed the real `CreateSession` handshake in [`drive_session`] above —
+/// every creator-only refusal check in this loop (`SubmitTurn`'s,
+/// `CloseSession`'s) trusts it completely, so an in-crate caller besides
+/// that handshake must never pass `true` here as a convenience.
 pub async fn drive_established_session(
     session_id: roundhouse_core::SessionId,
     subscription: crate::session_registry::Subscription,
@@ -1421,13 +1468,22 @@ pub async fn drive_established_session(
     // Phase 8, T19a Task 8 — the identical shape, applied to `CloseSession`:
     // at most one close in flight per connection, run in its own spawned
     // task (never awaited inline — `SessionActor::close` awaits a real
-    // durable append), with completion observed on its own 1-slot `select!`
-    // arm. `close_ack_pending` is a second stage past that: once the
-    // spawned close reports success, the `Ack` itself still has to wait for
+    // durable append), with completion observed via this task's own
+    // `JoinHandle` rather than a completion channel: `turn_done_tx`/
+    // `turn_done_rx`'s channel only ever yields
+    // `None` once every sender drops, which never happens while this stack
+    // frame holds one — so a close task that panics or is aborted before it
+    // can `send` (e.g. a poisoned `SessionRegistry` mutex) would otherwise
+    // never wake this loop at all, latching `close_task` at `Some` forever,
+    // the same permanent-latch failure mode `CLOSE_SESSION_TIMEOUT` exists
+    // to close for a wedged (rather than panicked) close. Selecting on the
+    // `JoinHandle` itself covers both: a `Result::Err` from the join is
+    // treated as a failed close, exactly like the task returning `false`.
+    // `close_ack_pending` is a second stage past that: once the spawned
+    // close reports success, the `Ack` itself still has to wait for
     // `events_tx` capacity via the same `reserve()`-as-an-arm shape
     // `pending_event` already uses below, rather than being sent inline.
-    let (close_done_tx, mut close_done_rx) = mpsc::channel::<bool>(1);
-    let mut close_in_flight = false;
+    let mut close_task: Option<tokio::task::JoinHandle<bool>> = None;
     let mut close_ack_pending = false;
     loop {
         tokio::select! {
@@ -1438,21 +1494,66 @@ pub async fn drive_established_session(
                 // sender was dropped.
                 turn_in_flight = false;
             }
-            close_result = close_done_rx.recv(), if close_in_flight => {
-                // `close_done_tx` is held by this stack frame for the whole
-                // loop, for the identical reason `turn_done_tx` is — see
-                // that arm, just above.
-                close_in_flight = false;
-                if close_result.expect("close_done_tx held for this loop's lifetime") {
-                    close_ack_pending = true;
+            // Wrapped in a lazy `async {}` block, NOT `close_task.as_mut()
+            // .unwrap()` inlined directly as the branch expression: contrary
+            // to what might seem like the obvious reading, `tokio::select!`
+            // evaluates every branch's expression on every poll of the
+            // macro regardless of its `if` precondition — only the polling
+            // of the resulting future is skipped when the precondition is
+            // false. An inlined `.unwrap()` therefore panics on the very
+            // first iteration where `close_task` is `None` (which is every
+            // iteration outside a close), even though this arm's guard says
+            // it should never run. An `async` block defers its body,
+            // including the `unwrap()`, to poll time — which only happens
+            // once the precondition has already gated it — so constructing
+            // the block when `close_task` is `None` is inert. A `&mut
+            // JoinHandle<T>` implements `Future` (the standard library's
+            // blanket `impl<F: Future + Unpin> Future for &mut F` —
+            // `JoinHandle` is `Unpin`), so awaiting it re-polls the SAME
+            // handle across loop iterations rather than consuming it, which
+            // is what lets the `close_task = None` below run only once the
+            // task has genuinely finished.
+            close_result = async {
+                close_task.as_mut().expect(
+                    "select! arm guarded by close_task.is_some(); the async block this \
+                     runs inside is never polled otherwise"
+                ).await
+            }, if close_task.is_some() => {
+                close_task = None;
+                match close_result {
+                    Ok(true) => close_ack_pending = true,
+                    Ok(false) => {
+                        // The close failed (a durable-append error, or it hit
+                        // `CLOSE_SESSION_TIMEOUT`) — already logged, with
+                        // detail, at the spawn site below. No `Ack` is ever
+                        // sent for a failed close, and this connection stays
+                        // open: a client that wants to retry can send
+                        // another `CloseSession`.
+                    }
+                    Err(join_err) => {
+                        tracing::error!(
+                            %session_id,
+                            error = %join_err,
+                            "the spawned CloseSession task panicked or was aborted before \
+                             reporting an outcome; treating it as a failed close"
+                        );
+                    }
                 }
-                // `false` means the close failed to durably append — already
-                // logged, with detail, at the spawn site below. No `Ack` is
-                // ever sent for a failed close, and this connection stays
-                // open: a client that wants to retry can send another
-                // `CloseSession`.
             }
-            permit = events_tx.reserve(), if close_ack_pending => {
+            // `&& pending_event.is_none()`: both this arm and the
+            // ordinary-event permit arm below reserve capacity on the SAME
+            // `events_tx`, and `tokio::select!` picks pseudo-randomly among
+            // whichever arms are ready — without this guard, an event
+            // already dequeued out of `session_events` into `pending_event`
+            // could lose that race to a ready `Ack`, and the `break` below
+            // would then drop it on the floor permanently, with the client
+            // seeing the `Ack` ahead of an event it was already due. The
+            // guard only protects an event that has ALREADY been taken out
+            // of `session_events` — anything still queued inside that
+            // channel when this arm's `break` fires is not, and cannot be,
+            // covered here; that queue belongs to whatever publishes into
+            // it, not to this connection's own ordering.
+            permit = events_tx.reserve(), if close_ack_pending && pending_event.is_none() => {
                 match permit {
                     Ok(permit) => {
                         permit.send(ClientEvent::Ack { api_version: ApiVersion::CURRENT });
@@ -1503,31 +1604,28 @@ pub async fn drive_established_session(
             maybe_request = requests_rx.recv() => {
                 match maybe_request {
                     // # Rulings W1-R37/W1-R52 — attached connections are
-                    // READ-ONLY, by design, and this is the discard site
-                    // that enforces it
+                    // READ-ONLY, by design, and this arm (and
+                    // `CloseSession`'s, further below) is what enforces it
                     //
-                    // `ClientRequest` carries exactly two variants today
-                    // (`CreateSession`, `Attach` — both only valid as the
-                    // FIRST line of a connection, matched above); there is
-                    // currently no variant that names "do something inside
-                    // an already-established session" at all, so this arm
-                    // is unreachable in ordinary operation regardless of
-                    // `is_creator`, and both a creator's and an attached
-                    // connection's post-handshake frames are, today,
-                    // identically discarded below. `is_creator` is threaded
-                    // this far anyway (see the `let _ = is_creator;` inside
-                    // this arm) so the binding decision this ruling records
-                    // is visible at the exact discard site a future real
-                    // handler replaces, not left implicit: `docs/architecture/
-                    // 03-security-and-sandboxing.md:174` ("approvals
-                    // broadcast to every attached client, first responder
-                    // wins") governs what an attached client may SEE, not
-                    // what it may SEND — defaulting the latter open the
-                    // moment a real request variant exists would make
-                    // unauthenticated `Attach` an approval-hijack primitive.
-                    // Only the creating connection's future requests may
-                    // ever be honored; an attached connection's must stay
-                    // refused even once a real handler exists.
+                    // (This comment previously described a state that
+                    // predates this arm even existing — "`ClientRequest`
+                    // carries exactly two variants today," "this arm is
+                    // unreachable," a `let _ = is_creator;` that no longer
+                    // appears anywhere in this arm's body — corrected here
+                    // rather than left to mislead the next reader.)
+                    // `ClientRequest` carries four variants as of this lane
+                    // (`CreateSession`,
+                    // `Attach`, `SubmitTurn`, `CloseSession`); the first two
+                    // are handshake-only (matched above, as this
+                    // connection's FIRST frame), and `is_creator` — decided
+                    // once, there — is what every check below actually
+                    // gates: `docs/architecture/03-security-and-sandboxing.md:174`
+                    // ("approvals broadcast to every attached client, first
+                    // responder wins") governs what an attached client may
+                    // SEE, not what it may SEND, and defaulting the latter
+                    // open would make unauthenticated `Attach` an
+                    // approval-hijack primitive. Only the creating
+                    // connection's requests are ever honored.
                     //
                     // **Known, deliberate limitation (W1-R52):** once the
                     // creating connection disconnects, this session has NO
@@ -1540,26 +1638,28 @@ pub async fn drive_established_session(
                     // requests "to make attach feel complete" — doing so
                     // would silently reopen exactly what this ruling closed.
                     //
-                    // **W1-R38 — this remains a property of the loop's
-                    // shape, not a one-time patch.** The moment a real
-                    // variant exists and handling it needs to `await` a
-                    // `SessionActor` (`registry.actor(session_id)`, already
-                    // available for exactly this), that work must be handed
-                    // to a spawned task or gated behind its own `select!`
-                    // arm reserving capacity — never awaited inside this
-                    // arm's own body — for the identical reason
-                    // `events_tx`/`requests_out` already aren't: doing so
-                    // would stop this arm from polling `session_events.recv()`
-                    // for as long as the await is pending, recreating the
-                    // exact circular wait W1-R31 fixed.
-                    // Phase 7, Task 8 (ruling W1-R116): the real handler
-                    // that grew into the discard site described above.
-                    // Every refusal below is a `warn!` + a dropped frame
-                    // with the connection kept alive: `ClientRequest`/
-                    // `ClientEvent` still carry no error-response variant
-                    // (the same constraint ruling W1-R6 already accepted
-                    // for "unknown session" and a failed construction), so
-                    // there is nothing honest to send back.
+                    // **W1-R38 — a property of the loop's shape, not a
+                    // one-time patch, and both real handlers below already
+                    // hold to it.** Handling a request that needs to `await`
+                    // a `SessionActor` must hand that work to a spawned task
+                    // or gate it behind its own `select!` arm reserving
+                    // capacity — never await it inside this arm's own body —
+                    // for the identical reason `events_tx`/`requests_out`
+                    // already aren't: doing so would stop this arm from
+                    // polling `session_events.recv()` for as long as the
+                    // await is pending, recreating the exact circular wait
+                    // W1-R31 fixed. See this function's own doc comment
+                    // ("No branch body ever blocks on `events_tx`") for the
+                    // full mechanism this generalizes from.
+                    //
+                    // Phase 7, Task 8 (ruling W1-R116): `SubmitTurn`, the
+                    // first real handler here. Every refusal below is a
+                    // `warn!` + a dropped frame with the connection kept
+                    // alive: `ClientRequest`/`ClientEvent` still carry no
+                    // error-response variant (the same constraint ruling
+                    // W1-R6 already accepted for "unknown session" and a
+                    // failed construction), so there is nothing honest to
+                    // send back.
                     Some(ClientRequest::SubmitTurn { session_id: named, text }) => {
                         if !is_creator {
                             // W1-R37, enforced here rather than assumed.
@@ -1601,6 +1701,25 @@ pub async fn drive_established_session(
                                 %session_id,
                                 "refusing SubmitTurn: a turn is already in flight on this \
                                  connection"
+                            );
+                        } else if close_task.is_some() {
+                            // A `CloseSession` this connection already
+                            // spawned samples its outcome
+                            // (`Completed`/`Cancelled`) from `turn_in_flight`/
+                            // `actor.live_work()` at the moment it is
+                            // handled, below — a turn admitted AFTER that
+                            // sample would (1) burn a spawn only to be
+                            // refused inside `admit_task` once the session
+                            // starts cancelling, and (2), more importantly,
+                            // leave the terminator recording `Completed` for
+                            // a session whose work was in fact cancelled out
+                            // from under it. Refusing here, honestly, at the
+                            // boundary, is simpler and cheaper than trying to
+                            // re-open that already-durable outcome decision.
+                            tracing::warn!(
+                                %session_id,
+                                "refusing SubmitTurn: a CloseSession is already in flight on \
+                                 this connection"
                             );
                         } else {
                             match registry.actor(session_id) {
@@ -1652,8 +1771,8 @@ pub async fn drive_established_session(
                     // second one to do, and refusing it keeps this arm's
                     // own work O(1) the same way `turn_in_flight` already
                     // does for `SubmitTurn`. A client that wants to retry a
-                    // *failed* close (logged, `close_in_flight` already
-                    // reset to `false`) may send another one.
+                    // *failed* close (`close_task` already reset to `None`)
+                    // may send another one.
                     Some(ClientRequest::CloseSession { session_id: named }) => {
                         if !is_creator {
                             // W1-R37, the same read-only guard `SubmitTurn`
@@ -1670,7 +1789,7 @@ pub async fn drive_established_session(
                                 "refusing CloseSession naming a session other than the one \
                                  this connection established"
                             );
-                        } else if close_in_flight {
+                        } else if close_task.is_some() {
                             tracing::warn!(
                                 %session_id,
                                 "refusing CloseSession: a close is already in flight on this \
@@ -1696,31 +1815,59 @@ pub async fn drive_established_session(
                                     // still labeled `Cancelled` — a known,
                                     // accepted residual race, not something
                                     // this arm tries to close.
+                                    //
+                                    // The two signals diverge in the OTHER
+                                    // direction too, and that divergence is
+                                    // also accepted rather than closed:
+                                    // `live_work()` counts live `WorkGuard`s,
+                                    // while the
+                                    // store's own sweep (inside
+                                    // `SessionActor::close`) cancels every
+                                    // task sitting in `Created`/`Decided`/
+                                    // `Running`/`Suspended` regardless of
+                                    // whether a `WorkGuard` is currently held
+                                    // for it — so a session with such an open
+                                    // task but no live guard at THIS exact
+                                    // instant is recorded `Completed` even
+                                    // though that task is about to be swept
+                                    // to `TaskCancelled`.
                                     let outcome = if turn_in_flight || actor.live_work() > 0 {
                                         roundhouse_core::SessionOutcome::Cancelled
                                     } else {
                                         roundhouse_core::SessionOutcome::Completed
                                     };
-                                    close_in_flight = true;
-                                    let done = close_done_tx.clone();
-                                    tokio::spawn(async move {
+                                    close_task = Some(tokio::spawn(async move {
                                         // **W1-R38**, the same shape
                                         // `run_submitted_turn` already uses
                                         // for `SubmitTurn`: `SessionActor::
                                         // close` awaits a real durable
                                         // append, so it must never run
                                         // inline in this arm's own body —
-                                        // see `close_done_tx`'s declaration.
-                                        let ok = match actor.close(outcome).await {
-                                            Ok(_receipt) => true,
-                                            Err(err) => {
-                                                // Never includes `err`'s
-                                                // `Display` in anything sent
-                                                // to a client — same
-                                                // constraint `run_submitted_
-                                                // turn` already observes, and
-                                                // there is no wire variant to
-                                                // send it on regardless.
+                                        // this task, and this loop's own
+                                        // `close_task` `select!` arm, are
+                                        // what keep that off the connection's
+                                        // critical path.
+                                        //
+                                        // Bounded by `CLOSE_SESSION_TIMEOUT` —
+                                        // see that constant's own doc comment for why
+                                        // an unbounded call here is a
+                                        // permanent-leak hazard, not merely a
+                                        // slow one.
+                                        match tokio::time::timeout(
+                                            CLOSE_SESSION_TIMEOUT,
+                                            actor.close(outcome),
+                                        )
+                                        .await
+                                        {
+                                            Ok(Ok(_receipt)) => true,
+                                            // Never includes `err`'s
+                                            // `Display` in anything sent to a
+                                            // client — same constraint
+                                            // `run_submitted_turn` already
+                                            // observes, and there is no wire
+                                            // variant to send it on
+                                            // regardless.
+                                            Ok(Err(err)) => {
                                                 tracing::error!(
                                                     %session_id,
                                                     error = %err,
@@ -1730,12 +1877,19 @@ pub async fn drive_established_session(
                                                 );
                                                 false
                                             }
-                                        };
-                                        // Failure means this connection
-                                        // already ended — see
-                                        // `close_done_tx`'s declaration.
-                                        let _ = done.send(ok).await;
-                                    });
+                                            Err(_elapsed) => {
+                                                tracing::error!(
+                                                    %session_id,
+                                                    timeout = ?CLOSE_SESSION_TIMEOUT,
+                                                    "CloseSession did not durably append within \
+                                                     the timeout; leaving the session running \
+                                                     rather than forcing a teardown, the \
+                                                     connection stays open and no Ack is sent"
+                                                );
+                                                false
+                                            }
+                                        }
+                                    }));
                                 }
                                 None => {
                                     // The session was reaped (its actor

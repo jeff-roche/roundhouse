@@ -17,6 +17,14 @@ fn client_event_schema_emits_valid_json_schema_with_expected_properties() {
 /// nothing previously exercised `client_request_schema` at all despite it
 /// being exported for exactly this purpose (`schema.rs`'s own doc comment:
 /// "the one schema-emission entry point downstream tooling ... relies on").
+///
+/// This test's first version would have passed identically before
+/// `CloseSession` was ever added — it only checked that the schema has SOME
+/// `properties`/`oneOf` shape, never that the new variant is actually IN it.
+/// Asserting the emitted JSON mentions `CloseSession` by name (rather than
+/// parsing the exact `oneOf` shape, which is `schemars`-version-specific and
+/// not this test's concern) is enough to make the test fail if the variant
+/// were ever dropped from the schema while remaining in the enum.
 #[test]
 fn client_request_schema_emits_valid_json_schema_with_expected_properties() {
     let schema = client_request_schema();
@@ -26,6 +34,10 @@ fn client_request_schema_emits_valid_json_schema_with_expected_properties() {
         .or_else(|| value.get("oneOf"))
         .expect("schema has properties or oneOf (ClientRequest is an enum)");
     assert!(!props.is_null());
+    assert!(
+        value.to_string().contains("CloseSession"),
+        "the emitted ClientRequest schema must mention the CloseSession variant: {value}"
+    );
 }
 
 #[test]
