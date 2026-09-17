@@ -302,6 +302,39 @@ pub struct SessionActor {
     /// process's history. Starts `Taint::Trusted`: a session with nothing
     /// yet in its context has, vacuously, ingested nothing untrusted.
     taint: RwLock<Taint>,
+    /// Phase 8, T19a Task 3: the typed reason [`Self::cancel`] was last
+    /// called with, stored BEFORE `state_tx` is flipped to `Cancelling` (see
+    /// `cancel`'s own doc comment for why that ordering matters). `None`
+    /// until `cancel` has been called at least once. Reading this back is
+    /// how a caller downstream of the state-watch signal (`run_agent_loop`'s
+    /// cancellation check, `dispatch_builtin`'s `ShellSessionCancelled`
+    /// mapping) recovers the REAL reason, rather than only the free-text
+    /// `Debug` rendering `cancel` also writes into the durable
+    /// `SessionStateChanged` event.
+    cancel_reason: RwLock<Option<CancelReason>>,
+    /// Phase 8, T19a Task 3: the number of [`WorkGuard`]s currently held for
+    /// this session — one per `run_agent_loop` call presently in flight
+    /// against it. [`Self::wait_idle`] resolves once this reaches zero,
+    /// which is what the later `SessionActor::close` waits on after
+    /// `cancel()` before durably closing the session, so an abandoned loop's
+    /// `_work_guard` has genuinely dropped (and with it, any further event
+    /// this loop could still have appended) before close proceeds.
+    work_tx: tokio::sync::watch::Sender<usize>,
+}
+
+/// RAII guard for one unit of live work against a [`SessionActor`] — see
+/// [`SessionActor::begin_work`]. Incrementing happens when the guard is
+/// created; decrementing happens exactly once, on drop, however the holder
+/// returns (a normal return, an early `?`, or a cancelled `select!` branch
+/// dropping the future that held it).
+pub struct WorkGuard {
+    tx: tokio::sync::watch::Sender<usize>,
+}
+
+impl Drop for WorkGuard {
+    fn drop(&mut self) {
+        self.tx.send_modify(|n| *n = n.saturating_sub(1));
+    }
 }
 
 impl SessionActor {
@@ -417,6 +450,7 @@ impl SessionActor {
             "SessionActor::new_with_workspace_root: workspace_root must be a non-root absolute path"
         );
         let (state_tx, _rx) = tokio::sync::watch::channel(initial_state);
+        let (work_tx, _work_rx) = tokio::sync::watch::channel(0usize);
         let effective_tier = effective_tier(&session_spec);
         // Snapshot HOME once, here, alongside state_dir/daemon_binary's own
         // construction-time validation — never read live at decision time
@@ -441,6 +475,8 @@ impl SessionActor {
             tool_defs,
             sub_agent_host: RwLock::new(None),
             taint: RwLock::new(Taint::Trusted),
+            cancel_reason: RwLock::new(None),
+            work_tx,
         }
     }
 
@@ -738,6 +774,50 @@ impl SessionActor {
         self.state_tx.subscribe()
     }
 
+    /// Marks one unit of live work (a `run_agent_loop` call) as started
+    /// against this session, for as long as the returned [`WorkGuard`] is
+    /// held. `run_agent_loop` acquires one at entry, before the first task
+    /// it creates, and holds it until it returns by any path.
+    pub fn begin_work(&self) -> WorkGuard {
+        self.work_tx.send_modify(|n| *n += 1);
+        WorkGuard {
+            tx: self.work_tx.clone(),
+        }
+    }
+
+    /// The number of [`WorkGuard`]s currently held for this session — a
+    /// cheap, non-blocking read of the same counter [`Self::wait_idle`]
+    /// waits on. Exposed so a caller deciding a close outcome (whether
+    /// anything was genuinely in flight when a close was requested) can
+    /// read it without waiting.
+    pub fn live_work(&self) -> usize {
+        *self.work_tx.borrow()
+    }
+
+    /// Resolves once every [`WorkGuard`] held for this session has dropped
+    /// (`live_work() == 0`) — including one that already reached zero
+    /// before this call, which resolves immediately rather than waiting for
+    /// a future transition. This is what `SessionActor::close` awaits after
+    /// `cancel()`, so it never durably closes a session while a
+    /// `run_agent_loop` call (possibly one already abandoning its own
+    /// in-flight work in response to that same `cancel()`) is still
+    /// unwinding.
+    pub async fn wait_idle(&self) {
+        let mut rx = self.work_tx.subscribe();
+        loop {
+            if *rx.borrow() == 0 {
+                return;
+            }
+            // `Err` means every `Sender` (this actor's `work_tx`, plus every
+            // outstanding `WorkGuard` clone) was dropped — only possible if
+            // this `SessionActor` itself is being dropped concurrently, in
+            // which case there is no further count to wait on.
+            if rx.changed().await.is_err() {
+                return;
+            }
+        }
+    }
+
     /// The shared, process-wide `TaskRunner` this actor was constructed
     /// with — exposed so a later caller (e.g. a real task-execution
     /// dispatch chokepoint) can mint further session-scoped events through
@@ -779,11 +859,36 @@ impl SessionActor {
     /// open`'s doc comment) — not fsync'd on every write — so "appended"
     /// here means "written to the write-ahead log," not "survives an
     /// OS-level power loss"; it is not a claim of strict durability.
+    ///
+    /// **Stores `reason` typed, before flipping `state_tx` (T19a Task 3):**
+    /// a caller reacting to the state transition — `run_agent_loop`'s
+    /// cancellation check, `dispatch_builtin`'s mapping of a
+    /// session-cancelled shell to `TaskCancelled` — needs the REAL reason
+    /// this session was cancelled for, not just the free-text `Debug`
+    /// rendering recorded into the durable event below. Storing it first
+    /// means anything that observes the flip (by any means: polling
+    /// `state()`, `subscribe()`'s watch) can always read back a real,
+    /// already-stored reason via [`Self::cancel_reason`] — never a gap where
+    /// the state has visibly changed but the reason has not yet been
+    /// recorded anywhere in-process.
     pub async fn cancel(
         &self,
         runner: &TaskRunner,
         reason: CancelReason,
     ) -> Result<(), StoreError> {
+        match self.cancel_reason.write() {
+            Ok(mut guard) => *guard = Some(reason.clone()),
+            // Fail loud, not fail panicking: a poisoned lock here must not
+            // stop the state flip/durable append below (a session actually
+            // being cancelled must not get stuck because of this), but a
+            // reader of `cancel_reason()` will see `None` and fall back to
+            // its own documented default — see that accessor's doc comment.
+            Err(_) => tracing::error!(
+                session_id = %self.session_id,
+                "cancel_reason lock is poisoned; SessionActor::cancel_reason will read back None \
+                 for this cancellation"
+            ),
+        }
         self.state_tx.send_replace(SessionState::Cancelling);
 
         let event = runner.record_session_state_changed(
@@ -805,6 +910,21 @@ impl SessionActor {
         );
         self.writer.append(event).await?;
         Ok(())
+    }
+
+    /// The `CancelReason` stored by the most recent [`Self::cancel`] call,
+    /// or `None` if `cancel` has never been called for this session (or its
+    /// lock is poisoned — see that method's own doc comment). A caller
+    /// reacting to this session having left `Created`/`Running` should treat
+    /// `None` as unreachable by construction (`cancel` is the only writer of
+    /// `state_tx` away from its initial value, and it always stores a reason
+    /// first) and fall back to a documented default — `CancelReason::User`,
+    /// logged loudly — rather than panicking or silently guessing.
+    pub fn cancel_reason(&self) -> Option<CancelReason> {
+        self.cancel_reason
+            .read()
+            .ok()
+            .and_then(|guard| guard.clone())
     }
 
     /// Admit or refuse a new task, gated on the session's current state.

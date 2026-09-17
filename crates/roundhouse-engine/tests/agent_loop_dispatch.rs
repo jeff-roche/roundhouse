@@ -141,6 +141,50 @@ impl Isolate for TestIsolate {
     }
 }
 
+/// Wraps [`TestIsolate`], notifying `spawned` right after a real shell
+/// process has actually been spawned. Phase 8, T19a Task 3's cancellation
+/// tests drive their `cancel()` call on this signal instead of a wall-clock
+/// sleep: `TestIsolate::spawn` is only reached from
+/// `SessionActor::spawn_isolated`, itself only reached from `dispatch_builtin`
+/// AFTER `SessionActor::admit_task` has already succeeded — so waiting on
+/// this notification before sending `cancel()` guarantees the cancel lands
+/// on an admitted, already-running dispatch rather than racing admission
+/// itself (which would instead hit `AdmitError::SessionCancelling`, a
+/// different, already-covered path).
+struct SpawnNotifyingIsolate {
+    inner: TestIsolate,
+    spawned: Arc<tokio::sync::Notify>,
+}
+
+#[async_trait::async_trait]
+impl Isolate for SpawnNotifyingIsolate {
+    fn declared(&self) -> Tier {
+        self.inner.declared()
+    }
+
+    async fn probe(&self) -> ProbeResult {
+        self.inner.probe().await
+    }
+
+    async fn prepare(&self, spec: &SessionSpec) -> Result<Handle, IsolationError> {
+        self.inner.prepare(spec).await
+    }
+
+    async fn spawn(&self, handle: &Handle, command: CommandSpec) -> Result<Child, IsolationError> {
+        let child = self.inner.spawn(handle, command).await?;
+        self.spawned.notify_one();
+        Ok(child)
+    }
+
+    fn attest(&self, handle: &Handle) -> Attestation {
+        self.inner.attest(handle)
+    }
+
+    async fn teardown(&self, handle: Handle) -> Result<(), IsolationError> {
+        self.inner.teardown(handle).await
+    }
+}
+
 /// Builds a real `SessionActor` over a fresh on-disk store. `config_rules`
 /// are ordinary config-derived rules; the compiled-in sealed floor is
 /// checked first regardless and cannot be overridden by them (see
@@ -324,6 +368,48 @@ impl Provider for ScriptedToolCallProvider {
                 ]
             };
             Ok(ChatStream::from_events(events))
+        })
+    }
+    fn count_tokens<'a>(
+        &'a self,
+        _req: &'a ChatRequest,
+        _ctx: &'a RequestCtx,
+    ) -> BoxFut<'a, Result<TokenCount, ProviderError>> {
+        Box::pin(async { Ok(TokenCount::default()) })
+    }
+}
+
+/// A `Provider` whose `stream_chat` resolves (so `run_chat_turn`'s own
+/// initial provider round-trip genuinely starts), but whose returned
+/// `ChatStream` never yields a single item and never completes — proving
+/// Phase 8 T19a Task 3's claim that `run_agent_loop` races a genuinely
+/// in-flight (not just not-yet-started) provider stream against
+/// cancellation, rather than only checking between calls. `polled` notifies
+/// once `stream_chat` is actually invoked, which is the explicit signal
+/// tests drive their `cancel()` call on instead of a wall-clock sleep.
+struct HangingStreamProvider {
+    polled: Arc<tokio::sync::Notify>,
+}
+
+impl Provider for HangingStreamProvider {
+    fn capabilities(&self, _model: &ModelId) -> Capabilities {
+        Capabilities::default()
+    }
+    fn resolve(&self, _req: &ChatRequest) -> Result<Plan, ProviderError> {
+        Ok(Plan {
+            endpoint: "fake".into(),
+        })
+    }
+    fn stream_chat<'a>(
+        &'a self,
+        _req: &'a ChatRequest,
+        _ctx: &'a RequestCtx,
+    ) -> BoxFut<'a, Result<ChatStream, ProviderError>> {
+        self.polled.notify_one();
+        Box::pin(async {
+            Ok(ChatStream(Box::pin(
+                futures::stream::pending::<StreamEvent>(),
+            )))
         })
     }
     fn count_tokens<'a>(
@@ -1245,8 +1331,23 @@ async fn a_model_issued_shell_command_is_classified_and_executes_each_node() {
     )));
 }
 
+/// Phase 8, T19a Task 3 updated this test's own expectations: before that
+/// task, `run_agent_loop` did not check the owning session's state between
+/// provider round-trips, so a shell call cancelled mid-dispatch was folded
+/// into a `ToolResult { is_error: true }` and the loop went on to call the
+/// provider AGAIN with that error result in context, eventually returning
+/// `Ok(transcript)`. Task 3 adds a check at the top of every iteration
+/// (Ruling P8): once the owning session has left `Created`/`Running`, the
+/// loop reports `Err(AgentLoopError::Cancelled(reason))` instead of
+/// starting another provider round-trip — so the cancelled call's
+/// `ToolResult` is built internally but never actually returned to a
+/// caller. What IS still durably true, and is what this test asserts: the
+/// shell dispatch itself is genuinely aborted (not left running to its full
+/// 900s), and it is recorded as `TaskCancelled` (Ruling P2), not
+/// `TaskFailed` — a session-cancelled shell must never look like a panic or
+/// an ordinary tool error in the append-only log.
 #[tokio::test]
-async fn shell_command_cancellation_reaches_the_model_facing_dispatch() {
+async fn shell_command_cancellation_is_recorded_as_task_cancelled_and_the_loop_reports_it() {
     let (dir, script) = workspace_contained_script("#!/bin/sh\nsleep 900\n", "slow.sh");
     let canonical_script = script.canonicalize().unwrap();
     let (actor, _writer, db_path, session_id) = new_actor(
@@ -1299,17 +1400,37 @@ async fn shell_command_cancellation_reaches_the_model_facing_dispatch() {
     }
     let result = tokio::time::timeout(std::time::Duration::from_secs(2), &mut run)
         .await
-        .expect("model-facing shell dispatch did not observe cancellation")
-        .unwrap();
-    assert!(result
-        .iter()
-        .any(|block| matches!(block, ContentBlock::ToolResult { is_error: true, .. })));
+        .expect("model-facing shell dispatch did not observe cancellation");
+    assert!(
+        matches!(
+            result,
+            Err(AgentLoopError::Cancelled(
+                roundhouse_core::CancelReason::User
+            ))
+        ),
+        "a session cancelled mid-shell-dispatch must report cancellation instead of folding the \
+         cancelled call's result into a further provider turn, got {result:?}"
+    );
     let store = open(&db_path).await.unwrap();
     let events = session_events(&store, session_id).await.unwrap();
-    assert!(events.iter().any(|event| matches!(
-        &event.payload,
-        EventPayload::TaskFailed { error, .. } if error.category == "tool_error"
-    )));
+    assert!(
+        events.iter().any(|event| matches!(
+            &event.payload,
+            EventPayload::TaskCancelled {
+                by: roundhouse_core::Origin::System,
+                reason: roundhouse_core::CancelReason::User,
+            }
+        )),
+        "a shell cancelled by a session cancel must be recorded as TaskCancelled, not \
+         TaskFailed, got {:?}",
+        events.iter().map(|e| &e.payload).collect::<Vec<_>>()
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(&event.payload, EventPayload::TaskFailed { .. })),
+        "the cancelled shell task must not ALSO be recorded as TaskFailed"
+    );
 }
 
 #[tokio::test]
@@ -3028,6 +3149,22 @@ async fn a_panicked_mcp_dispatch_records_task_failed_instead_of_leaving_the_task
 /// session could still have a fresh MCP call started against a real server.
 /// The built-in arm has had this property since Task 25; this test is the MCP
 /// arm's version of it.
+///
+/// **Phase 8, T19a Task 3 updated this test's own top-level expectation:**
+/// `cancel()` is called BEFORE `run_agent_loop` even starts here, and Task
+/// 3's per-iteration cancellation check (Ruling P8) now catches that at the
+/// very top of the loop's first iteration — before the loop makes even one
+/// provider round-trip, let alone attempts to dispatch the MCP call
+/// `admit_task`/`record_denial` would otherwise have refused. The transport
+/// is therefore never reached for an even more direct reason than before,
+/// which this test still asserts (`transport.call_count() == 0`). What this
+/// test can no longer show, because the loop never gets that far, is
+/// `record_denial`'s own message/categorization for a MID-turn
+/// `SessionCancelling` refusal reaching the model — that mapping is
+/// unchanged by this task and is exercised whenever cancellation lands
+/// genuinely mid-turn (between two tool calls issued by the same provider
+/// response) rather than before the loop starts; `admit_task`'s own
+/// `SessionCancelling` behavior is covered directly in `cancel_admission.rs`.
 #[tokio::test]
 async fn a_cancelling_session_refuses_a_new_mcp_dispatch_before_it_reaches_the_transport() {
     let dir = tempfile::tempdir().unwrap();
@@ -3064,7 +3201,7 @@ async fn a_cancelling_session_refuses_a_new_mcp_dispatch_before_it_reaches_the_t
         ScriptedToolCallProvider::new(&namespaced_name, serde_json::json!({ "query": "x" }));
     let ctx = fake_ctx();
 
-    let blocks = run_agent_loop(
+    let result = run_agent_loop(
         &actor,
         &RUNNER,
         &provider,
@@ -3077,39 +3214,32 @@ async fn a_cancelling_session_refuses_a_new_mcp_dispatch_before_it_reaches_the_t
             max_tool_calls_per_turn: 10,
         },
     )
-    .await
-    .unwrap();
+    .await;
 
+    assert!(
+        matches!(
+            result,
+            Err(AgentLoopError::Cancelled(
+                roundhouse_core::CancelReason::User
+            ))
+        ),
+        "a session already cancelled before the loop starts must report cancellation before \
+         making even one provider round-trip, got {result:?}"
+    );
     assert_eq!(
         transport.call_count(),
         0,
         "a Cancelling session must not start a new MCP call against a real server"
     );
-    let refusal = blocks
-        .iter()
-        .find_map(|b| match b {
-            ContentBlock::ToolResult {
-                is_error: true,
-                content,
-                ..
-            } => Some(content.iter().map(|p| p.text.clone()).collect::<String>()),
-            _ => None,
-        })
-        .expect("the refusal must reach the model as an error tool result");
-    assert!(
-        refusal.contains("session is Cancelling"),
-        "the model must be told WHY the call was refused, not just that it failed: {refusal:?}"
-    );
 
     let reopened = open(&db_path).await.unwrap();
     let events = session_events(&reopened, session_id).await.unwrap();
     assert!(
-        events.iter().any(|e| matches!(
-            &e.payload,
-            EventPayload::TaskFailed { error, .. } if error.category == "session_not_running"
-        )),
-        "the refused attempt must still be a real, queryable TaskFailed categorised as a \
-         lifecycle refusal, got {:?}",
+        !events
+            .iter()
+            .any(|e| matches!(&e.payload, EventPayload::TaskCreated { .. })),
+        "a session already cancelled before the loop starts must never even attempt the \
+         dispatch that `record_denial`'s own SessionCancelling refusal covers, got {:?}",
         events.iter().map(|e| &e.payload).collect::<Vec<_>>()
     );
 }
@@ -3331,6 +3461,17 @@ async fn an_mcp_policy_ask_records_a_terminal_and_is_reported_as_pending_approva
 /// ran on to the full `MCP_CALL_TIMEOUT` (120s). The `timeout` below is the
 /// discriminator: against the pre-fix code this test does not merely assert
 /// something different, it does not finish.
+///
+/// **Phase 8, T19a Task 3 updated this test's own top-level expectation:**
+/// before that task, `run_agent_loop` did not check the owning session's
+/// state between provider round-trips, so the abandoned call's `ToolResult`
+/// was folded into a further provider turn and the loop returned
+/// `Ok(transcript)` containing it. Task 3's per-iteration cancellation check
+/// (Ruling P8) now reports `Err(AgentLoopError::Cancelled(reason))` instead
+/// of starting that further round-trip — so the transport-level abandonment
+/// this test exists to prove (the `dropped` flag) and the durable
+/// `TaskFailed { category: "session_cancelled" }` record are still asserted
+/// below, but no longer via a `ToolResult` the function actually returns.
 #[tokio::test]
 async fn a_session_cancelled_mid_mcp_dispatch_abandons_the_call_instead_of_waiting_out_the_timeout()
 {
@@ -3379,36 +3520,30 @@ async fn a_session_cancelled_mid_mcp_dispatch_abandons_the_call_instead_of_waiti
             .unwrap();
     };
 
-    let blocks = tokio::time::timeout(std::time::Duration::from_secs(5), async {
-        let (blocks, ()) = tokio::join!(loop_fut, canceller);
-        blocks
+    let result = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        let (result, ()) = tokio::join!(loop_fut, canceller);
+        result
     })
     .await
     .expect(
         "a cancelled session must abandon its in-flight MCP call promptly — waiting out the \
          120s MCP_CALL_TIMEOUT instead is the bug this test exists for",
-    )
-    .unwrap();
+    );
 
     assert!(
         dropped.load(Ordering::SeqCst),
         "the in-flight transport call must actually have been dropped, not merely stopped \
          being awaited"
     );
-    let message = blocks
-        .iter()
-        .find_map(|b| match b {
-            ContentBlock::ToolResult {
-                is_error: true,
-                content,
-                ..
-            } => Some(content.iter().map(|p| p.text.clone()).collect::<String>()),
-            _ => None,
-        })
-        .expect("the abandoned call must reach the model as an error tool result");
     assert!(
-        message.contains("cancelled"),
-        "the model must be told the call was cancelled: {message:?}"
+        matches!(
+            result,
+            Err(AgentLoopError::Cancelled(
+                roundhouse_core::CancelReason::User
+            ))
+        ),
+        "a cancelled session must report cancellation instead of folding the abandoned call's \
+         result into a further provider turn, got {result:?}"
     );
 
     let reopened = open(&db_path).await.unwrap();
@@ -3962,4 +4097,245 @@ async fn a_shell_containment_refusal_is_audited_and_discloses_nothing_about_the_
             "a containment refusal is raised before admission — it must never reach TaskStarted"
         );
     }
+}
+
+// =======================================================================================
+// Phase 8, T19a Task 3 — session close: `run_agent_loop` honors cancellation,
+// a live-work counter `SessionActor::wait_idle` resolves against, and a
+// session-cancelled shell records `TaskCancelled`, not `TaskFailed`.
+// =======================================================================================
+
+/// A provider whose stream never completes must still let the loop return
+/// promptly once the owning session is cancelled — proving `run_agent_loop`
+/// races the in-flight `run_chat_turn` call itself against cancellation, not
+/// only the gap between provider calls. Driven entirely on
+/// `HangingStreamProvider`'s own `polled` notification, never a sleep: the
+/// outer `tokio::time::timeout` is a safety backstop against a real hang,
+/// not what orders the cancellation.
+#[tokio::test]
+async fn a_provider_stream_that_never_completes_is_abandoned_when_the_session_is_cancelled() {
+    let dir = tempfile::tempdir().unwrap();
+    let (actor, _writer, _db_path, _session_id) = new_actor(
+        dir.path(),
+        dir.path().join("state"),
+        dir.path().join("daemon-binary"),
+        vec![],
+    )
+    .await;
+
+    let polled = Arc::new(tokio::sync::Notify::new());
+    let provider = HangingStreamProvider {
+        polled: Arc::clone(&polled),
+    };
+    let tools = actor.tool_defs().to_vec();
+    let ctx = fake_ctx();
+
+    let loop_fut = run_agent_loop(
+        &actor,
+        &RUNNER,
+        &provider,
+        &ctx,
+        &tools,
+        None,
+        empty_request(),
+        AgentLoopConfig {
+            max_turns: 4,
+            max_tool_calls_per_turn: 10,
+        },
+    );
+
+    let canceller = async {
+        polled.notified().await;
+        actor
+            .cancel(&RUNNER, roundhouse_core::CancelReason::User)
+            .await
+            .unwrap();
+    };
+
+    let result = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        let (result, ()) = tokio::join!(loop_fut, canceller);
+        result
+    })
+    .await
+    .expect(
+        "a cancelled session must abandon a never-completing provider stream promptly, not \
+         hang forever — that is the bug this test exists for",
+    );
+
+    assert!(
+        matches!(
+            result,
+            Err(AgentLoopError::Cancelled(
+                roundhouse_core::CancelReason::User
+            ))
+        ),
+        "got {result:?}"
+    );
+}
+
+/// A shell dispatch cancelled by a session cancel (not by its own wall-clock
+/// timeout) must be recorded as `TaskCancelled { by: Origin::System, reason }`,
+/// never `TaskFailed` — Ruling P2. Driven on `SpawnNotifyingIsolate`'s
+/// `spawned` notification, never a sleep: `cancel()` fires only once the
+/// real shell process has genuinely been spawned (i.e. only after
+/// `admit_task` already succeeded), so this test cannot race admission
+/// itself.
+#[tokio::test]
+async fn a_session_cancelled_shell_dispatch_is_recorded_as_task_cancelled_not_task_failed() {
+    let (dir, script) = workspace_contained_script("#!/bin/sh\nsleep 30\n", "long_running.sh");
+    let canonical_script = script.canonicalize().unwrap();
+
+    let state_dir = dir.path().join("state");
+    let daemon_binary = dir.path().join("daemon-binary");
+    let db_path = dir.path().join("events.db");
+    let store = open(&db_path).await.unwrap();
+    let writer = spawn_writer(store).await;
+
+    let spawned = Arc::new(tokio::sync::Notify::new());
+    let isolate: Arc<dyn Isolate> = Arc::new(SpawnNotifyingIsolate {
+        inner: TestIsolate,
+        spawned: Arc::clone(&spawned),
+    });
+    let spec = SessionSpec::test_requesting(Tier::Sandbox, OnDegrade::Refuse);
+    let handle = isolate.prepare(&spec).await.unwrap();
+    let session_id = SessionId::new();
+
+    let policy = Arc::new(PolicyEngine::from_rules(vec![CompiledRule::test_new(
+        Scope::Builtin,
+        Outcome::Allow,
+        Predicate::Shell {
+            program: canonical_script.to_string_lossy().to_string(),
+            matcher: ArgMatcher::ArgvPrefix(vec![]),
+            allow_interpreter: false,
+        },
+    )]));
+
+    let actor = SessionActor::new_with_workspace_root(
+        session_id,
+        writer.clone(),
+        SessionState::Running,
+        &RUNNER,
+        policy,
+        state_dir,
+        daemon_binary,
+        std::env::current_dir().unwrap(),
+        isolate,
+        handle,
+        spec,
+        tool_catalog::builtin_tool_defs(),
+    );
+
+    let tools = actor.tool_defs().to_vec();
+    let provider = ScriptedToolCallProvider::new(
+        "shell",
+        serde_json::json!({
+            "program": "./long_running.sh",
+            "argv": [],
+            "cwd": dir.path().to_string_lossy(),
+        }),
+    );
+    let ctx = fake_ctx();
+
+    let loop_fut = run_agent_loop(
+        &actor,
+        &RUNNER,
+        &provider,
+        &ctx,
+        &tools,
+        None,
+        empty_request(),
+        AgentLoopConfig {
+            max_turns: 4,
+            max_tool_calls_per_turn: 10,
+        },
+    );
+
+    let canceller = async {
+        spawned.notified().await;
+        actor
+            .cancel(&RUNNER, roundhouse_core::CancelReason::User)
+            .await
+            .unwrap();
+    };
+
+    let result = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        let (result, ()) = tokio::join!(loop_fut, canceller);
+        result
+    })
+    .await
+    .expect(
+        "a session-cancelled shell dispatch must be abandoned promptly, not run to its full \
+         30s sleep",
+    );
+
+    assert!(
+        matches!(
+            result,
+            Err(AgentLoopError::Cancelled(
+                roundhouse_core::CancelReason::User
+            ))
+        ),
+        "got {result:?}"
+    );
+
+    let reopened = open(&db_path).await.unwrap();
+    let events = session_events(&reopened, session_id).await.unwrap();
+    assert!(
+        events.iter().any(|e| matches!(
+            &e.payload,
+            EventPayload::TaskCancelled {
+                by: roundhouse_core::Origin::System,
+                reason: roundhouse_core::CancelReason::User,
+            }
+        )),
+        "a shell cancelled by a session cancel must be recorded as TaskCancelled{{System, \
+         User}}, not TaskFailed, got {:?}",
+        events.iter().map(|e| &e.payload).collect::<Vec<_>>()
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(&e.payload, EventPayload::TaskFailed { .. })),
+        "the cancelled shell task must not ALSO be recorded as TaskFailed, got {:?}",
+        events.iter().map(|e| &e.payload).collect::<Vec<_>>()
+    );
+}
+
+/// `SessionActor::wait_idle` must resolve immediately when nothing is
+/// running, must NOT resolve while a `WorkGuard` is still held, and must
+/// resolve once the last one drops — driven entirely on `now_or_never`
+/// (never a sleep) to prove "not yet resolved" without racing a timer
+/// against however long polling would otherwise take.
+#[tokio::test]
+async fn wait_idle_resolves_only_after_the_last_work_guard_drops() {
+    use futures::FutureExt;
+
+    let dir = tempfile::tempdir().unwrap();
+    let (actor, ..) = new_actor(
+        dir.path(),
+        dir.path().join("state"),
+        dir.path().join("daemon-binary"),
+        vec![],
+    )
+    .await;
+
+    assert_eq!(actor.live_work(), 0);
+    assert!(
+        actor.wait_idle().now_or_never().is_some(),
+        "wait_idle must resolve immediately when nothing is running"
+    );
+
+    let guard = actor.begin_work();
+    assert_eq!(actor.live_work(), 1);
+    assert!(
+        actor.wait_idle().now_or_never().is_none(),
+        "wait_idle must not resolve while a WorkGuard is still held"
+    );
+
+    drop(guard);
+    assert_eq!(actor.live_work(), 0);
+    assert!(
+        actor.wait_idle().now_or_never().is_some(),
+        "wait_idle must resolve once the last WorkGuard has dropped"
+    );
 }

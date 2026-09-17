@@ -110,8 +110,8 @@
 use crate::session_actor::{SessionActor, TaskCreateRequest, TaskIsolator};
 use crate::tool_catalog::{resolve_tool_target, ToolTarget};
 use roundhouse_core::{
-    IsolationAttestation, Origin, TaskError, TaskId, TaskInput, TaskKind, TaskOutput, TaskRunner,
-    Tier, Timestamp, Usage,
+    CancelReason, IsolationAttestation, Origin, SessionState, TaskError, TaskId, TaskInput,
+    TaskKind, TaskOutput, TaskRunner, Tier, Timestamp, Usage,
 };
 use roundhouse_mcp::executor::TaskExecutor as _;
 use roundhouse_provider::{
@@ -147,6 +147,36 @@ pub enum AgentLoopError {
     TooManyToolCallsInOneTurn(usize, u32),
     #[error("exceeded the maximum number of tool-call turns ({0}) in one agent loop")]
     MaxTurnsExceeded(u32),
+    /// Phase 8, T19a Task 3: the owning session left `Created`/`Running`
+    /// while this loop was running — either observed at the top of an
+    /// iteration, or preempted mid-flight against an in-progress
+    /// `run_chat_turn` call. Any `chat`/`infer` task that in-flight call had
+    /// already opened may be left non-terminal: this loop abandons it rather
+    /// than waiting for it to finish, and a later durable sweep
+    /// (`SessionActor::close`) is responsible for reconciling it, not this
+    /// error path.
+    #[error("agent loop abandoned: the owning session was cancelled ({0:?})")]
+    Cancelled(CancelReason),
+}
+
+/// The reason `actor`'s owning session was cancelled, per
+/// [`SessionActor::cancel`]'s own typed storage
+/// ([`SessionActor::cancel_reason`]). Falls back to `CancelReason::User`
+/// with a loud warning if none was stored — `cancel` is the only writer of
+/// the session's state watch away from `Created`/`Running`, and it always
+/// stores a reason before flipping it, so a caller reaching this fallback
+/// means that invariant broke elsewhere, not that cancellation itself is in
+/// doubt.
+fn stored_cancel_reason(actor: &SessionActor) -> CancelReason {
+    actor.cancel_reason().unwrap_or_else(|| {
+        tracing::warn!(
+            session_id = %actor.session_id(),
+            "session left Created/Running with no stored CancelReason; SessionActor::cancel \
+             always stores one before flipping the watch, so this should be unreachable — \
+             falling back to CancelReason::User"
+        );
+        CancelReason::User
+    })
 }
 
 /// `Timestamp` has no `now()` — read the wall clock ourselves and convert.
@@ -172,6 +202,31 @@ pub(crate) fn now_ts() -> Timestamp {
 /// denial or an intermediate tool result is visible to the caller even when
 /// the loop goes on to a further turn afterward.
 ///
+/// # Cancellation (Phase 8, T19a Task 3)
+///
+/// This loop honors the owning `actor`'s session-cancel watch two ways:
+/// checked at the top of every iteration (a cancellation observed between
+/// one iteration's tool dispatch and the next provider call), and raced
+/// against each individual [`crate::run_chat_turn`] call (a cancellation
+/// observed while a provider stream is genuinely in flight — including one
+/// that never completes at all). Either preemption returns
+/// `Err(AgentLoopError::Cancelled(reason))` rather than `Ok`: cancellation
+/// is reported as an outcome distinct from a normal empty-tool-uses return,
+/// consistent with this function's existing error type rather than a new,
+/// separate return shape. A cancellation that preempts an in-flight
+/// `run_chat_turn` call abandons that call's future outright — any
+/// `chat`/`infer` task it had already opened may be left non-terminal. That
+/// is an accepted gap here: a later durable sweep (`SessionActor::close`,
+/// which calls `cancel()` then `SessionActor::wait_idle()` before closing
+/// the session) is responsible for reconciling any such dangling task, not
+/// this loop.
+///
+/// An RAII [`crate::session_actor::WorkGuard`] (`SessionActor::begin_work`)
+/// is held for this whole call's lifetime — acquired before the first task
+/// this loop creates, dropped on every return path including the
+/// cancellation ones above — which is what lets `SessionActor::wait_idle`
+/// know a cancelled loop has genuinely finished unwinding.
+///
 /// **No separate `writer` parameter (fix round A, ruling W1-R60):** every
 /// append this loop makes goes through `actor.writer()` — the session's own
 /// `EventWriter` — rather than a second, independently-suppliable one. An
@@ -196,16 +251,47 @@ pub async fn run_agent_loop(
     let mut turns: u32 = 0;
     let mut transcript: Vec<ContentBlock> = Vec::new();
 
+    // Phase 8, T19a Task 3: acquired before the first task this loop
+    // creates (the very first `run_chat_turn` call's `chat` task, below)
+    // and held until this function returns by any path — a normal return,
+    // an error, or the cancellation-preemption paths below. This is the
+    // counter `SessionActor::wait_idle` waits on, so a later
+    // `SessionActor::close` (which calls `cancel()` then `wait_idle()`
+    // before durably closing the session) never proceeds while this loop
+    // is still unwinding.
+    let _work_guard = actor.begin_work();
+
     loop {
-        let (chat_task_id, blocks) = crate::run_chat_turn(
-            writer,
-            runner,
-            provider,
-            ctx,
-            actor.session_id(),
-            request.clone(),
-        )
-        .await?;
+        // Checked at the top of every iteration, not only raced against
+        // the provider call below: a session cancelled while the PREVIOUS
+        // iteration's tool-call dispatch was still running must not start
+        // another provider round-trip once that dispatch returns control
+        // here.
+        if !matches!(actor.state(), SessionState::Created | SessionState::Running) {
+            return Err(AgentLoopError::Cancelled(stored_cancel_reason(actor)));
+        }
+
+        let mut cancel = Some(actor.subscribe());
+        let (chat_task_id, blocks) = tokio::select! {
+            result = crate::run_chat_turn(
+                writer,
+                runner,
+                provider,
+                ctx,
+                actor.session_id(),
+                request.clone(),
+            ) => result?,
+            () = crate::tool_dispatch::wait_for_session_cancel(&mut cancel) => {
+                // The in-flight `run_chat_turn` future is dropped here,
+                // abandoning it mid-flight rather than awaiting its
+                // completion — whatever `chat`/`infer` task it had already
+                // opened may be left non-terminal. See this function's own
+                // doc comment and `AgentLoopError::Cancelled`'s: that is
+                // acceptable, and reconciling it durably is
+                // `SessionActor::close`'s job, not this loop's.
+                return Err(AgentLoopError::Cancelled(stored_cancel_reason(actor)));
+            }
+        };
 
         let tool_uses: Vec<(ToolCallId, String, serde_json::Value)> = blocks
             .iter()
@@ -1569,6 +1655,32 @@ async fn dispatch_builtin(
                 format!("failed to record the dispatched tool call completing: {e}")
             })?;
             Ok(parts)
+        }
+        // Phase 8, T19a Task 3: a shell dispatch abandoned because the
+        // owning session left `Created`/`Running` mid-call is a
+        // cancellation, not a failure — recorded as `TaskCancelled`, never
+        // `TaskFailed`. Checked before the generic arm below so this one
+        // variant never falls into the ordinary tool-error path.
+        Err(crate::tool_dispatch::ToolDispatchError::ShellSessionCancelled(_)) => {
+            let reason = stored_cancel_reason(actor);
+            tracing::info!(
+                %task_id,
+                ?reason,
+                "admitted shell dispatch cancelled by a session state change"
+            );
+            let cancelled = runner.record_task_cancelled(
+                actor.session_id(),
+                0,
+                now_ts(),
+                task_id,
+                Origin::System,
+                reason,
+                1,
+            );
+            writer.append(cancelled).await.map_err(|e| {
+                format!("failed to record the dispatched tool call's cancellation: {e}")
+            })?;
+            Err("tool execution was cancelled".to_string())
         }
         Err(tool_err) => {
             // A post-admission executor error can carry an `io::Error`, and
