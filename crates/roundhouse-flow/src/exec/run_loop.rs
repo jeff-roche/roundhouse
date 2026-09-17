@@ -1515,7 +1515,7 @@ const STEPS_ROOT_NAME: &str = "steps";
 /// would otherwise collide on a bare id).
 ///
 /// **It is also what makes such a key unreachable from any expression**, which
-/// [`ItemStepsContext::top_level_of`] relies on: `#` is outside the closed
+/// [`ItemStepsContext::for_map`] relies on: `#` is outside the closed
 /// charset `crate::parse::steps`'s `validate_step_id` allows, so no
 /// `${{ steps.<id> }}` path can name one, and this evaluator's `[..]` indexes
 /// arrays by position only (`crate::expr::ExprError::NonNumericIndex`), so no
@@ -1605,12 +1605,12 @@ fn fold_decided_inner_step(
 ///
 /// [`Loop::advance_map_item`] snapshots the `steps` root, binds this over it
 /// for the length of one item's walk, and restores the snapshot on every exit
-/// path. Two things follow, and both are asserted rather than argued
+/// path (all three skipped, together, when [`Self::may_be_read`] is false). Two things follow, and both are asserted rather than argued
 /// (`tests/run_loop.rs`:
 /// `an_items_later_inner_step_reads_a_sibling_decided_in_an_earlier_segment`
 /// and `a_map_items_inner_step_is_not_visible_to_a_top_level_step_after_the_map`):
 /// a sibling item never sees another item's entries, because each item starts
-/// from [`Self::top_level_of`]'s projection again; and a top-level step after
+/// from [`Self::for_map`]'s projection again; and a top-level step after
 /// the `map` never sees them either, because the restore ends the span. The
 /// run's durable context model is untouched — nothing here writes
 /// [`Loop::steps_context`].
@@ -1628,7 +1628,7 @@ fn fold_decided_inner_step(
 ///
 /// # What it deliberately leaves out, and what that costs
 ///
-/// [`Self::top_level_of`] drops every [`per_item_context_key`] entry. No
+/// [`Self::for_map`] drops every [`per_item_context_key`] entry. No
 /// expression can reach one by path, so the only observable difference is a
 /// whole-root read (`${{ steps }}`, `json(steps)`) evaluated *inside* a `map`
 /// item, which no longer carries sibling items' bookkeeping entries — a
@@ -1641,17 +1641,41 @@ fn fold_decided_inner_step(
 /// projection is taken **once per `map` step** ([`Loop::dispatch_map`]) and
 /// cloned per item from there.
 ///
-/// The residual cost that remains is real and is named rather than hidden:
-/// each bind still deep-clones the run's top-level entries, so an item pays
-/// that clone once per inner step it decides. A workflow whose earlier
-/// top-level step produced a large output (commonly the very collection the
-/// `map` fans out over) pays it per item. Closing that would need either an
-/// incremental root-mutation API on [`crate::expr::ExprContext`] — which would
-/// have to narrow provenance, the one thing that type refuses by design — or a
-/// static analysis of which inner steps read `steps` at all.
+/// What remains is paid **only by a `map` whose inner steps can observe it**,
+/// which is what [`Self::may_be_read`] is for: each bind deep-clones the run's
+/// top-level entries, so an item pays that clone once per inner step it
+/// decides, and a workflow whose earlier top-level step produced a large
+/// output (commonly the very collection the `map` fans out over) pays it per
+/// item. Measured, release build, one `map` of three `emit:` inner steps over
+/// the output of an earlier top-level step (~220 bytes per item, so 22 KB at
+/// 100 items and 220 KB at 1,000), driven to a terminal state:
+///
+/// | items | no inner step names `steps` | one reads a sibling |
+/// |---|---|---|
+/// | 100 | 9.7 ms | 22 ms |
+/// | 1,000 | 87 ms | 1.23 s |
+///
+/// The left column is the figure this same fixture measured *before* this type
+/// existed (90 ms at 1,000 items), which is what the switch buys: a `map` that
+/// cannot observe the binding is not slowed by it at all.
+///
+/// Closing the remaining factor would need an incremental root-mutation API on
+/// [`crate::expr::ExprContext`] — which would have to narrow a root's
+/// provenance, the one thing that type refuses by design.
 #[derive(Clone)]
 struct ItemStepsContext {
-    /// Exactly what is bound under [`STEPS_ROOT_NAME`].
+    /// Whether any inner step of this `map` names the `steps` root at all
+    /// ([`inner_steps_may_read_steps`]).
+    ///
+    /// **When false this whole type is inert** — `steps` is empty, `record`
+    /// and `bind` return immediately, and [`Loop::advance_map_item`] takes no
+    /// snapshot (which would itself deep-clone the bound root). A fan-out that
+    /// cannot observe the binding therefore pays nothing for it, which is the
+    /// difference the table above measures. Every `map` written before this
+    /// mechanism existed is in that class, by construction.
+    may_be_read: bool,
+    /// Exactly what is bound under [`STEPS_ROOT_NAME`] — empty, and never
+    /// bound, when [`Self::may_be_read`] is false.
     steps: serde_json::Map<String, Value>,
     /// The keys of `steps` whose `output` is secret material — the paths
     /// [`Loop::bind_steps_context`]'s own projection marks, plus this item's
@@ -1661,12 +1685,22 @@ struct ItemStepsContext {
 
 impl ItemStepsContext {
     /// The run's own entries, minus the per-item bookkeeping keys — the
-    /// starting point every item of one `map` step is walked from.
-    fn top_level_of(
+    /// starting point every item of one `map` step is walked from, or an inert
+    /// value when this `map`'s inner steps cannot read `steps` at all.
+    fn for_map(
         steps_context: &serde_json::Map<String, Value>,
         secret_derived_steps: &[String],
+        inner_step_yaml: &[serde_yaml::Value],
     ) -> Self {
+        if !inner_steps_may_read_steps(inner_step_yaml) {
+            return ItemStepsContext {
+                may_be_read: false,
+                steps: serde_json::Map::new(),
+                secret_steps: Vec::new(),
+            };
+        }
         ItemStepsContext {
+            may_be_read: true,
             steps: steps_context
                 .iter()
                 .filter(|(key, _)| !is_per_item_context_key(key))
@@ -1688,6 +1722,9 @@ impl ItemStepsContext {
     /// taints the *item's* aggregate (`fold_inner_step_outcome`) rather than
     /// this entry's output — which it did not produce.
     fn record(&mut self, step_id: &str, outcome: &StepOutcome) {
+        if !self.may_be_read {
+            return;
+        }
         if outcome.output_is_secret_derived {
             self.secret_steps.push(step_id.to_string());
         }
@@ -1700,12 +1737,48 @@ impl ItemStepsContext {
     /// method's own doc comment for why the projection's cardinality is
     /// load-bearing.
     fn bind(&self, executor: &mut Executor<'_>) {
+        if !self.may_be_read {
+            return;
+        }
         executor.ctx.set_with_secret_paths(
             STEPS_ROOT_NAME,
             Value::Object(self.steps.clone()),
             self.secret_steps.iter().map(secret_output_path),
         );
     }
+}
+
+/// Whether any of one `map`'s inner steps could read the `steps` root at all —
+/// a conservative, text-level answer over the inner steps' own YAML, and the
+/// switch [`ItemStepsContext::may_be_read`] records.
+///
+/// **Sound because a root can only be named by a literal identifier in the
+/// expression text.** `crate::expr` has no way to compute a root's name, so an
+/// expression that reads `steps` — `${{ steps.a.output }}`, a bare
+/// `${{ steps }}`, `json(steps)` — contains those five characters in the very
+/// YAML this is handed. Every expression an item's walk evaluates comes from
+/// that YAML: the inner steps' own `when:` conditions and bodies, a nested
+/// `gate:`'s title, a nested `map:`'s `over:`. The enclosing `map`'s own
+/// `isolation.base_ref` is the one expression evaluated inside the walk that
+/// does not, and it does not need to be: it can name only top-level steps,
+/// whose entries are bound either way (by [`Loop::bind_steps_context`], before
+/// the `map` step was dispatched at all).
+///
+/// **Over-approximate on purpose, in the only safe direction.** A prompt
+/// containing the English word "steps" opens the binding for nothing, which
+/// costs some clones and changes no behaviour; the opposite mistake would make
+/// the feature silently stop working, so the one fallible call here answers
+/// "it might" rather than "it cannot".
+fn inner_steps_may_read_steps(inner_step_yaml: &[serde_yaml::Value]) -> bool {
+    inner_step_yaml.iter().any(|step| {
+        match serde_yaml::to_string(step) {
+            Ok(text) => text.contains(STEPS_ROOT_NAME),
+            // Re-serializing a `serde_yaml::Value` that was parsed from a
+            // document has no known failure mode; if one exists, binding is
+            // the answer that cannot break a workflow.
+            Err(_) => true,
+        }
+    })
 }
 
 struct Loop<'c, H: WorkflowHost> {
@@ -3613,9 +3686,16 @@ impl<H: WorkflowHost> Loop<'_, H> {
         // Task 10: the starting point for every item's own `${{ steps.* }}`
         // surface, projected once here rather than once per item — see
         // [`ItemStepsContext`], whose own doc comment records why the
-        // per-item bookkeeping keys are left out of it and what that saves.
-        let top_level_steps =
-            ItemStepsContext::top_level_of(&self.steps_context, &self.secret_derived_steps);
+        // per-item bookkeeping keys are left out of it, why a `map` no inner
+        // step of which names `steps` gets an inert one, and what each saves.
+        // Safe to take once: nothing this fan-out does writes
+        // `Self::steps_context`, which only a *top-level* step's `record`
+        // touches.
+        let top_level_steps = ItemStepsContext::for_map(
+            &self.steps_context,
+            &self.secret_derived_steps,
+            inner_step_yaml,
+        );
         let mut any_item_secret_derived = over_evaluated.secret_derived();
         let mut policy = ItemErrorPolicy::new(on_item_error);
         let mut outcomes: Vec<Option<ItemOutcome>> = vec![None; items.len()];
@@ -4084,7 +4164,13 @@ impl<H: WorkflowHost> Loop<'_, H> {
         phase: Phase,
         top_level_steps: &ItemStepsContext,
     ) -> Result<ItemAdvance, RunLoopError> {
-        let steps_snapshot = executor.ctx.snapshot_root(STEPS_ROOT_NAME);
+        // Not taken for a `map` whose inner steps never name `steps`: the
+        // walk binds nothing, so there is nothing to restore — and the
+        // snapshot itself would clone the whole bound root, per item, for
+        // nothing (see [`ItemStepsContext::may_be_read`]).
+        let steps_snapshot = top_level_steps
+            .may_be_read
+            .then(|| executor.ctx.snapshot_root(STEPS_ROOT_NAME));
         let advanced = self.walk_map_item(
             executor,
             map_step_id,
@@ -4098,7 +4184,9 @@ impl<H: WorkflowHost> Loop<'_, H> {
             phase,
             top_level_steps,
         );
-        executor.ctx.restore_root(STEPS_ROOT_NAME, steps_snapshot);
+        if let Some(snapshot) = steps_snapshot {
+            executor.ctx.restore_root(STEPS_ROOT_NAME, snapshot);
+        }
         advanced
     }
 
