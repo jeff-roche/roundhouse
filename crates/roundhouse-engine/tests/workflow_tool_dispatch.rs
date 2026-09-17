@@ -220,6 +220,21 @@ fn expect_completed<'a>(result: &'a DispatchOutcome, context: &str) -> &'a serde
     }
 }
 
+/// Names one stored event's payload variant — shared by every test in this
+/// file that asserts on the exact shape of a dispatched task's own event
+/// sequence (Phase 8 Task 19 lane B, Task 9).
+fn event_kind(payload: &EventPayload) -> &'static str {
+    match payload {
+        EventPayload::TaskCreated { .. } => "TaskCreated",
+        EventPayload::TaskStarted { .. } => "TaskStarted",
+        EventPayload::TaskDelta { .. } => "TaskDelta",
+        EventPayload::TaskProgress { .. } => "TaskProgress",
+        EventPayload::TaskCompleted { .. } => "TaskCompleted",
+        EventPayload::TaskFailed { .. } => "TaskFailed",
+        _ => "other",
+    }
+}
+
 /// `write` dispatches through to a real in-workspace execution (Task 2,
 /// closing Task 1's own deferred gap — see this file's own
 /// `shell_tool_dispatches_through` doc comment for why an out-of-workspace
@@ -431,27 +446,32 @@ async fn shell_tool_dispatches_through() {
     );
 
     // The same run, seen from the event log: a shell step that reached
-    // `execute_builtin` and returned `Ok` records TaskStarted then
-    // TaskCompleted — an admission refusal or a pre-admission rejection
-    // records TaskFailed (or a denial note) instead.
+    // `execute_builtin` and returned `Ok` records TaskStarted, then its
+    // streamed output (Phase 8 Task 19 lane B, Task 9 — see
+    // `shell_tool_dispatch_streams_deltas_and_progress_before_its_terminal_event`
+    // below for the dedicated test on this shape), then TaskCompleted — an
+    // admission refusal or a pre-admission rejection records TaskFailed (or
+    // a denial note) instead.
     let reopened = open(&db_path).await.unwrap();
     let kinds: Vec<&'static str> = session_events(&reopened, session_id)
         .await
         .unwrap()
         .iter()
         .filter(|e| e.task_id == Some(dispatch.task_id))
-        .map(|e| match e.payload {
-            EventPayload::TaskCreated { .. } => "TaskCreated",
-            EventPayload::TaskStarted { .. } => "TaskStarted",
-            EventPayload::TaskCompleted { .. } => "TaskCompleted",
-            EventPayload::TaskFailed { .. } => "TaskFailed",
-            _ => "other",
-        })
+        .map(|e| event_kind(&e.payload))
         .collect();
     assert_eq!(
         kinds,
-        vec!["TaskCreated", "TaskStarted", "TaskCompleted"],
-        "a shell step that executed must have the full S-LOG-1 lifecycle recorded"
+        vec![
+            "TaskCreated",
+            "TaskStarted",
+            "TaskDelta",
+            "TaskProgress",
+            "TaskCompleted"
+        ],
+        "a shell step that executed and produced real stdout must have the full S-LOG-1 \
+         lifecycle recorded, with its output streamed as a delta/progress pair before the \
+         terminal event"
     );
 
     let isolation = started_isolation(&db_path, session_id, dispatch.task_id).await;
@@ -460,6 +480,203 @@ async fn shell_tool_dispatches_through() {
         Tier::None,
         "shell crosses the process isolation boundary — its TaskStarted must carry a real \
          attestation, not the fs kinds' Tier::None placeholder, got {isolation:?}"
+    );
+}
+
+/// Phase 8 Task 19 lane B, Task 9: `dispatch_tool_for_workflow` builds a
+/// real `ShellDeltaSink` for `TaskParams::Shell` and threads it into
+/// `execute_builtin`, mirroring `agent_loop::dispatch_builtin`'s identical
+/// wiring — a dispatched `tool: shell` step's own stdout now streams as
+/// real `TaskDelta`/`TaskProgress` events between `TaskStarted` and the
+/// terminal event, not just a single buffered string folded into
+/// `TaskCompleted.output` at the very end. This is the workflow-path half
+/// of the "on both paths" requirement; `agent_loop_dispatch.rs`'s
+/// `a_dispatched_shell_tasks_deltas_and_progress_land_between_started_and_its_terminal_event`
+/// is the chat-path half.
+#[tokio::test]
+async fn shell_tool_dispatch_streams_deltas_and_progress_before_its_terminal_event() {
+    let dir = TempDir::new().unwrap();
+    let workspace_root = dir.path().canonicalize().unwrap();
+    let program = workspace_program(
+        &workspace_root,
+        "echo_streamed.sh",
+        "#!/bin/sh\necho hello-from-streamed-shell\n",
+    );
+
+    let (actor, actor_root, db_path, session_id) = setup_actor(
+        &dir,
+        vec![CompiledRule::test_new(
+            Scope::Builtin,
+            PolicyOutcome::Allow,
+            Predicate::program(&program),
+        )],
+    )
+    .await;
+    assert_eq!(actor_root, workspace_root);
+
+    let cwd = workspace_root.to_string_lossy().to_string();
+    let dispatch = dispatch_tool_for_workflow(
+        &actor,
+        TaskKind::Shell,
+        json!({ "program": &program, "argv": [], "cwd": &cwd }),
+        json!({ "program": &program, "argv": [], "cwd": &cwd }),
+        AMPLE_STEP_TIMEOUT,
+        None,
+    )
+    .await
+    .expect("dispatch should succeed");
+    expect_completed(
+        &dispatch.result,
+        "an allowed shell dispatch with real output must complete",
+    );
+
+    let reopened = open(&db_path).await.unwrap();
+    let mut task_events: Vec<_> = session_events(&reopened, session_id)
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|e| e.task_id == Some(dispatch.task_id))
+        .collect();
+    task_events.sort_by_key(|e| e.seq);
+
+    for pair in task_events.windows(2) {
+        assert!(
+            pair[0].seq < pair[1].seq,
+            "seq must be strictly increasing across one task's own events, got {:?}",
+            task_events.iter().map(|e| e.seq).collect::<Vec<_>>()
+        );
+    }
+
+    let kinds: Vec<&'static str> = task_events.iter().map(|e| event_kind(&e.payload)).collect();
+    assert_eq!(kinds.first(), Some(&"TaskCreated"), "got {kinds:?}");
+    assert_eq!(kinds.get(1), Some(&"TaskStarted"), "got {kinds:?}");
+    assert_eq!(kinds.last(), Some(&"TaskCompleted"), "got {kinds:?}");
+    assert!(
+        kinds[2..kinds.len() - 1]
+            .iter()
+            .all(|k| *k == "TaskDelta" || *k == "TaskProgress"),
+        "every event between TaskStarted and the terminal event must be a delta or a \
+         progress note, got {kinds:?}"
+    );
+    assert!(
+        kinds.contains(&"TaskDelta"),
+        "a real shell step with real output must have produced at least one TaskDelta, got \
+         {kinds:?}"
+    );
+    assert!(
+        kinds.contains(&"TaskProgress"),
+        "a real shell step must have produced at least one TaskProgress, got {kinds:?}"
+    );
+}
+
+/// Phase 8 Task 19 lane B, Task 9's required ordering test, workflow half: a
+/// shell step that has already produced (and streamed) real output, then
+/// has its `step_timeout` elapse mid-flight, must still have every
+/// delta/progress event it produced commit strictly before its own terminal
+/// event. See `run_isolated_shell_dispatch`'s own doc comment on
+/// `completion` for why this is guaranteed regardless of the race's outcome:
+/// `ShellDeltaSink` holds a `Clone` of the very same `EventWriter` that
+/// records the terminal event, so both enqueue onto the same writer-actor
+/// FIFO.
+///
+/// The dispatched script writes ~100 KiB of stdout immediately — comfortably
+/// over `SHELL_FLUSH_CHUNK_BYTES` (64 KiB), so the pump's size-triggered
+/// flush fires and commits almost immediately — before blocking in
+/// `sleep 30`, so the step's own 300ms `step_timeout` always elapses while
+/// the script is still deep in that sleep, long after the size-triggered
+/// flush already landed.
+#[tokio::test]
+async fn shell_tool_step_timeout_with_prior_output_commits_all_deltas_before_the_terminal_event() {
+    let dir = TempDir::new().unwrap();
+    let workspace_root = dir.path().canonicalize().unwrap();
+    let program = workspace_program(
+        &workspace_root,
+        "streamed_then_hangs.sh",
+        "#!/bin/sh\nyes | head -c 100000\nsleep 30\n",
+    );
+
+    let (actor, actor_root, db_path, session_id) = setup_actor(
+        &dir,
+        vec![CompiledRule::test_new(
+            Scope::Builtin,
+            PolicyOutcome::Allow,
+            Predicate::program(&program),
+        )],
+    )
+    .await;
+    assert_eq!(actor_root, workspace_root);
+
+    let cwd = workspace_root.to_string_lossy().to_string();
+    let dispatch = tokio::time::timeout(
+        Duration::from_secs(10),
+        dispatch_tool_for_workflow(
+            &actor,
+            TaskKind::Shell,
+            json!({ "program": &program, "argv": [], "cwd": &cwd }),
+            json!({ "program": &program, "argv": [], "cwd": &cwd }),
+            Duration::from_millis(300),
+            None,
+        ),
+    )
+    .await
+    .expect("dispatch_tool_for_workflow must honor the threaded step_timeout, not hang")
+    .expect("a timed-out shell dispatch still records its own lifecycle and returns Ok(..)");
+
+    match &dispatch.result {
+        DispatchOutcome::Completed(output) => panic!(
+            "a shell step whose command outlives its step_timeout must not report success, got \
+             {output:?}"
+        ),
+        DispatchOutcome::Failed(msg) => {
+            assert!(!msg.is_empty(), "a failed dispatch must carry a message")
+        }
+        DispatchOutcome::Cancelled(reason) => panic!(
+            "a step_timeout elapsing alone (no session cancel) must be reported as an ordinary \
+             failure, not Cancelled — got Cancelled({reason:?})"
+        ),
+    }
+
+    let reopened = open(&db_path).await.unwrap();
+    let mut task_events: Vec<_> = session_events(&reopened, session_id)
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|e| e.task_id == Some(dispatch.task_id))
+        .collect();
+    task_events.sort_by_key(|e| e.seq);
+
+    let terminal = task_events
+        .iter()
+        .find(|e| matches!(&e.payload, EventPayload::TaskFailed { .. }))
+        .expect("a timed-out shell step must record a real TaskFailed terminal event");
+    assert_eq!(
+        Some(terminal.seq),
+        dispatch.last_task_seq,
+        "the terminal event found in the log must be the exact seq dispatch_tool_for_workflow \
+         itself returned"
+    );
+
+    let delta_or_progress_seqs: Vec<u64> = task_events
+        .iter()
+        .filter(|e| {
+            matches!(
+                &e.payload,
+                EventPayload::TaskDelta { .. } | EventPayload::TaskProgress { .. }
+            )
+        })
+        .map(|e| e.seq)
+        .collect();
+    assert!(
+        !delta_or_progress_seqs.is_empty(),
+        "the ~100 KiB of stdout written before the timeout must have produced at least one \
+         streamed delta/progress event — otherwise this ordering assertion is vacuous"
+    );
+    let max_delta_seq = *delta_or_progress_seqs.iter().max().unwrap();
+    assert!(
+        max_delta_seq < terminal.seq,
+        "every delta/progress event for a timed-out shell step must commit before its own \
+         terminal event — got max delta/progress seq {max_delta_seq}, terminal seq {}",
+        terminal.seq
     );
 }
 

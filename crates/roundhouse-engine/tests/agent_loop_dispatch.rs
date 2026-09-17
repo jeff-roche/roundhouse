@@ -875,6 +875,266 @@ async fn a_model_issued_shell_tool_use_with_no_matching_policy_rule_is_denied_th
     );
 }
 
+/// Names one stored event's payload variant — used by the two streamed-delta
+/// tests below to assert on the exact shape of a shell task's own event
+/// sequence, not just "some delta exists somewhere in the session."
+fn event_kind(payload: &EventPayload) -> &'static str {
+    match payload {
+        EventPayload::TaskCreated { .. } => "TaskCreated",
+        EventPayload::TaskStarted { .. } => "TaskStarted",
+        EventPayload::TaskDelta { .. } => "TaskDelta",
+        EventPayload::TaskProgress { .. } => "TaskProgress",
+        EventPayload::TaskCompleted { .. } => "TaskCompleted",
+        EventPayload::TaskFailed { .. } => "TaskFailed",
+        _ => "other",
+    }
+}
+
+/// Phase 8 Task 19 lane B, Task 9: `dispatch_builtin` now builds a real
+/// `ShellDeltaSink` for `TaskParams::Shell` and threads it into
+/// `execute_builtin` — a model-issued `shell` call's own stdout must show up
+/// as real `TaskDelta`/`TaskProgress` events between its `TaskStarted` and
+/// its terminal event, not just as a single buffered string folded into
+/// `TaskCompleted.output` at the very end. This is the chat-path half of
+/// the "on both paths" requirement; `workflow_tool_dispatch.rs`'s
+/// `shell_tool_dispatch_streams_deltas_and_progress_before_its_terminal_event`
+/// is the workflow-path half.
+#[tokio::test]
+async fn a_dispatched_shell_tasks_deltas_and_progress_land_between_started_and_its_terminal_event()
+{
+    let (dir, script) =
+        workspace_contained_script("#!/bin/sh\necho shell-ran-for-real\n", "streamed.sh");
+    let canonical_script = script.canonicalize().unwrap();
+
+    let (actor, _writer, db_path, session_id) = new_actor(
+        dir.path(),
+        dir.path().join("state"),
+        dir.path().join("daemon-binary"),
+        vec![CompiledRule::test_new(
+            Scope::Builtin,
+            Outcome::Allow,
+            Predicate::Shell {
+                program: canonical_script.to_string_lossy().to_string(),
+                matcher: ArgMatcher::ArgvPrefix(vec![]),
+                allow_interpreter: false,
+            },
+        )],
+    )
+    .await;
+
+    let tools = actor.tool_defs().to_vec();
+    let provider = ScriptedToolCallProvider::new(
+        "shell",
+        serde_json::json!({
+            "program": "./streamed.sh",
+            "argv": [],
+            "cwd": dir.path().to_string_lossy(),
+        }),
+    );
+    let ctx = fake_ctx();
+
+    run_agent_loop(
+        &actor,
+        &RUNNER,
+        &provider,
+        &ctx,
+        &tools,
+        None,
+        empty_request(),
+        AgentLoopConfig {
+            max_turns: 4,
+            max_tool_calls_per_turn: 10,
+        },
+    )
+    .await
+    .unwrap();
+
+    let reopened = open(&db_path).await.unwrap();
+    let all_events = session_events(&reopened, session_id).await.unwrap();
+    let shell_task_id = all_events
+        .iter()
+        .find_map(|e| match &e.payload {
+            EventPayload::TaskCreated {
+                kind: TaskKind::Shell,
+                ..
+            } => e.task_id,
+            _ => None,
+        })
+        .expect("a shell task must have been created");
+
+    let mut task_events: Vec<_> = all_events
+        .into_iter()
+        .filter(|e| e.task_id == Some(shell_task_id))
+        .collect();
+    task_events.sort_by_key(|e| e.seq);
+
+    for pair in task_events.windows(2) {
+        assert!(
+            pair[0].seq < pair[1].seq,
+            "seq must be strictly increasing across one task's own events, got {:?}",
+            task_events.iter().map(|e| e.seq).collect::<Vec<_>>()
+        );
+    }
+
+    let kinds: Vec<&'static str> = task_events.iter().map(|e| event_kind(&e.payload)).collect();
+    assert_eq!(kinds.first(), Some(&"TaskCreated"), "got {kinds:?}");
+    assert_eq!(kinds.get(1), Some(&"TaskStarted"), "got {kinds:?}");
+    assert_eq!(kinds.last(), Some(&"TaskCompleted"), "got {kinds:?}");
+    assert!(
+        kinds[2..kinds.len() - 1]
+            .iter()
+            .all(|k| *k == "TaskDelta" || *k == "TaskProgress"),
+        "every event between TaskStarted and the terminal event must be a delta or a \
+         progress note, got {kinds:?}"
+    );
+    assert!(
+        kinds.contains(&"TaskDelta"),
+        "a real shell task with real output must have produced at least one TaskDelta, got \
+         {kinds:?}"
+    );
+    assert!(
+        kinds.contains(&"TaskProgress"),
+        "a real shell task must have produced at least one TaskProgress, got {kinds:?}"
+    );
+}
+
+/// Phase 8 Task 19 lane B, Task 9's required ordering test: a shell call
+/// that has already produced (and streamed) real output, then gets
+/// cancelled mid-flight by the owning session leaving `Running`, must still
+/// have every delta/progress event it produced commit strictly before its
+/// own terminal event — the Global Constraint holds even when the call
+/// never finishes on its own. See `run_isolated_shell_dispatch`'s own doc
+/// comment on `completion` for why this is guaranteed: `ShellDeltaSink`
+/// holds a `Clone` of the very same `EventWriter` that records the terminal
+/// event, so both enqueue onto the same writer-actor FIFO.
+///
+/// The dispatched script writes ~100 KiB of stdout immediately — comfortably
+/// over `SHELL_FLUSH_CHUNK_BYTES` (64 KiB) — before blocking in `sleep 30`,
+/// so the pump's size-triggered (not tick-triggered) flush fires and commits
+/// almost immediately, well before the fixed head start below elapses; the
+/// dispatch is cancelled while the script is still deep in that sleep, long
+/// before it could ever exit on its own. This mirrors the fixed-head-start
+/// idiom `shell_command_cancellation_reaches_the_model_facing_dispatch`
+/// above already uses for "cancel mid-flight" tests in this file, sized up
+/// for the extra size-triggered-flush margin this test needs.
+#[tokio::test]
+async fn a_cancelled_shell_tasks_deltas_all_commit_before_its_terminal_event() {
+    let (dir, script) = workspace_contained_script(
+        "#!/bin/sh\nyes | head -c 100000\nsleep 30\n",
+        "cancel_me.sh",
+    );
+    let canonical_script = script.canonicalize().unwrap();
+
+    let (actor, _writer, db_path, session_id) = new_actor(
+        dir.path(),
+        dir.path().join("state"),
+        dir.path().join("daemon-binary"),
+        vec![CompiledRule::test_new(
+            Scope::Builtin,
+            Outcome::Allow,
+            Predicate::Shell {
+                program: canonical_script.to_string_lossy().to_string(),
+                matcher: ArgMatcher::ArgvPrefix(vec![]),
+                allow_interpreter: false,
+            },
+        )],
+    )
+    .await;
+
+    let tools = actor.tool_defs().to_vec();
+    let provider = ScriptedToolCallProvider::new(
+        "shell",
+        serde_json::json!({
+            "program": "./cancel_me.sh",
+            "argv": [],
+            "cwd": dir.path().to_string_lossy(),
+        }),
+    );
+    let ctx = fake_ctx();
+
+    let run = run_agent_loop(
+        &actor,
+        &RUNNER,
+        &provider,
+        &ctx,
+        &tools,
+        None,
+        empty_request(),
+        AgentLoopConfig {
+            max_turns: 4,
+            max_tool_calls_per_turn: 10,
+        },
+    );
+    tokio::pin!(run);
+    tokio::select! {
+        result = &mut run => panic!("shell command completed before cancellation: {result:?}"),
+        _ = async {
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            actor
+                .cancel(&RUNNER, roundhouse_core::CancelReason::User)
+                .await
+                .unwrap();
+        } => {}
+    }
+    let blocks = tokio::time::timeout(std::time::Duration::from_secs(5), &mut run)
+        .await
+        .expect("model-facing shell dispatch did not observe cancellation")
+        .unwrap();
+    assert!(
+        blocks
+            .iter()
+            .any(|b| matches!(b, ContentBlock::ToolResult { is_error: true, .. })),
+        "a cancelled shell call must surface as a real tool error, got {blocks:?}"
+    );
+
+    let reopened = open(&db_path).await.unwrap();
+    let all_events = session_events(&reopened, session_id).await.unwrap();
+    let shell_task_id = all_events
+        .iter()
+        .find_map(|e| match &e.payload {
+            EventPayload::TaskCreated {
+                kind: TaskKind::Shell,
+                ..
+            } => e.task_id,
+            _ => None,
+        })
+        .expect("a shell task must have been created");
+
+    let mut task_events: Vec<_> = all_events
+        .into_iter()
+        .filter(|e| e.task_id == Some(shell_task_id))
+        .collect();
+    task_events.sort_by_key(|e| e.seq);
+
+    let terminal = task_events
+        .iter()
+        .find(|e| matches!(&e.payload, EventPayload::TaskFailed { error, .. } if error.category == "tool_error"))
+        .expect("a cancelled shell call must record a real TaskFailed{tool_error}");
+
+    let delta_or_progress_seqs: Vec<u64> = task_events
+        .iter()
+        .filter(|e| {
+            matches!(
+                &e.payload,
+                EventPayload::TaskDelta { .. } | EventPayload::TaskProgress { .. }
+            )
+        })
+        .map(|e| e.seq)
+        .collect();
+    assert!(
+        !delta_or_progress_seqs.is_empty(),
+        "the ~100 KiB of stdout written before the cancel must have produced at least one \
+         streamed delta/progress event — otherwise this ordering assertion is vacuous"
+    );
+    let max_delta_seq = *delta_or_progress_seqs.iter().max().unwrap();
+    assert!(
+        max_delta_seq < terminal.seq,
+        "every delta/progress event for a cancelled shell task must commit before its own \
+         terminal event — got max delta/progress seq {max_delta_seq}, terminal seq {}",
+        terminal.seq
+    );
+}
+
 #[tokio::test]
 async fn a_model_issued_shell_command_is_classified_and_executes_each_node() {
     let (dir, script) =
