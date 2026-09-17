@@ -2,10 +2,9 @@
 //! and the tail guard it depends on (`StoreError::SessionClosed`, rejecting any append
 //! whose session log already ends in `SessionClosed`).
 //!
-//! Ruling P1 (binding, see `.superpowers/sdd/2026-09-17-phase8-t19a-session-close/
-//! global-constraints.md`): the sweep this file exercises covers open tasks in
-//! `Created`, `Decided`, `Running` **and `Suspended`** — deliberately wider than
-//! `recover_interrupted_tasks` (`recovery.rs`), which skips `Suspended` because a
+//! The sweep this file exercises covers open tasks in `Created`, `Decided`, `Running`
+//! **and `Suspended`** — deliberately wider than `recover_interrupted_tasks`
+//! (`recovery.rs`), which skips `Suspended` because a
 //! daemon restart re-arms a suspended task through the attention-queue path. A session
 //! close has no "later" to re-arm into once the session itself is gone, so every open
 //! task, including one merely waiting on an approval/elicitation/reply, is cancelled.

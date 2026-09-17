@@ -262,6 +262,33 @@ pub trait SubAgentHost: Send + Sync {
     /// itself. A real daemon-side implementor is expected to override this
     /// to walk `parent`'s edges in the shared `SpawnTree` and call `close`
     /// on each child's own `SessionActor` in turn.
+    ///
+    /// # Implementor contract
+    ///
+    /// **Must be idempotent.** `SessionActor::close`'s own retry path can
+    /// call this a second time for the same `parent` after an earlier
+    /// `close` attempt failed at a LATER step (its own durable append) —
+    /// see `close`'s doc comment on why a retry re-runs this step rather
+    /// than skipping it. A real implementor must tolerate being asked to
+    /// close children it has already closed (or is already closing)
+    /// without erroring or double-acting on them.
+    ///
+    /// **Owns handling a child that fails to close.** This method returns
+    /// no `Result` — `SessionActor::close`'s own signature has nowhere to
+    /// carry a per-child failure, and one uncooperative or already-gone
+    /// child must not block the parent's own close indefinitely. An
+    /// implementor is responsible for its own logging/recording of any
+    /// child it could not close (e.g. a durable `Note`, same as other
+    /// best-effort paths in this crate), rather than propagating a failure
+    /// this trait has no channel for.
+    ///
+    /// **Must not let a cascade revisit an ancestor.** Closing a child may
+    /// itself recurse into that child's own `close_children` for its
+    /// grandchildren; an implementor walking `parent`'s edges must not
+    /// follow an edge back up toward `parent` or any of its own ancestors —
+    /// the spawn tree is expected to be acyclic, but this method's own
+    /// walk must not be the thing that turns a corrupted or cyclic edge
+    /// into an infinite close loop.
     async fn close_children(&self, parent: SessionId) {
         let _ = parent;
     }

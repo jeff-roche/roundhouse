@@ -28,7 +28,7 @@ pub enum CloseReceipt {
     /// idempotent, and nothing was appended.
     AlreadyClosed,
     /// This call minted the sweep and the `SessionClosed` terminator. `swept` is how many
-    /// open tasks (Ruling P1: `Created`/`Decided`/`Running`/`Suspended`) were cancelled.
+    /// open tasks (`Created`/`Decided`/`Running`/`Suspended`) were cancelled.
     Closed { swept: usize },
 }
 
@@ -812,14 +812,13 @@ async fn append_batch_with_blobs(
 /// `SessionClosed`, this is a no-op read (`CloseReceipt::AlreadyClosed`) — nothing is
 /// appended and no `BEGIN IMMEDIATE` write is even attempted beyond the read itself.
 ///
-/// Ruling P1 (binding, `.superpowers/sdd/2026-09-17-phase8-t19a-session-close/
-/// global-constraints.md`): the sweep covers `tasks` rows in `Created`, `Decided`,
-/// `Running`, **and `Suspended`** — deliberately wider than `recover_interrupted_tasks`
-/// (`recovery.rs`), which only sweeps `Created`/`Decided`/`Running` and leaves `Suspended`
-/// alone because a daemon restart re-arms a suspended task through the attention-queue
-/// path (see `recovery.rs`'s own module doc comment). A session close has no "later" to
-/// re-arm into once the session itself is gone, so a task merely waiting on an
-/// approval/elicitation/reply/peer is cancelled too, not left stranded forever.
+/// The sweep covers `tasks` rows in `Created`, `Decided`, `Running`, **and `Suspended`** —
+/// deliberately wider than `recover_interrupted_tasks` (`recovery.rs`), which only sweeps
+/// `Created`/`Decided`/`Running` and leaves `Suspended` alone because a daemon restart
+/// re-arms a suspended task through the attention-queue path (see `recovery.rs`'s own
+/// module doc comment). A session close has no "later" to re-arm into once the session
+/// itself is gone, so a task merely waiting on an approval/elicitation/reply/peer is
+/// cancelled too, not left stranded forever.
 ///
 /// `runner` mints both the sweep's `TaskCancelled` events and the `SessionClosed`
 /// terminator (`record_task_cancelled`/`record_session_closed` — the sole sanctioned way
@@ -1223,7 +1222,7 @@ impl EventWriter {
     }
 
     /// Closes a session (Task 19a Task 1): sweeps every currently open task
-    /// (`Created`/`Decided`/`Running`/`Suspended` — Ruling P1) into
+    /// (`Created`/`Decided`/`Running`/`Suspended`) into
     /// `TaskCancelled{by: System, reason: SessionClosed}`, then appends
     /// `SessionClosed{outcome}` as the terminator, sweep events first, terminator last,
     /// all in one transaction. Idempotent — closing an already-closed session returns
