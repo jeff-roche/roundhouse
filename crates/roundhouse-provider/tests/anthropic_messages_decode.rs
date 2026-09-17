@@ -1,5 +1,6 @@
+use futures::StreamExt;
 use roundhouse_provider::codec::anthropic_messages::{
-    decode_anthropic_messages_stream, StreamFailureKind,
+    decode_anthropic_messages_events, decode_anthropic_messages_stream, StreamFailureKind,
 };
 use roundhouse_provider::{
     BlockDelta, BlockKind, CassetteTransport, HttpRequest, HttpTransport, StreamEvent,
@@ -117,4 +118,163 @@ async fn a_mid_stream_transport_error_is_surfaced_not_silently_dropped() {
     };
     assert_eq!(failure.kind, StreamFailureKind::Transport);
     assert_eq!(failure.partial_text, "cut off here");
+}
+
+/// Task 2: `decode_anthropic_messages_events` must be a genuinely incremental
+/// decoder -- it has to yield an already-decoded frame's event the moment
+/// that frame is available, without waiting for the body to end. Uses a
+/// `futures::channel::mpsc` body under direct manual control (no sleeps): the
+/// first poll before anything is sent must be pending (nothing to yield
+/// yet), the first frame decodes to `Some(Some(Ok(BlockStart)))` the instant
+/// it's sent even though the sender is still open (proving this isn't just a
+/// buffered decode masquerading as a stream), and a second poll right after
+/// is pending again (proving it doesn't fabricate completion either).
+#[test]
+fn block_start_arrives_while_the_body_is_still_open() {
+    use futures::channel::mpsc;
+    use futures::FutureExt;
+
+    let (tx, rx) = mpsc::unbounded::<Result<bytes::Bytes, TransportError>>();
+    let events = decode_anthropic_messages_events(rx);
+    futures::pin_mut!(events);
+
+    // Nothing sent yet: the body is open and empty, so polling now must be
+    // pending, not `None` (end of stream) and not `Some` (a fabricated
+    // event).
+    assert!(
+        events.next().now_or_never().is_none(),
+        "polling an events stream with nothing sent yet must be pending"
+    );
+
+    tx.unbounded_send(Ok(bytes::Bytes::from(
+        "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\"}}\n\n",
+    )))
+    .unwrap();
+
+    let first = events
+        .next()
+        .now_or_never()
+        .expect("a full frame was already sent -- decoding it must not need another network read")
+        .expect("the stream must not end while the sender is still open")
+        .expect("a well-formed content_block_start frame must decode without error");
+    assert!(matches!(
+        first,
+        StreamEvent::BlockStart {
+            index: 0,
+            kind: BlockKind::Text
+        }
+    ));
+
+    // The sender is still open and nothing further was sent: a second poll
+    // must be pending again, not `None` -- this decoder must not treat "no
+    // more frames right now" as "the stream ended".
+    assert!(
+        events.next().now_or_never().is_none(),
+        "a second poll while the sender is still open and idle must be pending, not end-of-stream"
+    );
+
+    drop(tx);
+}
+
+/// Splits `bytes` into contiguous chunks at `points` (deduped, sorted,
+/// clamped into range), mirroring how a real network body arrives in
+/// arbitrarily-sized pieces. An empty `points` list yields the whole body as
+/// one chunk.
+fn split_at(bytes: &[u8], points: &[usize]) -> Vec<bytes::Bytes> {
+    let mut points: Vec<usize> = points.iter().copied().map(|p| p.min(bytes.len())).collect();
+    points.sort_unstable();
+    points.dedup();
+
+    let mut chunks = Vec::new();
+    let mut start = 0;
+    for point in points {
+        chunks.push(bytes::Bytes::copy_from_slice(&bytes[start..point]));
+        start = point;
+    }
+    chunks.push(bytes::Bytes::copy_from_slice(&bytes[start..]));
+    chunks
+}
+
+/// Drives `decode_anthropic_messages_events` over `chunks` to completion,
+/// collapsing each `StreamFailure` down to its `kind` (whose `message` field
+/// isn't required to be split-point-invariant, only `kind` and the events
+/// that already decoded are).
+async fn decode_chunks(chunks: Vec<bytes::Bytes>) -> Vec<Result<StreamEvent, StreamFailureKind>> {
+    let body = futures::stream::iter(chunks.into_iter().map(Ok::<_, TransportError>));
+    let stream = decode_anthropic_messages_events(body);
+    futures::pin_mut!(stream);
+    let mut out = Vec::new();
+    while let Some(item) = stream.next().await {
+        out.push(item.map_err(|failure| failure.kind));
+    }
+    out
+}
+
+/// The three fixtures this equivalence check runs over: both of the existing
+/// well-formed fixtures, plus a new one (`anthropic_multibyte.sse`) whose
+/// `text_delta` contains literal multi-byte UTF-8 (an accented Latin letter,
+/// two CJK characters, and an astral-plane emoji encoded as a UTF-8
+/// surrogate-pair-free 4-byte sequence) -- so that splitting at *every* byte
+/// offset necessarily includes splits that land inside a multi-byte
+/// sequence, not just at frame/line boundaries.
+fn fixtures() -> [&'static [u8]; 3] {
+    [
+        include_bytes!("fixtures/anthropic_hello.sse").as_slice(),
+        include_bytes!("fixtures/anthropic_thinking.sse").as_slice(),
+        include_bytes!("fixtures/anthropic_multibyte.sse").as_slice(),
+    ]
+}
+
+/// Task 2 (b): for every fixture and every single split point (including
+/// mid-multibyte-sequence splits in `anthropic_multibyte.sse`), decoding the
+/// body split into exactly two chunks at that point must produce the exact
+/// same event sequence as decoding it as one whole chunk. `sse_stream`
+/// reassembles line/frame boundaries incrementally regardless of where the
+/// underlying transport happened to split the bytes, and this decoder must
+/// not add any chunk-alignment sensitivity on top of that.
+#[tokio::test]
+async fn every_single_split_point_matches_the_whole_body_decode() {
+    for fixture in fixtures() {
+        let whole = decode_chunks(split_at(fixture, &[])).await;
+        for split in 0..=fixture.len() {
+            let split_result = decode_chunks(split_at(fixture, &[split])).await;
+            assert_eq!(
+                split_result,
+                whole,
+                "splitting at byte {split} of {} produced a different event sequence than the \
+                 whole-body decode",
+                fixture.len()
+            );
+        }
+    }
+}
+
+/// Task 2 (b): 200 seeded (deterministic, no wall-clock/no external entropy)
+/// random multi-chunk splits per fixture must also match the whole-body
+/// decode -- single split points prove pairwise chunk boundaries don't
+/// matter, this proves arbitrarily many simultaneous chunk boundaries don't
+/// either.
+#[tokio::test]
+async fn two_hundred_seeded_random_multi_splits_match_the_whole_body_decode() {
+    use rand::rngs::StdRng;
+    use rand::{Rng, SeedableRng};
+
+    for fixture in fixtures() {
+        let whole = decode_chunks(split_at(fixture, &[])).await;
+        let mut rng = StdRng::seed_from_u64(0xA17_C0DE_u64);
+        for trial in 0..200 {
+            let num_splits = rng.random_range(0..8usize);
+            let points: Vec<usize> = (0..num_splits)
+                .map(|_| rng.random_range(0..=fixture.len()))
+                .collect();
+            let split_result = decode_chunks(split_at(fixture, &points)).await;
+            assert_eq!(
+                split_result,
+                whole,
+                "seeded random multi-split trial {trial} (points {points:?}) of a \
+                 {}-byte fixture produced a different event sequence than the whole-body decode",
+                fixture.len()
+            );
+        }
+    }
 }

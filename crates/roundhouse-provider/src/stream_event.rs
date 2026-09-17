@@ -17,7 +17,7 @@ pub enum BlockKind {
 }
 
 /// A delta received in a `BlockDelta` event, representing incremental changes to a block.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum BlockDelta {
     /// Incremental text content.
     Text(String),
@@ -33,6 +33,12 @@ pub enum BlockDelta {
 }
 
 /// Streaming event representing a chunk of a provider's response stream.
+///
+/// `Debug`/`PartialEq` (Phase 8 T19b Task 2) exist for
+/// `anthropic_messages_decode.rs`'s split-point equivalence tests, which
+/// compare a whole-body decode's event vector against the same body decoded
+/// incrementally across arbitrary chunk boundaries.
+#[derive(Debug, PartialEq)]
 pub enum StreamEvent {
     /// Start of a new content block at the given index with the specified kind.
     BlockStart {

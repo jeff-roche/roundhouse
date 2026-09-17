@@ -58,22 +58,6 @@ pub struct StreamFailure {
     pub partial_text: String,
 }
 
-/// Text decoded so far, for `StreamFailure::partial_text`. Mirrors
-/// `cohere_v2::decode`'s identical helper.
-fn partial_text_from_events(events: &[StreamEvent]) -> String {
-    let mut text = String::new();
-    for event in events {
-        if let StreamEvent::BlockDelta {
-            delta: BlockDelta::Text(t),
-            ..
-        } = event
-        {
-            text.push_str(t);
-        }
-    }
-    text
-}
-
 /// Normalizes Anthropic's `input_tokens` usage figure by adding back `cache_read_input_tokens`.
 ///
 /// Anthropic reports `input_tokens` as the count of *freshly processed* prompt tokens,
@@ -90,77 +74,61 @@ pub fn normalize_anthropic_usage(input_tokens: u64, cache_read_input_tokens: u64
     input_tokens.saturating_add(cache_read_input_tokens)
 }
 
-/// Decodes an Anthropic Messages SSE response body into normalized [`StreamEvent`]s.
+/// Owns everything one decode pass over an Anthropic Messages SSE body
+/// accumulates across frames, so both the incremental
+/// [`decode_anthropic_messages_events`] loop and (through it)
+/// [`decode_anthropic_messages_stream`]'s collect adapter dispatch on exactly
+/// the same rules and can never diverge on what a given frame decodes to:
 ///
-/// Parses `data: {...}` frames and dispatches on the payload's `type` field. Malformed or
-/// unparseable frames (bad JSON, a missing `data` field on an SSE comment/keep-alive frame,
-/// an unrecognized `type`) are skipped rather than treated as fatal — this decoder will
-/// eventually process live bytes from Anthropic's network API, so it never panics on
-/// unexpected shapes.
-///
-/// `message_start`'s `usage.input_tokens`/`usage.cache_read_input_tokens` and
-/// `message_delta`'s `usage.output_tokens` are two halves of one logical usage update
-/// (Anthropic splits them across the start and end of the stream); this decoder buffers the
-/// `message_start` half and emits a single combined `UsageDelta` when `message_delta`
-/// arrives, rather than emitting a partial `UsageDelta` immediately at `message_start`. This
-/// also keeps `events[0]` as the first real content event (`BlockStart`) rather than a
-/// usage bookkeeping event that arrives before any content — the natural place for
-/// consumers to look for "did the stream produce anything yet".
-///
-/// Ruling R17 (Phase 7, Task 11): joins the "strict" truncation-signaling
-/// group (`openai_chat`, `cohere_v2`) — returns `Err(StreamFailure)`,
-/// never `Ok`, if the loop ends without ever observing a `message_stop`
-/// event or hits a mid-stream transport/SSE-framing error. Before this fix
-/// it returned a bare `Vec<StreamEvent>` unconditionally, the last codec in
-/// this crate still doing so; see `crate::decode_guard` for the shared,
-/// structural "did we ever see the terminal" guard this and its two strict
-/// siblings now share.
-pub async fn decode_anthropic_messages_stream(
-    body: impl Stream<Item = Result<Bytes, TransportError>> + Send + Unpin,
-) -> Result<Vec<StreamEvent>, StreamFailure> {
-    let mut sse = SseStream::from_bytes_stream(body);
-    let mut events = Vec::new();
-    let mut guard = DecodeLoopGuard::new();
+/// - the `message_start`/`message_delta` usage halves, buffered until both
+///   are available (see [`AnthropicDecodeState::on_frame`]'s doc comment);
+/// - [`DecodeLoopGuard`]'s "did we ever see `message_stop`" tracking;
+/// - a running concatenation of every `BlockDelta::Text` fragment decoded so
+///   far, for `StreamFailure::partial_text` if the stream fails before
+///   completing (mirrors the old buffered loop's `partial_text_from_events`
+///   helper, computed incrementally instead of by re-scanning `events` at
+///   the point of failure).
+#[derive(Default)]
+struct AnthropicDecodeState {
+    guard: DecodeLoopGuard,
     // Buffered from `message_start`; combined with `message_delta`'s `output_tokens` into
-    // one `UsageDelta` (see doc comment above).
-    let mut initial_input_tokens: Option<u64> = None;
-    let mut initial_cache_read_tokens: Option<u64> = None;
+    // one `UsageDelta` (see `on_frame`'s doc comment).
+    initial_input_tokens: Option<u64>,
+    initial_cache_read_tokens: Option<u64>,
+    partial_text: String,
+}
 
-    while let Some(frame) = sse.next().await {
-        // Ruling R17: a mid-stream transport/SSE-framing error must not be
-        // swallowed as benign — this used to be `let Ok(frame) = frame else
-        // { continue };`, indistinguishable from a skipped keep-alive
-        // frame. Mirrors `openai_chat`/`cohere_v2::decode`'s identical fix.
-        let frame = match frame {
-            Ok(f) => f,
-            Err(e) => {
-                return Err(StreamFailure {
-                    kind: StreamFailureKind::Transport,
-                    message: redact_transport_error_text(&format!(
-                        "SSE transport error while decoding the anthropic-messages stream: {e}"
-                    )),
-                    partial_text: partial_text_from_events(&events),
-                });
-            }
-        };
-        // SSE keep-alive/comment frames carry no `data` field at all — not an error,
-        // just skip and wait for the next frame (matches the OpenAI decoder's handling
-        // of the same real `sse-stream` API shape).
-        let Some(data) = frame.data else { continue };
-        let Ok(payload) = serde_json::from_str::<Value>(data.trim()) else {
-            continue;
-        };
-        let Some(kind) = payload.get("type").and_then(Value::as_str) else {
-            continue;
-        };
+impl AnthropicDecodeState {
+    fn new() -> Self {
+        Self::default()
+    }
 
-        match kind {
+    /// Applies one already-JSON-parsed SSE frame payload, dispatching on its
+    /// `type` field exactly as the original buffered loop's `match` did, and
+    /// returns the single normalized event it produced, if any. A frame with
+    /// no (or a non-string) `type` field produces `None`, same as an
+    /// unrecognized `type` — this never treats a malformed frame as fatal,
+    /// since this decoder processes live bytes from Anthropic's network API
+    /// and must not panic on an unexpected shape.
+    ///
+    /// `message_start` never produces an event by itself: it only buffers
+    /// the input/cache usage halves that `message_delta` later combines into
+    /// one [`StreamEvent::UsageDelta`] (Anthropic splits usage reporting
+    /// across the start and end of the stream). Buffering rather than
+    /// emitting immediately also keeps the first real *content* event
+    /// (`BlockStart`) as the first event a consumer sees, rather than a
+    /// usage bookkeeping event with no content behind it yet.
+    fn on_frame(&mut self, payload: &Value) -> Option<StreamEvent> {
+        let kind = payload.get("type").and_then(Value::as_str)?;
+
+        let event = match kind {
             "message_start" => {
                 if let Some(usage) = payload.pointer("/message/usage") {
-                    initial_input_tokens = usage.get("input_tokens").and_then(Value::as_u64);
-                    initial_cache_read_tokens =
+                    self.initial_input_tokens = usage.get("input_tokens").and_then(Value::as_u64);
+                    self.initial_cache_read_tokens =
                         usage.get("cache_read_input_tokens").and_then(Value::as_u64);
                 }
+                None
             }
             "content_block_start" => {
                 let index = payload.get("index").and_then(Value::as_u64).unwrap_or(0) as u32;
@@ -183,10 +151,10 @@ pub async fn decode_anthropic_messages_stream(
                     },
                     _ => BlockKind::Text,
                 };
-                events.push(StreamEvent::BlockStart {
+                Some(StreamEvent::BlockStart {
                     index,
                     kind: block_kind,
-                });
+                })
             }
             "content_block_delta" => {
                 let index = payload.get("index").and_then(Value::as_u64).unwrap_or(0) as u32;
@@ -226,13 +194,11 @@ pub async fn decode_anthropic_messages_stream(
                     }),
                     _ => None,
                 };
-                if let Some(delta) = delta {
-                    events.push(StreamEvent::BlockDelta { index, delta });
-                }
+                delta.map(|delta| StreamEvent::BlockDelta { index, delta })
             }
             "content_block_stop" => {
                 let index = payload.get("index").and_then(Value::as_u64).unwrap_or(0) as u32;
-                events.push(StreamEvent::BlockStop { index });
+                Some(StreamEvent::BlockStop { index })
             }
             "message_delta" => {
                 let output_tokens = payload
@@ -241,35 +207,151 @@ pub async fn decode_anthropic_messages_stream(
                 // Only emit a combined UsageDelta if there's something to report — either
                 // half (message_start's input/cache figures, or this message_delta's
                 // output figure) may legitimately be absent on a malformed/partial stream.
-                if initial_input_tokens.is_some()
-                    || initial_cache_read_tokens.is_some()
+                if self.initial_input_tokens.is_some()
+                    || self.initial_cache_read_tokens.is_some()
                     || output_tokens.is_some()
                 {
-                    let input_tokens = initial_input_tokens.map(|input| {
-                        normalize_anthropic_usage(input, initial_cache_read_tokens.unwrap_or(0))
+                    let input_tokens = self.initial_input_tokens.map(|input| {
+                        normalize_anthropic_usage(
+                            input,
+                            self.initial_cache_read_tokens.unwrap_or(0),
+                        )
                     });
-                    events.push(StreamEvent::UsageDelta {
+                    Some(StreamEvent::UsageDelta {
                         input_tokens,
                         output_tokens,
-                        cache_read_tokens: initial_cache_read_tokens,
-                    });
+                        cache_read_tokens: self.initial_cache_read_tokens,
+                    })
+                } else {
+                    None
                 }
             }
-            "message_stop" => {
-                events.push(StreamEvent::MessageStop);
-                guard.observe(&StreamEvent::MessageStop);
+            "message_stop" => Some(StreamEvent::MessageStop),
+            _ => None,
+        };
+
+        if let Some(event) = &event {
+            self.guard.observe(event);
+            if let StreamEvent::BlockDelta {
+                delta: BlockDelta::Text(text),
+                ..
+            } = event
+            {
+                self.partial_text.push_str(text);
             }
-            _ => {}
         }
+
+        event
     }
+}
 
-    guard.finish().map_err(|_| StreamFailure {
-        kind: StreamFailureKind::Truncated,
-        message: "anthropic-messages stream ended without ever observing a message_stop event \
-                   -- the generation was truncated"
-            .into(),
-        partial_text: partial_text_from_events(&events),
-    })?;
+/// Decodes an Anthropic Messages SSE response body into normalized
+/// [`StreamEvent`]s incrementally: each item is yielded as soon as its frame
+/// has fully arrived and decoded, without waiting for the rest of the body
+/// (§9.3 — "streaming is the only path"). `sse_stream::SseStream` already
+/// reassembles line/frame boundaries independent of how the underlying
+/// transport chunked the bytes, so this only has to drive it frame by frame
+/// through [`AnthropicDecodeState::on_frame`] rather than draining it first;
+/// see that method's doc comment for the per-`type` dispatch rules and
+/// `AnthropicDecodeState`'s for what state carries across frames.
+///
+/// Built with [`futures::stream::unfold`] over `(SseStream, state, done)`:
+/// each poll drives the SSE parser frame by frame, skipping frames that
+/// decode to no event (`message_start`, keep-alives, malformed/unrecognized
+/// frames), until one produces an event, the body ends, or a transport error
+/// arrives. `done` latches once a terminal item (a `StreamFailure` or a
+/// clean end) has been produced, so this stream never polls the underlying
+/// body again afterward and never yields a second terminal item.
+///
+/// Ruling R17 (Phase 7, Task 11): joins the "strict" truncation-signaling
+/// group (`openai_chat`, `cohere_v2`) — at EOF, yields at most one terminal
+/// `Err(StreamFailure { kind: Truncated, .. })` if `message_stop` was never
+/// observed ([`DecodeLoopGuard::finish`]), and a mid-stream transport/SSE-
+/// framing error yields `Err(StreamFailure { kind: Transport, .. })` and
+/// stops rather than being silently swallowed (matching
+/// `openai_chat`/`cohere_v2::decode`'s identical fix — this used to be `let
+/// Ok(frame) = frame else { continue };`, indistinguishable from a benign
+/// skipped keep-alive frame).
+pub fn decode_anthropic_messages_events<B>(
+    body: B,
+) -> impl Stream<Item = Result<StreamEvent, StreamFailure>> + Send
+where
+    B: Stream<Item = Result<Bytes, TransportError>> + Send + Unpin,
+{
+    let sse = SseStream::from_bytes_stream(body);
+    let state = AnthropicDecodeState::new();
 
-    Ok(events)
+    futures::stream::unfold(
+        (sse, state, false),
+        |(mut sse, mut state, done)| async move {
+            if done {
+                return None;
+            }
+            loop {
+                match sse.next().await {
+                    None => {
+                        return match std::mem::take(&mut state.guard).finish() {
+                            Ok(()) => None,
+                            Err(_) => {
+                                let failure = StreamFailure {
+                                    kind: StreamFailureKind::Truncated,
+                                    message: "anthropic-messages stream ended without ever \
+                                          observing a message_stop event -- the generation was \
+                                          truncated"
+                                        .into(),
+                                    partial_text: std::mem::take(&mut state.partial_text),
+                                };
+                                Some((Err(failure), (sse, state, true)))
+                            }
+                        };
+                    }
+                    Some(Err(e)) => {
+                        let failure = StreamFailure {
+                            kind: StreamFailureKind::Transport,
+                            message: redact_transport_error_text(&format!(
+                            "SSE transport error while decoding the anthropic-messages stream: {e}"
+                        )),
+                            partial_text: std::mem::take(&mut state.partial_text),
+                        };
+                        return Some((Err(failure), (sse, state, true)));
+                    }
+                    Some(Ok(frame)) => {
+                        // SSE keep-alive/comment frames carry no `data` field at all — not an
+                        // error, just skip and wait for the next frame (matches the OpenAI
+                        // decoder's handling of the same real `sse-stream` API shape).
+                        let Some(data) = frame.data else { continue };
+                        let Ok(payload) = serde_json::from_str::<Value>(data.trim()) else {
+                            continue;
+                        };
+                        if let Some(event) = state.on_frame(&payload) {
+                            return Some((Ok(event), (sse, state, false)));
+                        }
+                        // This frame decoded to no event (e.g. `message_start`, or an
+                        // unrecognized/malformed shape) — keep polling for the next one
+                        // instead of yielding a hole in the item stream.
+                    }
+                }
+            }
+        },
+    )
+}
+
+/// Decodes an Anthropic Messages SSE response body into normalized
+/// [`StreamEvent`]s, collecting the whole body first. A collect adapter over
+/// [`decode_anthropic_messages_events`] — kept as its own function, with this
+/// exact signature, because `AnthropicMessagesProfileProvider` and this
+/// module's own tests still consume a `Vec<StreamEvent>` rather than the
+/// stream directly (Phase 8 T19b Task 3 is what makes the provider consume
+/// the incremental stream instead).
+pub async fn decode_anthropic_messages_stream(
+    body: impl Stream<Item = Result<Bytes, TransportError>> + Send + Unpin,
+) -> Result<Vec<StreamEvent>, StreamFailure> {
+    let events = decode_anthropic_messages_events(body);
+    futures::pin_mut!(events);
+
+    let mut out = Vec::new();
+    while let Some(item) = events.next().await {
+        out.push(item?);
+    }
+    Ok(out)
 }
