@@ -480,6 +480,16 @@ impl SessionActor {
         &self.workspace_root
     }
 
+    /// This session's blob root — the same directory `roundhouse_store::blobs`'
+    /// `write_blob`/`read_verified_blob`/`record_blob_write` use, and the value
+    /// `roundhouse_store::EventWriter::append_batch_with_blobs` needs. Phase 8
+    /// Task 19 lane B, Task 8's `ShellDeltaSink` is the intended caller — it
+    /// needs this to write streamed shell-output blobs into the SAME tree its
+    /// events already index, not a separate/private path this actor invents.
+    pub fn state_dir(&self) -> &Path {
+        &self.state_dir
+    }
+
     /// The `(device, inode)` pair this session's workspace root must still
     /// resolve to, when one was recorded. Read by the `agent` tool so a
     /// spawned child is created against the SAME workspace identity its
@@ -1502,6 +1512,28 @@ pub fn egress_policy_from_allowed_hosts(allowed_hosts: &[String]) -> EgressPolic
     }
 }
 
+/// The one shared `TaskRunner` for this crate's ENTIRE `--lib` unit-test
+/// binary (Phase 8 Task 19 lane B, Task 8). `TaskRunner::bootstrap()` panics
+/// on a second call per process (S-LOG-1's "exactly one authority may mint
+/// Task records" — see its own doc comment), and `cargo test`'s `--lib`
+/// target links every source file's `#[cfg(test)] mod` into ONE process —
+/// so any second unit test elsewhere in this crate that also needs a real
+/// `TaskRunner` must share this one instance rather than calling
+/// `bootstrap()` again (`agent_loop.rs`'s `dispatch_mcp_join_result_outcome`
+/// doc comment already documents this exact constraint, for the
+/// integration-test-file workaround used where a lighter, in-crate-only test
+/// double — like `tool_dispatch.rs`'s own `TestIsolator` — isn't needed;
+/// this accessor is the workaround for when one IS needed, in-lib). The
+/// `min_secret_len_is_a_destructive_pattern_guard_not_a_security_threshold`
+/// test below and `tool_dispatch.rs`'s Task 8 shell-delta tests are, as of
+/// this change, this binary's only two call sites — both route through this
+/// one `OnceLock` rather than `TaskRunner::bootstrap()` directly.
+#[cfg(test)]
+pub(crate) fn test_runner() -> &'static TaskRunner {
+    static RUNNER: std::sync::OnceLock<TaskRunner> = std::sync::OnceLock::new();
+    RUNNER.get_or_init(TaskRunner::bootstrap)
+}
+
 #[cfg(test)]
 mod redaction_and_egress_tests {
     use super::*;
@@ -1675,7 +1707,7 @@ mod redaction_and_egress_tests {
         let db_path = dir.path().join("events.db");
         let store = roundhouse_store::open(&db_path).await.unwrap();
         let writer = roundhouse_store::spawn_writer(store).await;
-        let runner = roundhouse_core::TaskRunner::bootstrap();
+        let runner = test_runner();
 
         // A pathologically short (2-byte) value must still be dropped —
         // installing it as a redaction pattern would match at nearly

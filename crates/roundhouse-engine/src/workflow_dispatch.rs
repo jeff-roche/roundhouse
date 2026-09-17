@@ -327,6 +327,10 @@ pub async fn dispatch_tool_for_workflow(
         pre_spawned,
         actor,
         step_timeout,
+        // Phase 8 Task 19 lane B, Task 9 wires the real streamed-delta sink
+        // into this call site; until then this preserves the existing
+        // single-buffered-string behavior exactly.
+        None,
     )
     .await
     {

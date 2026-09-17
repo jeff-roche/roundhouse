@@ -1524,6 +1524,10 @@ async fn dispatch_builtin(
         // 120s bound `execute_builtin` used to hardcode internally, just
         // passed explicitly now that the parameter is real.
         crate::tool_dispatch::SHELL_TIMEOUT,
+        // Phase 8 Task 19 lane B, Task 9 wires the real streamed-delta sink
+        // into this call site; until then this preserves the existing
+        // single-buffered-string behavior exactly.
+        None,
     )
     .await
     {
