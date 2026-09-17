@@ -50,10 +50,12 @@
 //!   [`DeliveryExecutor::run_claimed_delivery`] for both.
 
 use std::collections::HashMap;
+use std::future::Future;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use chrono::{DateTime, Utc};
+use futures::stream::{self, StreamExt};
 use roundhouse_bus::spawn_tree::SpawnTree;
 use roundhouse_core::{
     BindingId, CancelReason, EventPayload, JobId, OnDegrade, Origin, SessionId, SessionSpec,
@@ -856,6 +858,17 @@ enum PendingExecution {
     ChildParked,
 }
 
+/// One [`PendingWork`] item's own resolution, from [`DeliveryExecutor::
+/// dispatch_one_pending`] — [`PendingExecution`] at item granularity, so a
+/// wave of items can be run concurrently (Phase 8 Task 25.7 Task 3) and
+/// folded back into one [`PendingExecution`] afterward by
+/// [`dispatch_wave`]. See `dispatch_wave`'s own doc comment for exactly how
+/// the fold works and why.
+enum ItemOutcome {
+    Done(WorkDone),
+    ChildParked,
+}
+
 /// The child-driving failures that must be observable without allowing a
 /// workspace, session, or run-loop error to carry raw workflow input into a
 /// log field.
@@ -880,12 +893,18 @@ impl ChildDispatchFailure {
     }
 }
 
-fn park_child_after_failure(failure: ChildDispatchFailure) -> PendingExecution {
+/// Returns [`ItemOutcome`], not [`PendingExecution`]: since Phase 8 Task
+/// 25.7 Task 3, every call site is inside [`DeliveryExecutor::
+/// dispatch_one_pending`] (one item's own dispatch), not the whole-wave
+/// `execute_pending_with_context` — [`dispatch_wave`] is what folds an
+/// item-level `ChildParked` up into the wave-level `PendingExecution`
+/// variant of the same name.
+fn park_child_after_failure(failure: ChildDispatchFailure) -> ItemOutcome {
     tracing::error!(
         kind = failure.kind(),
         "child workflow dispatch failed; leaving the parent and child nonterminal"
     );
-    PendingExecution::ChildParked
+    ItemOutcome::ChildParked
 }
 
 /// How [`DeliveryExecutor::handle_run_outcome`] treats a run that reached
@@ -1059,6 +1078,12 @@ fn flush_task_events(
 fn unanswerable_work(step_id: String, message: String) -> WorkDone {
     WorkDone {
         step_id,
+        // A placeholder, overwritten by `execute_pending_with_context`'s own
+        // one-place echo of the `PendingWork`'s `item_index` — see the loop
+        // there for why the echo lives at the loop and not at each of this
+        // file's `WorkDone` constructors. This function has no `PendingWork`
+        // to read it from, which is exactly why it cannot be the echo's home.
+        item_index: None,
         status: WorkStatus::Failed { message },
         output: serde_json::Value::Null,
         output_is_secret_derived: false,
@@ -1104,6 +1129,7 @@ fn failed_work_done_after_recording(
     match append_result {
         Ok(last_task_seq) => WorkDone {
             step_id,
+            item_index: None,
             status: WorkStatus::Failed { message },
             output: serde_json::Value::Null,
             output_is_secret_derived: false,
@@ -1113,6 +1139,7 @@ fn failed_work_done_after_recording(
         },
         Err(append_err) => WorkDone {
             step_id,
+            item_index: None,
             status: WorkStatus::Failed {
                 message: format!(
                     "{message}; additionally failed to record its terminal event: {append_err}"
@@ -1242,6 +1269,7 @@ fn work_done_from_dispatch(
             };
             WorkDone {
                 step_id,
+                item_index: None,
                 status,
                 output,
                 output_is_secret_derived: false,
@@ -1314,6 +1342,92 @@ fn reclassify_if_interrupted(done: &mut WorkDone, session: &HeadlessSession) {
             reason: cancel_reclassification_reason(&state),
         };
         done.output = serde_json::Value::Null;
+    }
+}
+
+/// Runs every item in one wave through `dispatch_one` concurrently, bounded
+/// by the wave's own size, and folds the results into one
+/// [`PendingExecution`] (Phase 8 Task 25.7 Task 3).
+///
+/// A free function, generic over `dispatch_one`, rather than an
+/// `DeliveryExecutor` method: it does no I/O of its own and needs no access
+/// to `self` — every item's real work happens inside the `dispatch_one`
+/// closure a caller supplies (in production,
+/// [`DeliveryExecutor::execute_pending_with_context`] passes
+/// [`DeliveryExecutor::dispatch_one_pending`] bound to its own `&self` and
+/// the wave's shared context). That keeps this function's own concurrency
+/// and aggregation logic directly unit-testable with synthetic dispatch
+/// closures, with no `HeadlessSession`/store/policy fixtures required.
+///
+/// # Concurrency bound
+///
+/// `futures::stream::StreamExt::buffer_unordered`, bounded by
+/// `pending.len().max(1)` — never unbounded relative to the batch the
+/// caller actually sent (`join_all` would be unbounded), while still
+/// documenting that bound as an explicit invariant of this function rather
+/// than trusting every caller to have already capped it. Today every real
+/// caller already has: a non-`map` wave is always length 1, and Task 2's
+/// `Loop::dispatch_map` caps a `map` wave at `max_parallel` before this
+/// function ever sees it — this function does not itself enforce
+/// `max_parallel`.
+///
+/// # Folding `ItemOutcome`s into one `PendingExecution`
+///
+/// Every item's own [`ItemOutcome`] future is polled to completion before
+/// this function looks at any of them — none is cancelled early because a
+/// sibling resolved to `ChildParked` first, matching
+/// `execute_pending_with_context`'s own doc comment (its "every item runs
+/// to completion" section). Once all have resolved: if **any** item
+/// resolved to `ItemOutcome::ChildParked`, this returns
+/// `PendingExecution::ChildParked` for the whole wave, discarding every
+/// other item's real `ItemOutcome::Done` answer — exactly the effect the
+/// pre-Task-3 sequential loop's early `return PendingExecution::ChildParked`
+/// already had (it discarded `done`'s already-accumulated entries and never
+/// even attempted the remaining items). Only when nothing in the wave
+/// parked does this return `PendingExecution::Done` with every item's real
+/// [`WorkDone`].
+///
+/// **That discard is only sound because a wave carrying a `ChildRun` carries
+/// exactly one entry**, and only a `ChildRun` item can park — every
+/// `ItemOutcome::ChildParked` in this file comes from
+/// `dispatch_one_pending`'s `PendingKind::ChildRun` arm or from
+/// [`park_child_after_failure`], which that arm alone calls. A discarded
+/// answer is not recoverable: the run loop is left with a `Running`
+/// `workflow_step_run` row and no `WorkDone` to match it, and for a
+/// `tool:`/`agent:` sibling nothing durable records what the dispatch
+/// returned, so the next segment crash-refuses an item whose work really did
+/// complete.
+///
+/// The invariant held for free while a `ChildRun` could only come from a
+/// top-level `call:` (always a one-entry wave). Phase 8 Task 25.7 Task 7 made
+/// a nested `call:` real, so it is now maintained on the **producer** side, by
+/// `roundhouse_flow`'s `Loop::dispatch_map` — see `ItemAdvance::Deferred`,
+/// which holds the whole argument. If that ever changes, this fold has to stop
+/// being all-or-nothing first.
+async fn dispatch_wave<F, Fut>(pending: Vec<PendingWork>, dispatch_one: F) -> PendingExecution
+where
+    F: Fn(PendingWork) -> Fut,
+    Fut: Future<Output = ItemOutcome>,
+{
+    let concurrency = pending.len().max(1);
+    let outcomes: Vec<ItemOutcome> = stream::iter(pending)
+        .map(dispatch_one)
+        .buffer_unordered(concurrency)
+        .collect()
+        .await;
+
+    let mut done = Vec::with_capacity(outcomes.len());
+    let mut any_child_parked = false;
+    for outcome in outcomes {
+        match outcome {
+            ItemOutcome::Done(work_done) => done.push(work_done),
+            ItemOutcome::ChildParked => any_child_parked = true,
+        }
+    }
+    if any_child_parked {
+        PendingExecution::ChildParked
+    } else {
+        PendingExecution::Done(done)
     }
 }
 
@@ -2358,6 +2472,47 @@ impl DeliveryExecutor {
     /// `call:` children.** Every `agent:` step is refused with a named,
     /// recorded failure; wiring it is Phase 8 Task 25.5.
     ///
+    /// # Concurrency (Phase 8 Task 25.7 Task 3)
+    ///
+    /// `pending` arrives as a whole wave — since Task 2, a `map` step hands
+    /// back up to `max_parallel` items in one call, where every non-`map`
+    /// caller still hands back exactly one. This method dispatches the
+    /// whole batch concurrently rather than one item at a time: each item's
+    /// own dispatch (everything below, per `PendingKind`) is unchanged, but
+    /// [`dispatch_wave`] runs every item's [`dispatch_one_pending`] future
+    /// through `futures::stream::StreamExt::buffer_unordered`, bounded by
+    /// the batch's own length (`pending.len().max(1)`) — never unbounded
+    /// relative to what the caller sent, while still going through a
+    /// bounded-concurrency primitive rather than `join_all` (which
+    /// documents the bound as an invariant rather than trusting the caller
+    /// never to send an oversized batch). This function does **not** itself
+    /// enforce `max_parallel`; Task 2's `Loop::dispatch_map` already caps
+    /// wave size before this method ever sees it.
+    ///
+    /// **Every item runs to completion — nothing is cancelled early when a
+    /// sibling signals `ChildParked`.** A `ChildRun` item parking (or
+    /// failing, via [`park_child_after_failure`]) does not stop the other
+    /// items in the same wave from being dispatched or interrupt one
+    /// already in flight; racing a cancel against, say, a `Shell` dispatch
+    /// mid-flight would reintroduce exactly the dropped-future hazard this
+    /// method's own no-outer-timeout-wrap reasoning (below) already warns
+    /// against, for a case this method already treats as fine to let
+    /// finish and discard. Once every item in the wave has resolved to its
+    /// own [`ItemOutcome`], [`dispatch_wave`] folds them: if **any** item
+    /// signalled `ChildParked`, the whole batch reports
+    /// `PendingExecution::ChildParked` — discarding whatever real
+    /// [`WorkDone`] answers the other items in the same wave produced,
+    /// exactly matching this method's own pre-Task-3 sequential behaviour
+    /// (an early `return PendingExecution::ChildParked` discarded `done`'s
+    /// already-accumulated entries and skipped every item later in
+    /// `pending`). That discarding is safe because it was already the
+    /// contract before this task: whatever real work those other items did
+    /// is durable independent of whether this call manages to report a
+    /// `WorkDone` for it, and the run loop's checkpoint/replay/dedup logic
+    /// (Task 2) is what makes redriving the suspended run safe rather than
+    /// duplicating that work. Only when **no** item parked does this method
+    /// report `PendingExecution::Done` with every item's real answer.
+    ///
     /// # `step_timeout` enforcement (Phase 8 Task 25.4 Task 3)
     ///
     /// Every `Tool` item's own `PendingWork.step_timeout` is passed straight
@@ -2494,314 +2649,356 @@ impl DeliveryExecutor {
         parent_run_ctx: &RunContext,
         pending: Vec<PendingWork>,
     ) -> PendingExecution {
-        let mut done = Vec::with_capacity(pending.len());
-        for item in pending {
-            done.push(match item.kind {
-                PendingKind::Tool {
-                    task_kind,
-                    logged_input,
-                    dispatch_input,
-                    ..
-                } => {
-                    let step_timeout = item.step_timeout;
-                    if step_timeout.is_zero() {
-                        unanswerable_work(
-                            item.step_id,
-                            "step_timeout was zero, which should be unreachable — refusing \
+        dispatch_wave(pending, |item| {
+            self.dispatch_one_pending(
+                session,
+                session_id,
+                session_spec,
+                workspace_root,
+                parent_run_ctx,
+                item,
+            )
+        })
+        .await
+    }
+
+    /// One [`PendingWork`] item's own dispatch — extracted from
+    /// `execute_pending_with_context` by Phase 8 Task 25.7 Task 3 so
+    /// [`dispatch_wave`] can run every item in a wave concurrently. Every
+    /// per-kind behaviour below is verbatim from before that extraction
+    /// (this function's body, minus the outer loop and the final
+    /// `item_index`/`done.push` bookkeeping, which moved to `dispatch_wave`
+    /// and its caller respectively); see `execute_pending_with_context`'s
+    /// own doc comment for the full reasoning behind each kind's dispatch
+    /// (`Shell`'s no-outer-timeout-wrap, the filesystem kinds' outer
+    /// `tokio::time::timeout` and `identity_sink`, `Agent`'s `step_timeout`
+    /// handling, `ChildRun`'s recursive drive and `ChildParked` contract,
+    /// and §8.13 cooperative cancel) and this function's own concurrency
+    /// section for how its `ItemOutcome` is folded back into one
+    /// [`PendingExecution`] for the whole wave.
+    async fn dispatch_one_pending(
+        &self,
+        session: &HeadlessSession,
+        session_id: SessionId,
+        session_spec: &SessionSpec,
+        workspace_root: &std::path::Path,
+        parent_run_ctx: &RunContext,
+        item: PendingWork,
+    ) -> ItemOutcome {
+        // **Echoed back on every arm, from one place** (Phase 8 Task 25.7
+        // Task 2). `WorkDone` is keyed by `(step_id, item_index)` in the
+        // run loop, so a `map` item's answer filed under `None` answers
+        // nothing: the loop would find its `PendingWork` unresolved and
+        // re-dispatch the same item on the next wave, forever, until the
+        // run's grant ran out. Captured before `item.kind` moves, and
+        // assigned once after the match rather than at each of the dozen
+        // `WorkDone` constructors below — a dozen chances to forget it is
+        // a dozen ways to reintroduce that livelock.
+        let item_index = item.item_index;
+        let mut answer = match item.kind {
+            PendingKind::Tool {
+                task_kind,
+                logged_input,
+                dispatch_input,
+                ..
+            } => {
+                let step_timeout = item.step_timeout;
+                if step_timeout.is_zero() {
+                    unanswerable_work(
+                        item.step_id,
+                        "step_timeout was zero, which should be unreachable — refusing \
                              rather than treating it as either \"no timeout\" or a legitimate \
                              instant timeout"
-                                .into(),
-                        )
-                    } else if task_kind == TaskKind::Shell {
-                        // No outer wrap here — see this method's own doc
-                        // comment for why racing an identical-duration
-                        // outer timeout against Shell's inner one would
-                        // orphan the child instead of protecting anything.
-                        let dispatched = dispatch_tool_for_workflow(
+                            .into(),
+                    )
+                } else if task_kind == TaskKind::Shell {
+                    // No outer wrap here — see this method's own doc
+                    // comment for why racing an identical-duration
+                    // outer timeout against Shell's inner one would
+                    // orphan the child instead of protecting anything.
+                    let dispatched = dispatch_tool_for_workflow(
+                        session.actor(),
+                        task_kind,
+                        logged_input,
+                        dispatch_input,
+                        step_timeout,
+                        None,
+                    )
+                    .await;
+                    let mut done = work_done_from_dispatch(item.step_id, dispatched);
+                    // Closes the asymmetry named by the Phase 8 Task
+                    // 25.4 PR #68 follow-up: Shell's own live signal
+                    // (`ToolDispatchError::ShellSessionCancelled`) only
+                    // covers a cancel observed *during*
+                    // `run_isolated_shell_dispatch`'s own
+                    // `tokio::select!` — a cancel landing in the
+                    // pre-dispatch window (before that select! starts,
+                    // e.g. during `admit_task` or the child pre-spawn)
+                    // surfaces as an ordinary `Failed`, not `Cancelled`.
+                    // [`reclassify_if_interrupted`]'s same post-hoc
+                    // snapshot, shared with the filesystem branch below,
+                    // closes that gap here too — its own guard against
+                    // double-wrapping an already-`Cancelled` `Shell`
+                    // result is what makes this safe to call
+                    // unconditionally.
+                    reclassify_if_interrupted(&mut done, session);
+                    done
+                } else {
+                    // Reports `(task_id, first_task_seq)` the instant
+                    // `TaskCreated` is durably appended inside
+                    // `dispatch_tool_for_workflow`, so the `Err(_elapsed)`
+                    // arm below can still learn real task identity even
+                    // though the outer timeout drops that future before
+                    // it ever returns — see `dispatch_tool_for_workflow`'s
+                    // own doc comment on `identity_sink` for why this is
+                    // race-free, and issue #69 for the gap this closes.
+                    let (identity_tx, mut identity_rx) = tokio::sync::oneshot::channel();
+                    match tokio::time::timeout(
+                        step_timeout,
+                        dispatch_tool_for_workflow(
                             session.actor(),
                             task_kind,
                             logged_input,
                             dispatch_input,
                             step_timeout,
-                            None,
-                        )
-                        .await;
-                        let mut done = work_done_from_dispatch(item.step_id, dispatched);
-                        // Closes the asymmetry named by the Phase 8 Task
-                        // 25.4 PR #68 follow-up: Shell's own live signal
-                        // (`ToolDispatchError::ShellSessionCancelled`) only
-                        // covers a cancel observed *during*
-                        // `run_isolated_shell_dispatch`'s own
-                        // `tokio::select!` — a cancel landing in the
-                        // pre-dispatch window (before that select! starts,
-                        // e.g. during `admit_task` or the child pre-spawn)
-                        // surfaces as an ordinary `Failed`, not `Cancelled`.
-                        // [`reclassify_if_interrupted`]'s same post-hoc
-                        // snapshot, shared with the filesystem branch below,
-                        // closes that gap here too — its own guard against
-                        // double-wrapping an already-`Cancelled` `Shell`
-                        // result is what makes this safe to call
-                        // unconditionally.
-                        reclassify_if_interrupted(&mut done, session);
-                        done
-                    } else {
-                        // Reports `(task_id, first_task_seq)` the instant
-                        // `TaskCreated` is durably appended inside
-                        // `dispatch_tool_for_workflow`, so the `Err(_elapsed)`
-                        // arm below can still learn real task identity even
-                        // though the outer timeout drops that future before
-                        // it ever returns — see `dispatch_tool_for_workflow`'s
-                        // own doc comment on `identity_sink` for why this is
-                        // race-free, and issue #69 for the gap this closes.
-                        let (identity_tx, mut identity_rx) = tokio::sync::oneshot::channel();
-                        match tokio::time::timeout(
-                            step_timeout,
-                            dispatch_tool_for_workflow(
-                                session.actor(),
-                                task_kind,
-                                logged_input,
-                                dispatch_input,
-                                step_timeout,
-                                Some(identity_tx),
-                            ),
-                        )
-                        .await
-                        {
-                            Ok(dispatched) => {
-                                let mut done = work_done_from_dispatch(item.step_id, dispatched);
-                                // [`reclassify_if_interrupted`]'s post-hoc
-                                // reclassification — see this method's own
-                                // doc comment for the full reasoning. A
-                                // `Cancelled` status cannot reach this arm
-                                // (filesystem dispatch has no producer of
-                                // its own), but its internal guard against
-                                // double-wrapping one is what makes sharing
-                                // this helper with the `Shell` branch above
-                                // (which *can* already be `Cancelled` here)
-                                // safe.
-                                reclassify_if_interrupted(&mut done, session);
-                                done
-                            }
-                            Err(_elapsed) => {
-                                let message = format!(
-                                    "the tool call exceeded its {step_timeout:?} step_timeout"
-                                );
-                                match identity_rx.try_recv() {
-                                    // `TaskCreated`/`TaskStarted` may already be
-                                    // durably logged for this real task_id — do
-                                    // not answer as if none was ever minted.
-                                    // Append a real terminal `TaskFailed` so the
-                                    // step's row carries true identity and the
-                                    // task doesn't sit `Running` until the next
-                                    // daemon boot's recovery pass repairs it.
-                                    Ok((task_id, first_task_seq)) => {
-                                        match record_workflow_task_failed(
-                                            session.actor(),
-                                            task_id,
-                                            "step_timeout",
-                                            message.clone(),
-                                        )
-                                        .await
-                                        {
-                                            Ok(last_task_seq) => WorkDone {
-                                                step_id: item.step_id,
-                                                status: WorkStatus::Failed { message },
-                                                output: serde_json::Value::Null,
-                                                output_is_secret_derived: false,
-                                                task_id: Some(task_id),
-                                                first_task_seq: Some(first_task_seq),
-                                                last_task_seq: Some(last_task_seq),
-                                            },
-                                            // The terminal append itself failed —
-                                            // still report the real identity we
-                                            // do have rather than claim none was
-                                            // minted; `last_task_seq: None`
-                                            // honestly reflects that no terminal
-                                            // event was confirmed, leaving this
-                                            // task for the next boot's recovery
-                                            // pass exactly as before this fix.
-                                            Err(append_err) => WorkDone {
-                                                step_id: item.step_id,
-                                                status: WorkStatus::Failed {
-                                                    message: format!(
-                                                        "{message}; additionally failed to record \
-                                                         its terminal event: {append_err}"
-                                                    ),
-                                                },
-                                                output: serde_json::Value::Null,
-                                                output_is_secret_derived: false,
-                                                task_id: Some(task_id),
-                                                first_task_seq: Some(first_task_seq),
-                                                last_task_seq: None,
-                                            },
-                                        }
-                                    }
-                                    // The channel closed with nothing ever sent:
-                                    // `dispatch_tool_for_workflow` was dropped
-                                    // before its `TaskCreated` append ever
-                                    // completed, so `unanswerable_work`'s
-                                    // "no task was ever minted" is actually true
-                                    // here.
-                                    Err(_) => unanswerable_work(item.step_id, message),
-                                }
-                            }
-                        }
-                    }
-                }
-                PendingKind::Agent {
-                    logged_prompt,
-                    dispatch_prompt,
-                    model,
-                    tools,
-                    output_schema,
-                    budget_tokens,
-                } => {
-                    let step_timeout = item.step_timeout;
-                    if step_timeout.is_zero() {
-                        unanswerable_work(
-                            item.step_id,
-                            "step_timeout was zero, which should be unreachable — refusing \
-                             rather than treating it as either \"no timeout\" or a legitimate \
-                             instant timeout"
-                                .into(),
-                        )
-                    } else {
-                        let resolved_model =
-                            model.unwrap_or_else(|| WORKFLOW_AGENT_DEFAULT_MODEL.to_string());
-                        let host = session.actor().sub_agent_host();
-                        match dispatch_agent_for_workflow(
-                            session.actor(),
-                            host.as_ref(),
-                            logged_prompt,
-                            Some(resolved_model.clone()),
-                            budget_tokens,
-                        )
-                        .await
-                        {
-                            Err(message) => unanswerable_work(item.step_id, message),
-                            Ok(dispatched) => match dispatched.result {
-                                AgentSpawnOutcome::Failed(message) => WorkDone {
-                                    step_id: item.step_id,
-                                    status: WorkStatus::Failed { message },
-                                    output: serde_json::Value::Null,
-                                    output_is_secret_derived: false,
-                                    task_id: Some(dispatched.task_id),
-                                    first_task_seq: Some(dispatched.first_task_seq),
-                                    last_task_seq: dispatched.last_task_seq,
-                                },
-                                AgentSpawnOutcome::Spawned { child_session_id } => {
-                                    self.drive_workflow_agent_child(
-                                        session.actor(),
-                                        child_session_id,
-                                        dispatched.task_id,
-                                        dispatched.first_task_seq,
-                                        item.step_id,
-                                        dispatch_prompt,
-                                        resolved_model,
-                                        tools,
-                                        output_schema,
-                                        step_timeout,
-                                    )
-                                    .await
-                                }
-                            },
-                        }
-                    }
-                }
-                PendingKind::ChildRun {
-                    child_run_id,
-                    child_session_id,
-                    parent_task_id: _,
-                    dispatch_input,
-                    inputs_secret_derived,
-                    ..
-                } => {
-                    let mut child_spec = session_spec.clone();
-                    child_spec.parent = Some(session_id);
-                    let workspace = match self.resources.workspace_registry.as_ref() {
-                        Some(registry) => match registry.resolve_by_id(child_spec.workspace) {
-                            Ok(workspace) => workspace,
-                            Err(_) => {
-                                return park_child_after_failure(
-                                    ChildDispatchFailure::WorkspaceUnresolvable,
-                                );
-                            }
-                        },
-                        None => {
-                            return park_child_after_failure(
-                                ChildDispatchFailure::WorkspaceRegistryUnavailable,
-                            );
-                        }
-                    };
-                    let child_session = match create_headless_session(
-                        &self.resources,
-                        &self.sessions,
-                        child_session_id,
-                        child_spec.clone(),
-                        workspace_root.to_path_buf(),
-                        workspace.root_device,
-                        workspace.root_inode,
+                            Some(identity_tx),
+                        ),
                     )
                     .await
                     {
-                        Ok(session) => session,
-                        Err(_) => {
-                            return park_child_after_failure(
-                                ChildDispatchFailure::SessionConstruction,
-                            );
+                        Ok(dispatched) => {
+                            let mut done = work_done_from_dispatch(item.step_id, dispatched);
+                            // [`reclassify_if_interrupted`]'s post-hoc
+                            // reclassification — see this method's own
+                            // doc comment for the full reasoning. A
+                            // `Cancelled` status cannot reach this arm
+                            // (filesystem dispatch has no producer of
+                            // its own), but its internal guard against
+                            // double-wrapping one is what makes sharing
+                            // this helper with the `Shell` branch above
+                            // (which *can* already be `Cancelled` here)
+                            // safe.
+                            reclassify_if_interrupted(&mut done, session);
+                            done
                         }
-                    };
-                    let child_ctx = RunContext {
-                        inputs: dispatch_input,
-                        inputs_secret_derived,
-                        vars: serde_json::Value::Null,
-                        secrets: HashMap::new(),
-                        run_id: child_run_id,
-                        previous_report: None,
-                        env_allowlist: parent_run_ctx.env_allowlist.clone(),
-                        worktree_provider: parent_run_ctx.worktree_provider.clone(),
-                    };
-                    let child_outcome = Box::pin(self.drive_run_to_completion(
-                        child_run_id,
-                        child_session_id,
-                        &child_session,
-                        child_spec,
-                        workspace_root.to_path_buf(),
-                        child_ctx,
-                        self.now(),
-                        None,
-                    ))
-                    .await;
-                    let state = match child_outcome {
-                        Ok(Ok(DrivenRun::Outcome(RunOutcome::Terminal { state, .. }))) => state,
-                        Ok(Ok(
-                            DrivenRun::ChildParked | DrivenRun::Outcome(RunOutcome::Parked(_)),
-                        )) => {
-                            self.park_session(child_session);
-                            return PendingExecution::ChildParked;
+                        Err(_elapsed) => {
+                            let message =
+                                format!("the tool call exceeded its {step_timeout:?} step_timeout");
+                            match identity_rx.try_recv() {
+                                // `TaskCreated`/`TaskStarted` may already be
+                                // durably logged for this real task_id — do
+                                // not answer as if none was ever minted.
+                                // Append a real terminal `TaskFailed` so the
+                                // step's row carries true identity and the
+                                // task doesn't sit `Running` until the next
+                                // daemon boot's recovery pass repairs it.
+                                Ok((task_id, first_task_seq)) => {
+                                    match record_workflow_task_failed(
+                                        session.actor(),
+                                        task_id,
+                                        "step_timeout",
+                                        message.clone(),
+                                    )
+                                    .await
+                                    {
+                                        Ok(last_task_seq) => WorkDone {
+                                            step_id: item.step_id,
+                                            item_index: None,
+                                            status: WorkStatus::Failed { message },
+                                            output: serde_json::Value::Null,
+                                            output_is_secret_derived: false,
+                                            task_id: Some(task_id),
+                                            first_task_seq: Some(first_task_seq),
+                                            last_task_seq: Some(last_task_seq),
+                                        },
+                                        // The terminal append itself failed —
+                                        // still report the real identity we
+                                        // do have rather than claim none was
+                                        // minted; `last_task_seq: None`
+                                        // honestly reflects that no terminal
+                                        // event was confirmed, leaving this
+                                        // task for the next boot's recovery
+                                        // pass exactly as before this fix.
+                                        Err(append_err) => WorkDone {
+                                            step_id: item.step_id,
+                                            item_index: None,
+                                            status: WorkStatus::Failed {
+                                                message: format!(
+                                                    "{message}; additionally failed to record \
+                                                         its terminal event: {append_err}"
+                                                ),
+                                            },
+                                            output: serde_json::Value::Null,
+                                            output_is_secret_derived: false,
+                                            task_id: Some(task_id),
+                                            first_task_seq: Some(first_task_seq),
+                                            last_task_seq: None,
+                                        },
+                                    }
+                                }
+                                // The channel closed with nothing ever sent:
+                                // `dispatch_tool_for_workflow` was dropped
+                                // before its `TaskCreated` append ever
+                                // completed, so `unanswerable_work`'s
+                                // "no task was ever minted" is actually true
+                                // here.
+                                Err(_) => unanswerable_work(item.step_id, message),
+                            }
                         }
-                        Ok(Err(_)) => {
-                            return park_child_after_failure(ChildDispatchFailure::RunLoop);
-                        }
-                        Err(_) | Ok(Ok(DrivenRun::Outcome(RunOutcome::AwaitingWork { .. }))) => {
-                            return park_child_after_failure(ChildDispatchFailure::Driver);
-                        }
-                    };
-                    let joined = self
-                        .join_terminal_child(child_run_id, state, self.now())
-                        .await;
-                    child_session
-                        .teardown(&self.sessions, &self.resources.proxy)
-                        .await;
-                    match joined {
-                        Ok(Some((_, joined))) => joined,
-                        Ok(None) => return PendingExecution::ChildParked,
-                        Err(_) => return park_child_after_failure(ChildDispatchFailure::Driver),
                     }
                 }
-            });
-        }
-        PendingExecution::Done(done)
+            }
+            PendingKind::Agent {
+                logged_prompt,
+                dispatch_prompt,
+                model,
+                tools,
+                output_schema,
+                budget_tokens,
+            } => {
+                let step_timeout = item.step_timeout;
+                if step_timeout.is_zero() {
+                    unanswerable_work(
+                        item.step_id,
+                        "step_timeout was zero, which should be unreachable — refusing \
+                             rather than treating it as either \"no timeout\" or a legitimate \
+                             instant timeout"
+                            .into(),
+                    )
+                } else {
+                    let resolved_model =
+                        model.unwrap_or_else(|| WORKFLOW_AGENT_DEFAULT_MODEL.to_string());
+                    let host = session.actor().sub_agent_host();
+                    match dispatch_agent_for_workflow(
+                        session.actor(),
+                        host.as_ref(),
+                        logged_prompt,
+                        Some(resolved_model.clone()),
+                        budget_tokens,
+                    )
+                    .await
+                    {
+                        Err(message) => unanswerable_work(item.step_id, message),
+                        Ok(dispatched) => match dispatched.result {
+                            AgentSpawnOutcome::Failed(message) => WorkDone {
+                                step_id: item.step_id,
+                                item_index: None,
+                                status: WorkStatus::Failed { message },
+                                output: serde_json::Value::Null,
+                                output_is_secret_derived: false,
+                                task_id: Some(dispatched.task_id),
+                                first_task_seq: Some(dispatched.first_task_seq),
+                                last_task_seq: dispatched.last_task_seq,
+                            },
+                            AgentSpawnOutcome::Spawned { child_session_id } => {
+                                self.drive_workflow_agent_child(
+                                    session.actor(),
+                                    child_session_id,
+                                    dispatched.task_id,
+                                    dispatched.first_task_seq,
+                                    item.step_id,
+                                    dispatch_prompt,
+                                    resolved_model,
+                                    tools,
+                                    output_schema,
+                                    step_timeout,
+                                )
+                                .await
+                            }
+                        },
+                    }
+                }
+            }
+            PendingKind::ChildRun {
+                child_run_id,
+                child_session_id,
+                parent_task_id: _,
+                dispatch_input,
+                inputs_secret_derived,
+                ..
+            } => {
+                let mut child_spec = session_spec.clone();
+                child_spec.parent = Some(session_id);
+                let workspace = match self.resources.workspace_registry.as_ref() {
+                    Some(registry) => match registry.resolve_by_id(child_spec.workspace) {
+                        Ok(workspace) => workspace,
+                        Err(_) => {
+                            return park_child_after_failure(
+                                ChildDispatchFailure::WorkspaceUnresolvable,
+                            );
+                        }
+                    },
+                    None => {
+                        return park_child_after_failure(
+                            ChildDispatchFailure::WorkspaceRegistryUnavailable,
+                        );
+                    }
+                };
+                let child_session = match create_headless_session(
+                    &self.resources,
+                    &self.sessions,
+                    child_session_id,
+                    child_spec.clone(),
+                    workspace_root.to_path_buf(),
+                    workspace.root_device,
+                    workspace.root_inode,
+                )
+                .await
+                {
+                    Ok(session) => session,
+                    Err(_) => {
+                        return park_child_after_failure(ChildDispatchFailure::SessionConstruction);
+                    }
+                };
+                let child_ctx = RunContext {
+                    inputs: dispatch_input,
+                    inputs_secret_derived,
+                    vars: serde_json::Value::Null,
+                    secrets: HashMap::new(),
+                    run_id: child_run_id,
+                    previous_report: None,
+                    env_allowlist: parent_run_ctx.env_allowlist.clone(),
+                    worktree_provider: parent_run_ctx.worktree_provider.clone(),
+                };
+                let child_outcome = Box::pin(self.drive_run_to_completion(
+                    child_run_id,
+                    child_session_id,
+                    &child_session,
+                    child_spec,
+                    workspace_root.to_path_buf(),
+                    child_ctx,
+                    self.now(),
+                    None,
+                ))
+                .await;
+                let state = match child_outcome {
+                    Ok(Ok(DrivenRun::Outcome(RunOutcome::Terminal { state, .. }))) => state,
+                    Ok(Ok(DrivenRun::ChildParked | DrivenRun::Outcome(RunOutcome::Parked(_)))) => {
+                        self.park_session(child_session);
+                        return ItemOutcome::ChildParked;
+                    }
+                    Ok(Err(_)) => {
+                        return park_child_after_failure(ChildDispatchFailure::RunLoop);
+                    }
+                    Err(_) | Ok(Ok(DrivenRun::Outcome(RunOutcome::AwaitingWork { .. }))) => {
+                        return park_child_after_failure(ChildDispatchFailure::Driver);
+                    }
+                };
+                let joined = self
+                    .join_terminal_child(child_run_id, state, self.now())
+                    .await;
+                child_session
+                    .teardown(&self.sessions, &self.resources.proxy)
+                    .await;
+                match joined {
+                    Ok(Some((_, joined))) => joined,
+                    Ok(None) => return ItemOutcome::ChildParked,
+                    Err(_) => return park_child_after_failure(ChildDispatchFailure::Driver),
+                }
+            }
+        };
+        answer.item_index = item_index;
+        ItemOutcome::Done(answer)
     }
 
     /// Drives one workflow `agent:` step's already-spawned child
@@ -2948,6 +3145,7 @@ impl DeliveryExecutor {
                     {
                         Ok(last_task_seq) => WorkDone {
                             step_id,
+                            item_index: None,
                             status: WorkStatus::Completed,
                             output,
                             output_is_secret_derived: false,
@@ -2961,6 +3159,7 @@ impl DeliveryExecutor {
                         // failed-terminal-append case in this file.
                         Err(append_err) => WorkDone {
                             step_id,
+                            item_index: None,
                             status: WorkStatus::Failed {
                                 message: format!(
                                     "the agent step's child completed but recording its \
@@ -3236,6 +3435,15 @@ impl DeliveryExecutor {
             call.clone(),
             WorkDone {
                 step_id: call.parent_step_id,
+                // **Read from the row, never assumed.** This used to be a
+                // hardcoded `None`, on the premise that a `call:` nested
+                // inside a `map` was refused; Phase 8 Task 25.7 Task 7 made
+                // that shape real, and `WorkflowChildCall::parent_item_index`
+                // is the durable record of which item the child answers.
+                // `WorkDone::item_index`'s own doc makes echoing it back
+                // mandatory: an answer filed under `None` answers nothing, and
+                // the item would be re-dispatched with the work already done.
+                item_index: call.parent_item_index,
                 status,
                 output,
                 output_is_secret_derived: false,
@@ -6095,6 +6303,128 @@ mod child_run_tests {
         }
     }
 
+    /// A minimal `PendingWork` for `dispatch_wave`'s own tests — its `kind`
+    /// is never inspected there, only `step_id`/`item_index` (which a
+    /// synthetic dispatch closure echoes back, exactly like a real one
+    /// must). Distinct `item_index` per call mirrors what a real `map`
+    /// wave's items actually carry (Phase 8 Task 25.7 Task 1).
+    fn probe_pending(item_index: u32) -> PendingWork {
+        PendingWork {
+            run_id: RunId::new(),
+            session_id: SessionId::new(),
+            step_id: "probe".into(),
+            attempt: 1,
+            item_index: Some(item_index),
+            disposition: roundhouse_flow::durability::StepDisposition::Effectful,
+            step_timeout: Duration::from_secs(60),
+            kind: PendingKind::ChildRun {
+                child_run_id: RunId::new(),
+                child_session_id: SessionId::new(),
+                parent_task_id: TaskId::new(),
+                dispatch_input: serde_json::Value::Null,
+                inputs_secret_derived: false,
+            },
+        }
+    }
+
+    fn completed_work_done(item: &PendingWork) -> WorkDone {
+        WorkDone {
+            step_id: item.step_id.clone(),
+            item_index: item.item_index,
+            status: WorkStatus::Completed,
+            output: serde_json::Value::Null,
+            output_is_secret_derived: false,
+            task_id: None,
+            first_task_seq: None,
+            last_task_seq: None,
+        }
+    }
+
+    /// Proves `dispatch_wave` actually runs a wave's items concurrently —
+    /// not just that the result is correct — using a fixture whose dispatch
+    /// closure sleeps for an identical, artificial delay per item. Driven
+    /// by `tokio`'s own paused/virtual clock (`start_paused = true`)
+    /// instead of real wall-clock `sleep`: this workspace's own convention
+    /// (`scheduled_trigger_end_to_end.rs`'s module doc bans the real-time
+    /// "sleep(N); assert!(...)" pattern as flaky) is followed here by
+    /// asserting against a deterministic, injected fake clock rather than
+    /// real elapsed time. With time paused, `tokio::time::sleep` only
+    /// advances the virtual clock once every currently-runnable task is
+    /// parked on a timer — so three items' identical-length sleeps resolve
+    /// on a single virtual advance (~one delay) if, and only if, they were
+    /// actually polled concurrently; sequential dispatch would advance the
+    /// virtual clock three times (~three delays), one per item.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn dispatch_wave_runs_every_item_concurrently_not_sequentially() {
+        let pending: Vec<PendingWork> = (0..3).map(probe_pending).collect();
+        let delay = Duration::from_millis(100);
+        let start = tokio::time::Instant::now();
+
+        let outcome = dispatch_wave(pending, |item| async move {
+            tokio::time::sleep(delay).await;
+            ItemOutcome::Done(completed_work_done(&item))
+        })
+        .await;
+
+        let elapsed = start.elapsed();
+        let done = match outcome {
+            PendingExecution::Done(done) => done,
+            PendingExecution::ChildParked => panic!("expected Done, got ChildParked"),
+        };
+        assert_eq!(
+            done.len(),
+            3,
+            "every item in the wave must report an answer"
+        );
+        assert!(
+            elapsed < delay * 2,
+            "3 items with a {delay:?} delay each took {elapsed:?} of (virtual, paused-clock) \
+             wall-clock time — sequential dispatch would take about {:?}; concurrent dispatch \
+             should take about {delay:?}",
+            delay * 3,
+        );
+    }
+
+    /// The `ChildParked`-for-the-whole-batch contract `dispatch_wave`'s own
+    /// doc comment describes: today's sequential loop already discards
+    /// every other item's answer when one `ChildRun` item parks (an early
+    /// `return PendingExecution::ChildParked`); this proves the same
+    /// ultimate effect holds under concurrent dispatch — AND that the other
+    /// items in the wave are not skipped or cancelled early, only their
+    /// real answers are discarded once every item has actually resolved.
+    #[tokio::test(flavor = "current_thread")]
+    async fn dispatch_wave_reports_child_parked_for_the_whole_batch_but_still_runs_every_item() {
+        let pending: Vec<PendingWork> = (0..3).map(probe_pending).collect();
+        let completed = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+        let outcome = {
+            let completed = Arc::clone(&completed);
+            dispatch_wave(pending, move |item| {
+                let completed = Arc::clone(&completed);
+                async move {
+                    if item.item_index == Some(1) {
+                        ItemOutcome::ChildParked
+                    } else {
+                        completed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        ItemOutcome::Done(completed_work_done(&item))
+                    }
+                }
+            })
+            .await
+        };
+
+        assert!(
+            matches!(outcome, PendingExecution::ChildParked),
+            "one item parking must park the whole batch"
+        );
+        assert_eq!(
+            completed.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "the other two items in the wave must still run to completion even though one \
+             parked — only their WorkDone answers are discarded, not the dispatch itself"
+        );
+    }
+
     async fn answer_child_gate_after_restart(
         executor: &DeliveryExecutor,
         harness: &Harness,
@@ -6132,6 +6462,9 @@ mod child_run_tests {
                 Timestamp::from_unix_nanos(1_700_000_000_000_000_001),
                 Some(Resume::Gate(roundhouse_flow::exec::run_loop::GateAnswer {
                     step_id: "approve".into(),
+                    // A top-level `gate:` step, so no item dimension — see
+                    // `GateAnswer::item_index`.
+                    item_index: None,
                     output: serde_json::json!({ "approved": true }),
                 })),
             )
@@ -8326,6 +8659,68 @@ mod child_run_tests {
             .await;
     }
 
+    /// The real-wiring counterpart of `dispatch_wave`'s own unit tests
+    /// (below, in this module): a 3-item batch through the actual
+    /// production `execute_pending_with_context`, not a synthetic
+    /// `dispatch_wave` closure. Before Phase 8 Task 25.7 Task 3, this is
+    /// where the sequential loop's bug lived — the very first `ChildRun`
+    /// item's `return park_child_after_failure(..)` returned from the
+    /// whole function immediately, so items 2 and 3 were never dispatched
+    /// at all, and the log below would show the failure category exactly
+    /// once. Under concurrent dispatch every item is actually attempted —
+    /// each logs its own `child_workspace_registry_unavailable`, so the
+    /// count is 3 — before the batch as a whole still reports
+    /// `PendingExecution::ChildParked`, exactly like the single-item case
+    /// above.
+    #[tokio::test(flavor = "current_thread")]
+    async fn multiple_child_items_in_one_batch_are_all_dispatched_before_reporting_child_parked() {
+        let harness = harness(completing_workflow()).await;
+        let (parent, spec) = harness.headless_parent(&harness.sessions).await;
+        let resources = Arc::new(daemon_resources(harness._dir.path(), None).await);
+        let executor = DeliveryExecutor::new(
+            harness.store.clone(),
+            resources,
+            Arc::clone(&harness.sessions),
+            Arc::new(InMemoryRunRegistry::new()),
+            Arc::new(SpawnTree::new()),
+            Arc::new(FixedClock(instant())),
+        );
+        let run_id = RunId::new();
+        let (captured, dispatch) = captured_logs();
+        let outcome = {
+            let _guard = tracing::dispatcher::set_default(&dispatch);
+            executor
+                .execute_pending_with_context(
+                    &parent,
+                    parent.session_id(),
+                    &spec,
+                    &harness.workspace_root,
+                    &test_run_context(run_id),
+                    vec![
+                        secret_derived_child_pending(parent.session_id()),
+                        secret_derived_child_pending(parent.session_id()),
+                        secret_derived_child_pending(parent.session_id()),
+                    ],
+                )
+                .await
+        };
+
+        assert!(matches!(outcome, PendingExecution::ChildParked));
+        let rendered = String::from_utf8(captured.0.lock().unwrap().clone())
+            .expect("the tracing subscriber emits UTF-8");
+        assert_eq!(
+            rendered
+                .matches("child_workspace_registry_unavailable")
+                .count(),
+            3,
+            "every item in the batch must actually be dispatched — a park signal from one item \
+             must not skip attempting the others: {rendered}"
+        );
+        parent
+            .teardown(&harness.sessions, &harness.resources.proxy)
+            .await;
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn child_dispatch_with_an_unresolvable_workspace_logs_only_its_static_category() {
         let harness = harness(completing_workflow()).await;
@@ -9565,3 +9960,6 @@ mod child_run_tests {
 
 #[cfg(test)]
 mod delivery_tests;
+
+#[cfg(test)]
+mod pr_review_e2e_tests;

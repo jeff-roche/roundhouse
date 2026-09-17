@@ -926,6 +926,84 @@ steps:
 }
 
 #[test]
+fn a_failed_inner_step_declaring_continue_on_error_does_not_abort_the_item() {
+    // Phase 8 Task 25.7 Task 10, gap 1, at *this* fan-out loop: the flag is
+    // honoured by `fold_inner_step_outcome`, which both loops share, so the
+    // in-memory sequencer gets it too rather than only the run loop (whose
+    // own coverage is `tests/run_loop.rs`'s
+    // `a_failed_inner_step_declaring_continue_on_error_lets_its_item_go_on`).
+    //
+    // The contrast that makes this a real assertion rather than a tautology
+    // is this file's own
+    // `on_item_error_collect_through_dispatch_map_step_gathers_a_non_final_inner_step_failure`:
+    // the same shape *without* the flag, where `after` never dispatches for
+    // any item and every item's entry reads `failed`.
+    let yaml = r#"
+name: map-inner-continue-on-error
+version: 1
+inputs: {}
+defaults: { isolation: worktree }
+permissions: { default: deny, unattended: { escalate: fail } }
+steps:
+  - id: fan_out
+    map:
+      over: "${{ inputs.items }}"
+      as: item
+      on_item_error: collect
+    steps:
+      - id: doomed
+        emit: { v: "${{ nope_this_function_does_not_exist(1) }}" }
+        continue_on_error: true
+      - id: after
+        emit: { v: "runs anyway" }
+"#;
+    let def = parse_workflow(yaml).unwrap();
+    let mut sink = RecordingSink(Vec::new());
+    let ctx = run_ctx(serde_json::json!({"items": [1, 2, 3]}));
+    let mut exec = Executor::new(&def, &mut sink, ctx).unwrap();
+    let outcomes = exec.run_to_completion().unwrap();
+
+    let output = &outcomes[0].output;
+    let items = output["items"]
+        .as_array()
+        .expect("map output has an `items` array");
+    assert_eq!(items.len(), 3);
+    for (i, item) in items.iter().enumerate() {
+        assert_eq!(
+            item["status"],
+            serde_json::json!("completed"),
+            "item {i} walks on past a failure its author declared non-fatal, and reports its \
+             last-run inner step's status: {item:?}"
+        );
+    }
+    assert_eq!(
+        output["collected_errors"]
+            .as_array()
+            .expect("map output has a `collected_errors` array")
+            .len(),
+        0,
+        "`collect` gathers what a finished *item* failed with, and an item allowed to continue \
+         is not a failed item — so in this loop, which has no durable per-step rows behind it, \
+         the continued failure's message is kept nowhere at all. That is what declaring a \
+         failure non-fatal costs here; the run loop still records it on the step's own row"
+    );
+    let dispatched: Vec<&serde_json::Value> = sink
+        .0
+        .iter()
+        .filter(|e| matches!(e.kind, TaskKind::Flow) && e.payload_json.get("TaskCreated").is_some())
+        .map(|e| &e.payload_json["TaskCreated"]["input"]["Json"])
+        .collect();
+    assert_eq!(
+        dispatched.len(),
+        3,
+        "one dispatched event per item (`after`) — `doomed` fails before it ever emits"
+    );
+    for created in &dispatched {
+        assert_eq!(created["v"], serde_json::json!("runs anyway"));
+    }
+}
+
+#[test]
 fn a_nested_maps_secret_derived_as_name_does_not_poison_the_outer_maps_use_of_the_same_as_name() {
     // Fix round 2, items 2/3: the case the atomicity safety argument has to
     // survive — a NESTED `map` reusing its parent's `as:` name, with the

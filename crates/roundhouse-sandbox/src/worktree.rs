@@ -265,11 +265,76 @@
 //! generates `worktree_path` itself; nothing here re-derives or validates
 //! it, exactly as [`crate::bounded_parse::run_bounded_subprocess`] never
 //! validates the `program`/`args` its own caller supplies.
+//!
+//! # Concurrency: one `git worktree` mutation at a time per repository
+//!
+//! Callers generate a fresh path per worktree (`roundhouse-flow`'s
+//! `SandboxWorktreeProvider` mints a uuid subdirectory per `materialize`),
+//! so concurrent callers cannot collide on a *path*. That is not the whole
+//! question: `git worktree add` and `git worktree remove` both mutate, and
+//! both first enumerate, the repository's shared
+//! `<git-common-dir>/worktrees/` administrative directory — and git does
+//! **not** take a repository-wide lock over that pair of steps.
+//!
+//! **Measured, on git 2.55.0, rather than assumed** (Phase 8 Task 25.7
+//! Task 8; see `tests/worktree.rs`'s
+//! `concurrent_add_and_remove_against_one_repo_all_succeed`, which is the
+//! experiment): with these calls unserialized, an `add` or a `remove` racing
+//! another `remove` against the same repository fails outright roughly half
+//! the time at that test's width, with git dying on an entry that has
+//! nothing to do with the worktree it was asked about —
+//!
+//! ```text
+//! fatal: Invalid path '<repo>/.git/worktrees/<some other worktree>': No such file or directory
+//! fatal: failed to read .git/worktrees/<some other worktree>/commondir: No such file or directory
+//! ```
+//!
+//! — i.e. a removal landing between another invocation's directory listing
+//! and its resolution of the entries it listed. Concurrent `add`s alone were
+//! *not* observed to fail; the reproducer always involves a concurrent
+//! removal. The repository itself survives (git's own junk cleanup unwinds a
+//! failed `add`), so the harm is not corruption but a spurious hard failure
+//! of an unrelated operation — which reaches a workflow as a `map` item that
+//! failed because of something a *sibling* item did.
+//!
+//! So [`add_worktree`] and [`remove_worktree`] each hold a mutex for the
+//! duration of their `git` child. **Per `repo_root`, not global**, because
+//! the state being contended is one repository's, and two runs against
+//! different workspaces have no reason to wait for each other; **process-
+//! wide rather than per-provider instance**, because `roundhouse-daemon`
+//! constructs a *fresh* `SandboxWorktreeProvider` per workflow run
+//! (`scheduler_driver.rs`), so a mutex owned by the provider would not
+//! serialize two concurrently-driven runs over the same workspace — which is
+//! exactly the concurrency that exists today, since each claimed delivery is
+//! driven in its own `tokio::spawn`ed task.
+//!
+//! **What it costs, stated plainly**: worktree materialization against one
+//! repository is now serial, so `n` concurrent runs over one workspace pay
+//! `n` checkouts end to end rather than `n` in parallel. It blocks no
+//! *additional* thread to do it — the caller was already going to sit on this
+//! thread for the whole `git` child either way — but a checkout of a large
+//! repository is honestly slow (see [`WORKTREE_WALL_LIMIT`]'s own doc
+//! comment), so this is a real throughput change and not merely a formality.
+//! It is the cheapest correct answer available in-process; the alternative
+//! that would not serialize is a per-worktree lock protocol git does not
+//! offer.
+//!
+//! **Two residuals this does not close, stated rather than assumed away.**
+//! First, it is an *in-process* lock: a second daemon, or a workflow step (or
+//! a human) running `git worktree` against the same repository from outside
+//! this process, still races. Closing that needs a filesystem lock, which is
+//! a larger change than this. Second, the key is the canonicalized
+//! `repo_root`, and two different `repo_root`s can share one
+//! `<git-common-dir>/worktrees/` — a linked worktree and the repository it
+//! was created from are the case that matters — so pointing this module at
+//! both would not serialize them against each other.
 
+use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -689,6 +754,41 @@ fn read_capped_discarding(pipe: &mut impl Read, cap: usize) -> Vec<u8> {
     }
 }
 
+/// The process-wide registry of per-repository worktree mutexes — see the
+/// module doc comment's "Concurrency" section for the measurement that makes
+/// this necessary, for why the key is the repository rather than the process,
+/// and for the two residuals it does not close.
+///
+/// Keyed on the **canonicalized** `repo_root` so `/a/b`, `/a/b/` and a
+/// symlink to either are one key rather than three. Canonicalization is a
+/// stat, against a call that is about to `fork`/`exec` `git`, so its cost is
+/// noise; when it fails (a `repo_root` that does not exist, which is a call
+/// that is about to fail anyway) the raw path is used, because a key that
+/// cannot be computed must not silently become "no lock at all".
+///
+/// The map is only ever inserted into, so it grows with the number of
+/// distinct repositories one process has ever touched. That is bounded in
+/// practice by the number of workspaces a daemon serves, and each entry is a
+/// path and an empty mutex; nothing here is worth an eviction policy.
+fn repo_worktree_lock(repo_root: &Path) -> Arc<Mutex<()>> {
+    static LOCKS: OnceLock<Mutex<HashMap<PathBuf, Arc<Mutex<()>>>>> = OnceLock::new();
+    let key = std::fs::canonicalize(repo_root).unwrap_or_else(|_| repo_root.to_path_buf());
+    let mut registry = lock_ignoring_poison(LOCKS.get_or_init(|| Mutex::new(HashMap::new())));
+    Arc::clone(registry.entry(key).or_default())
+}
+
+/// Locks `mutex`, recovering rather than propagating a poisoned lock.
+///
+/// Both mutexes this module takes guard `()` and a `HashMap` that is only
+/// ever inserted into: there is no invariant a panicking holder could have
+/// left half-established, so poisoning carries no information here. Refusing
+/// the lock instead would turn one panic anywhere in the process into a
+/// permanent, unrecoverable failure of every later worktree call — the
+/// opposite of what this lock exists to do.
+fn lock_ignoring_poison<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
 /// Creates a real git worktree at `worktree_path`, detached at `base_ref`,
 /// against the repository rooted at `repo_root`.
 ///
@@ -699,11 +799,18 @@ fn read_capped_discarding(pipe: &mut impl Read, cap: usize) -> Vec<u8> {
 /// PRs but starting from the same `main`) would otherwise collide on `git`
 /// refusing to check the same branch out twice, and this primitive has no
 /// use for a named branch per item regardless.
+///
+/// **Serialized against every other `git worktree` mutation this process
+/// makes to the same repository** — see the module doc comment's
+/// "Concurrency" section. The lock is held for this `git` child's whole life,
+/// which [`WORKTREE_WALL_LIMIT`] bounds.
 pub fn add_worktree(
     repo_root: &Path,
     worktree_path: &Path,
     base_ref: &str,
 ) -> Result<(), WorktreeError> {
+    let repo_lock = repo_worktree_lock(repo_root);
+    let _serialized = lock_ignoring_poison(&repo_lock);
     run_git(
         repo_root,
         &[
@@ -742,7 +849,14 @@ pub fn add_worktree(
 /// untracked or modified files behind (nothing about this feature commits
 /// on the caller's behalf), and cleanup must not fail just because the
 /// item did real work in the worktree before it completed or failed.
+///
+/// **Serialized exactly as [`add_worktree`] is, and against the same lock** —
+/// see the module doc comment's "Concurrency" section. A concurrent *removal*
+/// is what the measurement there found to be the hazard, so this is the half
+/// that must not be left out.
 pub fn remove_worktree(repo_root: &Path, worktree_path: &Path) -> Result<(), WorktreeError> {
+    let repo_lock = repo_worktree_lock(repo_root);
+    let _serialized = lock_ignoring_poison(&repo_lock);
     run_git(
         repo_root,
         &[

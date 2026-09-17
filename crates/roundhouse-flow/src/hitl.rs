@@ -344,6 +344,26 @@ pub struct AwaitingHuman {
     /// source text, since evaluating `${{ }}` is the expression language's
     /// job at timeout time.
     pub on_timeout: UncheckedOnTimeout,
+    /// Which `map` item this wait is about — `Some(i)` for a `gate:` nested
+    /// in a `map`'s own `steps:` (Phase 8 Task 25.7 Task 6), `None` for every
+    /// other wait, which is every wait that has no item dimension at all.
+    ///
+    /// **This is what a human is shown, not what a resume is decided from.**
+    /// The wait is serialised into the log by
+    /// `crate::exec::run_loop::Loop::emit_awaiting_human`, and without this
+    /// field a fan-out of 2,000 items would ask *"ship it?"* with no way to
+    /// say which of them is being asked about. What a resumed run reads to
+    /// find the parked item is the item's own `workflow_step_run` row, whose
+    /// `item_index` column migration 0007 has always had — never this
+    /// payload, which is deliberately not `Deserialize` (see the type's own
+    /// doc).
+    ///
+    /// Every constructor here leaves it `None`; the one park site that has an
+    /// item sets it through [`about_map_item`](Self::about_map_item). So the
+    /// source-independence property the type doc states still holds of the
+    /// constructors: two waits built from a gate and from an escalation
+    /// differ in `source` alone.
+    pub item_index: Option<u32>,
 }
 
 /// The form a permission escalation asks: one boolean.
@@ -518,7 +538,23 @@ impl AwaitingHuman {
             form_schema: form_schema(title, &fields),
             timeout_after: Some(timeout_after),
             on_timeout: UncheckedOnTimeout::new(on_timeout.clone()),
+            item_index: None,
         })
+    }
+
+    /// Names the `map` item this wait is about — the one thing a nested
+    /// `gate:` has that a top-level one does not (Phase 8 Task 25.7 Task 6).
+    ///
+    /// A builder rather than a sixth parameter on
+    /// [`from_gate`](Self::from_gate): the item dimension belongs to *where
+    /// the gate is written*, not to the gate's own fields, and every other
+    /// caller of `from_gate` — including the top-level `gate:` step, which is
+    /// the common case — would otherwise have to pass `None` to say something
+    /// it has no opinion about.
+    #[must_use]
+    pub fn about_map_item(mut self, item_index: u32) -> Self {
+        self.item_index = Some(item_index);
+        self
     }
 
     /// Turns an [`Escalate::Park`]'s already-evaluated fields into the same
@@ -551,6 +587,7 @@ impl AwaitingHuman {
             form_schema: form_schema(title, &permission_approval_fields()),
             timeout_after: Some(timeout_after),
             on_timeout: UncheckedOnTimeout::new(on_timeout.clone()),
+            item_index: None,
         }
     }
 
@@ -594,6 +631,12 @@ impl AwaitingHuman {
             form_schema: form_schema(title, &crash_recovery_fields()),
             timeout_after: Some(timeout_after),
             on_timeout: UncheckedOnTimeout::new(on_timeout.clone()),
+            // A crash-recovery park has no item dimension, and that is a
+            // limitation rather than an absence of one: see
+            // `crate::exec::run_loop`'s `map_item_crash_refusal`, which fails
+            // a `map` item's interrupted inner step closed because the
+            // *answer* half (`CrashRecoveryAnswer`) still carries no index.
+            item_index: None,
         })
     }
 }

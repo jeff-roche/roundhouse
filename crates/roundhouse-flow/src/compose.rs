@@ -13,12 +13,15 @@
 //! standing for the call — is **B12c**'s, and landed as
 //! [`crate::exec::run_loop`]'s `call:` arm. It is not
 //! [`crate::exec::Executor::dispatch_step`]'s `StepBody::Call` arm, which
-//! stays a refusal: that function holds no `Connection`, and a `call:`
-//! reached from inside a `map` is refused because a `call:` needs the
-//! per-item budget pool ruling P77 §C still defers (`map`'s *worktree*
-//! fan-out is a separate, since-Task-34 concern — see
-//! `crate::exec::Executor::dispatch_map_step`'s own doc
-//! comment, "Task 34" — and is not why `call:` is refused here).
+//! stays a refusal: that function holds no `Connection`. A `call:` nested
+//! inside a `map` was refused there too, for want of the per-item budget pool
+//! ruling P77 §C deferred; Phase 8 Task 25.7 Task 7 supplied it
+//! (`run_loop::requested_nested_child_caps` asks against the item's share of
+//! the run rather than the run's whole remainder), so the run loop now drives
+//! that shape and only the runless callers still take the refusal. (`map`'s
+//! *worktree* fan-out is a separate, since-Task-34 concern — see
+//! `crate::exec::Executor::dispatch_map_step`'s own doc comment, "Task 34" —
+//! and was never why `call:` was refused here.)
 //!
 //! **B12b closed the sourcing half.** [`crate::ledger::admit_call_from_run`]
 //! reads the parent run's `session_depth` (migration 0008) and calls both
@@ -553,9 +556,17 @@ impl ChildBudget {
 /// run's**: 2,000 map items each carrying the whole run's `max_subagents`.
 /// `split_budget`'s own doc already anticipates the collision (*"would be a
 /// transfer out of this same pool, not an independent allocation"*).
-/// Reconciling the two is **Task 20 (B12)**'s, as the first task with a run
-/// loop that can drive a `call:` from inside a `map`; nothing here can, since
-/// the `StepBody::Call` arm is a stub. Named, not closed.
+///
+/// **Phase 8 Task 25.7 Task 7 is the first run loop that does drive a `call:`
+/// from inside a `map`**, and it narrows the request to the item's share
+/// (`run_loop::requested_nested_child_caps`) — so the four fields
+/// `split_budget` divides are now a real per-item ceiling. The residual is
+/// exactly the other three, unchanged and for the reason above: an item's
+/// `max_tasks`, `max_subagents` and `max_escalations` ceiling *is* the run's,
+/// so n items' nested calls can each ask for half of it. What still bounds
+/// them is this function's clamp against the run's true remaining, which every
+/// draw passes through — the first sibling's grant lowers what the next one
+/// can be given. Narrowed, not closed.
 ///
 /// # Hostile `f64` input
 ///

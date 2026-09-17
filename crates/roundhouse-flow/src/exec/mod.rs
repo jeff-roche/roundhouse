@@ -15,8 +15,10 @@
 //! [`rusqlite::Connection`](https://docs.rs/rusqlite). `dispatch_step`'s arm
 //! for the two is a refusal naming that, and it is reachable only from a
 //! caller with no run behind it: the in-memory
-//! [`Executor::run_to_completion`], or a `gate:`/`call:` nested inside a
-//! `map`.
+//! [`Executor::run_to_completion`], including the `map` fan-out it drives.
+//! A `gate:`/`call:` nested inside a `map` that **does** have a run behind it
+//! is [`run_loop`]'s, like every other one — Phase 8 Task 25.7's Tasks 6 and 7
+//! gave `run_loop::Loop::advance_map_item` an arm for each.
 //!
 //! The attribution here used to read "Tasks 7/11", was corrected by Task 19
 //! (B11) under ruling P75 §A to "Task 20 (B12)", and is now the module that
@@ -86,9 +88,11 @@ pub(crate) enum GateDecision {
 /// — the two callers with no `workflow_run` row behind them — never see
 /// `Pending` at all: both go through [`Executor::dispatch_step_or_stub`],
 /// which converts it into the same stub outcome this crate always produced
-/// for `Tool`/`Agent` before this type existed. Only
-/// [`run_loop::Loop::run_phase`] is able to actually suspend a run, so only
-/// it calls [`Executor::dispatch_step`] directly.
+/// for `Tool`/`Agent` before this type existed. Only the two loops that can
+/// actually suspend a run call [`Executor::dispatch_step`] directly:
+/// [`run_loop::Loop::run_phase`] for a top-level step, and
+/// `run_loop::Loop::dispatch_map` for one `map` item's inner step (Phase 8
+/// Task 25.7 Task 2). Both hold the `&mut Connection` `Executor` does not.
 pub(crate) enum DispatchDecision {
     Done(StepOutcome),
     Pending(run_loop::PendingKind),
@@ -918,11 +922,9 @@ impl<'a> Executor<'a> {
         for idx in order {
             let step = &step_defs[idx];
             self.ctx.set_with_secret_paths(
-                "steps",
+                STEPS_ROOT_NAME,
                 Value::Object(steps_context.clone()),
-                secret_derived_steps
-                    .iter()
-                    .map(|id| vec![id.clone(), "output".to_string()]),
+                secret_derived_steps.iter().map(secret_output_path),
             );
 
             // `when:` handling is a shared helper (fix round 2, item 1) —
@@ -961,6 +963,22 @@ impl<'a> Executor<'a> {
     /// callers see no change at all), and the outcome is a fixed empty,
     /// `Completed` object. Real dispatch is [`run_loop::Loop::run_phase`]'s
     /// alone, because only it can suspend and resume a durable run.
+    ///
+    /// # What changed for `map` (Phase 8 Task 25.7 Task 2)
+    ///
+    /// This doc used to say a `map` item's inner `tool:`/`agent:` step was
+    /// stubbed here because *"real per-item concurrency is Phase 8 Task
+    /// 25.7's scope"*. That task landed, and the hand-off it named is done:
+    /// a `map` driven by [`run_loop::run_workflow`] is now dispatched by
+    /// `run_loop::Loop::dispatch_map`, whose per-item loop calls
+    /// [`Self::dispatch_step`] directly and turns each item's `Pending` into
+    /// a real `PendingWork { item_index: Some(i), .. }`.
+    ///
+    /// What still reaches this function from a `map` is
+    /// `dispatch_map_step`'s own loop — the in-memory one, reached only from
+    /// [`Self::run_to_completion`], which has no run to suspend into. So the
+    /// stub is no longer a deferral; it is the honest answer for a sequencer
+    /// that genuinely cannot dispatch.
     fn dispatch_step_or_stub(&mut self, step: &StepDef) -> StepOutcome {
         let kind = match self.dispatch_step(step) {
             DispatchDecision::Done(outcome) => return outcome,
@@ -1357,13 +1375,22 @@ impl<'a> Executor<'a> {
                     gate_condition_was_secret_derived: false,
                 })
             }
-            // Task 14/B6: real `map` dispatch — evaluates `over:`, binds the
-            // `as:` item variable per item, and recursively runs the inner
-            // steps via this same `dispatch_step`. See
+            // Task 14/B6: the **in-memory** `map` dispatch — evaluates
+            // `over:`, binds the `as:` item variable per item, and runs the
+            // inner steps via `dispatch_step_or_stub`. See
             // `map_step::Executor::dispatch_map_step`'s own doc comment for
             // the full provenance/budget reasoning, including Task 34's
             // addition: an explicit `isolation: worktree` materializes a
             // real git worktree per item.
+            //
+            // **A `map` inside a real run does not reach this arm at all**
+            // (Phase 8 Task 25.7 Task 2): `run_loop::Loop::run_phase`
+            // intercepts `StepBody::Map` before it calls this function, the
+            // same way it already intercepts `gate:`/`call:` below, and
+            // drives the fan-out in waves that can suspend per item. This arm
+            // is what `Executor::run_to_completion` — the sequencer with no
+            // run behind it — gets, and `DispatchDecision::Done` is the
+            // honest answer there because nothing in that caller can suspend.
             //
             // (`dispatch_step` matches on `&step.body`, so match ergonomics
             // already bind `over`/`r#as`/`max_parallel`/`on_item_error`/
@@ -1402,20 +1429,29 @@ impl<'a> Executor<'a> {
             //
             // 1. `Executor::run_to_completion`, the in-memory sequencer, which
             //    has no run row at all.
-            // 2. `map_step::dispatch_map_step`'s inner-step loop, for a
-            //    `gate:` or `call:` nested inside a `map`. §8.9's own reference
-            //    workflow nests a `gate:` that way, so this is a real shape
-            //    that is refused rather than an impossible one — and it is
-            //    refused for a structural reason, not an omission: a park is a
-            //    transition of *the run*, and one run cannot be parked
-            //    per-item; a nested `call:` needs the per-item budget pool
-            //    whose ceilings ruling P77 §C defers. (Task 34 closed the
-            //    *other* thing this bullet used to lump in here — `map`'s
-            //    worktree fan-out is no longer deferred; see
-            //    `map_step::Executor::dispatch_map_step`'s own doc comment,
-            //    "Task 34".) The per-item budget pool and the nested
-            //    `gate:`/`call:` refusal both still belong with whoever gives
-            //    `map` real fan-out.
+            // 2. `map_step::dispatch_map_step`'s in-memory inner-step loop,
+            //    for a `gate:` or `call:` nested inside a `map`. That loop
+            //    runs under `Executor::run_to_completion`, so it is case 1
+            //    one level down: there is no run row to park and no child run
+            //    to fund, and §8.9's own reference workflow nests a `gate:`
+            //    that way, so this is a real shape refused rather than an
+            //    impossible one.
+            //
+            //    `run_loop::Loop::dispatch_map`'s wave-driven loop — the one
+            //    that *does* have a `Connection` — used to route both here
+            //    too (Phase 8 Task 25.7 Task 2). It now routes **neither**:
+            //    Task 6 gave the `gate:` an arm of its own that parks the run
+            //    on the item's behalf, cooperatively, once its wave has
+            //    drained, and Task 7 gave the `call:` one that funds the
+            //    child run out of that item's own share of the run's budget
+            //    (`run_loop::requested_nested_child_caps`, the per-item pool
+            //    whose ceilings ruling P77 §C had deferred). So the only
+            //    `map` that reaches this arm is case 1's: the in-memory one,
+            //    with no run row to park and no ledger to fund a child from.
+            //    (Task 34 closed `map`'s worktree fan-out and Task 2 closed
+            //    its per-item `tool:`/`agent:` dispatch; see
+            //    `run_loop::Loop::dispatch_map`'s own doc comment for what is
+            //    left.)
             //
             // Fix round 1, item 8: the message used to be
             // `format!("step kind {other:?} handled by a later task")` — a
@@ -1430,8 +1466,8 @@ impl<'a> Executor<'a> {
                     &step.id,
                     format!(
                         "step kind `{}` needs a run loop: it is dispatched by \
-                         `run_loop::run_workflow`, never by a bare executor or from inside a \
-                         `map`",
+                         `run_loop::run_workflow`, never by a bare executor — including the \
+                         in-memory `map` fan-out a bare executor drives",
                         step_body_kind_name(other)
                     ),
                 ))
@@ -1480,6 +1516,32 @@ fn step_body_kind_name(body: &StepBody) -> &'static str {
         StepBody::Emit { .. } => "emit",
         StepBody::Report { .. } => "report",
     }
+}
+
+/// The `${{ }}` root every step's recorded outcome is read through —
+/// `${{ steps.<id>.output }}`.
+///
+/// Named once because **three** bindings write it, and a typo in any of them
+/// would silently bind a root nothing reads: [`Executor::run_to_completion`]'s
+/// own per-step fold (the in-memory sequencer, below),
+/// `crate::exec::run_loop::Loop::bind_steps_context` (a real run's), and
+/// `crate::exec::run_loop::ItemStepsContext::bind_if_stale` (one `map` item's
+/// own, Phase 8 Task 25.7 Task 10).
+pub(crate) const STEPS_ROOT_NAME: &str = "steps";
+
+/// The secret path [`ExprContext::set_with_secret_paths`] marks for one step's
+/// output — `["<id>", "output"]`, never the whole root, so
+/// `${{ steps.<id>.status }}` stays readable in the log.
+///
+/// Shared by the same three binding sites [`STEPS_ROOT_NAME`] lists, for a
+/// sharper reason than tidiness: this projection's *shape* is what decides
+/// which leaf is redacted, and a site that wrote `["<id>"]` or
+/// `["<id>", "value"]` instead would mark the wrong path — leaving a
+/// secret-derived output unmarked, which reaches the append-only log in
+/// cleartext (see `Loop::bind_steps_context`'s own doc comment for the
+/// measured shape of that hazard).
+pub(crate) fn secret_output_path(step_id: impl AsRef<str>) -> Vec<String> {
+    vec![step_id.as_ref().to_string(), "output".to_string()]
 }
 
 /// Builds the `steps.<id>` entry folded into [`ExprContext`]'s `steps` root

@@ -1,10 +1,57 @@
 //! `map` step fan-out (§8.9, Task 14/B6): per-item budget splitting
-//! ([`split_budget`]/[`MapBudget`]/[`run_map`]) and the real `StepBody::Map`
-//! dispatch arm ([`Executor::dispatch_map_step`]) that binds the item
-//! variable (`as:`) into the expression context for each item — closing
-//! finding 8's remaining gap (the `map` item variable was never bound
+//! ([`split_budget`]/[`MapBudget`]/[`run_map`]) and the in-memory
+//! `StepBody::Map` dispatch arm ([`Executor::dispatch_map_step`]) that binds
+//! the item variable (`as:`) into the expression context for each item —
+//! closing finding 8's remaining gap (the `map` item variable was never bound
 //! anywhere) — and distinguishes `on_item_error: collect` from `continue`
 //! (finding 9/10).
+//!
+//! # There are two `map` fan-out loops, and this file is one of them (Phase 8 Task 25.7 Task 2)
+//!
+//! [`Executor::dispatch_map_step`] is the loop the **in-memory** sequencer
+//! ([`Executor::run_to_completion`]) drives: no `workflow_run` row, no
+//! `Connection`, so a `tool:`/`agent:` inner step takes
+//! [`Executor::dispatch_step_or_stub`]'s fixed stub and an item always runs
+//! to completion inside one call. `crate::exec::run_loop::Loop::dispatch_map`
+//! is the loop a **real run** drives: it holds the `Connection`, dispatches
+//! each item's inner steps for real, and suspends the run per item in waves
+//! bounded by `map.max_parallel`.
+//!
+//! The two differ only in control flow. Everything below it — `over:`
+//! evaluation and the item cap ([`resolve_map_items`]), inner-step parsing
+//! ([`parse_map_inner_steps`]), the `as:`/`worktree` snapshot span
+//! ([`snapshot_map_roots`]/[`restore_map_roots`]), per-item isolation
+//! ([`Executor::prepare_item_isolation`]/[`Executor::release_item_isolation`]),
+//! the nested-`report:` refusal ([`nested_report_refusal`]), the inner-outcome
+//! fold ([`fold_inner_step_outcome`]), `on_item_error` bookkeeping
+//! ([`ItemErrorPolicy`]) and the map's own aggregate output
+//! ([`map_step_outcome`]) — lives here once, and both loops call it. That is
+//! deliberate and is the same argument [`evaluate_when_gate`]'s own doc
+//! comment makes: two independently written copies of one decision drift, and
+//! this file has already paid for that once.
+//!
+//! One decision here is deliberately *not* shared, and it is the exception
+//! that proves the rule: [`per_item_dispatch_refusal`] (Task 4) lives beside
+//! [`split_budget`], the division it enforces, but only the run-loop fan-out
+//! calls it. See the closure at [`run_map`]'s call site for why — in short,
+//! every `tool:`/`agent:` inner step *this* loop reaches is
+//! [`Executor::dispatch_step_or_stub`]'s stub, so there is no per-item spend
+//! here for a ceiling to bound.
+//!
+//! **One capability is likewise the run loop's alone, and this one is a real
+//! difference in what a workflow can express** (Phase 8 Task 25.7 Task 10):
+//! an inner step reading a *sibling* inner step's output through
+//! `${{ steps.<id>.output }}`. `crate::exec::run_loop::ItemStepsContext` binds
+//! an item-scoped `steps` object around each item's walk, and this loop has
+//! no counterpart — there is nothing here to bind. `crate::exec::Executor`'s
+//! own `steps` root is folded by
+//! [`Executor::run_to_completion`] from the outcomes of **top-level** steps,
+//! and a `map` item's inner steps never enter it (the item's whole fan-out is
+//! one step to that loop), so a sibling reference here still reads `null`. A
+//! workflow that depends on one — §8.9's reference workflow does — therefore
+//! behaves differently under the in-memory sequencer, which is a test/example
+//! harness (see [`MapBudget::unenforced_placeholder`] for the same split), not
+//! a path a real run takes.
 //!
 //! # Deviations from the plan text (ruling P1)
 //!
@@ -82,7 +129,7 @@ const DEFAULT_WORKTREE_BASE_REF: &str = "HEAD";
 /// paths, panic included", for the full reasoning and why the *explicit*
 /// [`Self::release`] call (not `Drop` alone) is what lets a release failure
 /// actually reach the item's own [`ItemOutcome`] on the ordinary path.
-struct WorktreeGuard {
+pub(crate) struct WorktreeGuard {
     provider: Arc<dyn WorktreeProvider>,
     /// `None` once released — by [`Self::release`], or by [`Drop::drop`] on
     /// an unwind/early-return path. `Option` (rather than a plain
@@ -250,6 +297,10 @@ pub enum ItemOutcome {
 /// this crate parses per-item `map` caps yet) would be a transfer out of
 /// this same pool, not an independent allocation, so this function is
 /// intended only for items that do not set their own caps.
+///
+/// What holds an item to the share this computes is
+/// [`per_item_dispatch_refusal`], which also records which of these fields is
+/// enforceable at all and why the rest are not.
 pub fn split_budget(total: &ResourceCaps, item_count: u32) -> ResourceCaps {
     let n = item_count.max(1) as f64;
     ResourceCaps {
@@ -265,6 +316,221 @@ pub fn split_budget(total: &ResourceCaps, item_count: u32) -> ResourceCaps {
     }
 }
 
+/// **[`split_budget`]'s enforcement half: one item's next real dispatch,
+/// refused once the item has spent its own share** (Phase 8 Task 25.7, #64,
+/// Task 4). `None` when the dispatch still fits.
+///
+/// # What this is, and what it deliberately is not
+///
+/// §8.9 makes an item's budget *"a transfer out of the run's remaining
+/// budget, not an independent pool"*, so this adds **no** durable accounting:
+/// [`crate::ledger::admit_spend`] stays the one place a run's ledger moves,
+/// and a `map` is still charged there exactly once, when it starts. What this
+/// adds on top is an in-memory ceiling, derived fresh on every segment from
+/// the item's own durable rows, that stops one item consuming the whole run's
+/// allowance while its siblings starve — a live risk only since Task 2 of the
+/// same task made a `map` item's inner steps dispatch for real.
+///
+/// **It bounds an item against its siblings, not the map's total.**
+/// [`split_budget`] rounds an item's share of `max_tool_calls` *up*, so every
+/// item keeps at least one call for as long as the run has any allowance left
+/// at all: an n-item `map` still issues n real dispatches whatever this
+/// returns. What it prevents is one item running away with the whole share,
+/// which is a fairness property rather than an exhaustion one. Bounding the
+/// aggregate — including recording the items a spent *run* never reached — is
+/// §8.9's cooperative run-budget exhaustion, which is
+/// [`run_budget_is_exhausted`] (Task 5).
+///
+/// # Why `max_tool_calls`, and why that field alone
+///
+/// Of the four countables [`split_budget`] divides, `max_tool_calls` is the
+/// only one whose unit a `map` can observe at all. `max_cost_usd`,
+/// `max_tokens` and `max_bytes_written` are measured *outside* the run (see
+/// [`crate::ledger::Spend`]'s own doc on why this crate invents none of them),
+/// and nothing carries them back: `crate::exec::run_loop::WorkDone` — the only
+/// thing a finished dispatch hands this crate — has no field for any of the
+/// three. A ceiling on a figure that is always zero would be enforcement
+/// theatre; a ceiling on calls is the one §8.9 shares with
+/// `crate::exec::run_loop::Loop::admit`, which charges a top-level `tool:`
+/// step exactly one.
+///
+/// **Every real dispatch counts as one call** — an `agent:` step included, and
+/// (Phase 8 Task 25.7 Task 7) a nested `call:` too. `Loop::admit` bills a
+/// top-level `agent:`/`call:` step against `max_subagents` instead, but
+/// [`split_budget`] deliberately does not divide that field, so counting an
+/// item's agent spawns or child runs there would bound them by the run's
+/// *whole* allowance — which is not a per-item bound at all. The question this
+/// ceiling answers is "how much real work may one item set going", and all
+/// three bodies are that; see
+/// `crate::exec::run_loop::inner_step_needs_real_dispatch`, which is what
+/// decides membership.
+///
+/// # The share can shrink between waves, and an item can be refused under a smaller one
+///
+/// `item_caps` is [`split_budget`]'s output, re-derived on **every** segment
+/// from the run's *current* remainder — so it is not a figure an item can rely
+/// on staying still. Before Phase 8 Task 25.7 Task 7 it did stay still, because
+/// nothing a fan-out did charged `max_tool_calls` at the run level. A nested
+/// `call:` charges it (the child's grant is drawn from the run's ledger, and
+/// `crate::ledger::Spend::for_grant` charges the parent every field of it), so
+/// **one item's child can shrink its siblings' share** — and an item's own
+/// later dispatch can be refused against a ceiling smaller than the one its
+/// earlier dispatches were measured against, with `dispatches_so_far` already
+/// at or past it.
+///
+/// That is §8.9's model working, not a defect in it: an item's budget is *"a
+/// transfer out of the run's remaining budget, not an independent pool"*, and a
+/// pool a sibling really did spend is a pool that legitimately has less in it.
+/// The alternative — freezing each item's share when the `map` starts — needs
+/// durable per-item state that does not exist (`crate::exec::run_loop::Loop` is
+/// rebuilt from scratch on every segment). What matters is that it fails
+/// **closed** and visibly: the item takes the ordinary `ItemOutcome::Failed`
+/// below, with the two numbers in the message, under `on_item_error`. Measured
+/// in `tests/run_loop.rs`:
+/// `a_siblings_nested_call_shrinks_a_later_waves_per_item_share`.
+///
+/// # Why the item `Failed` rather than `Skipped`
+///
+/// A `Skipped` item is one the fan-out never started — `fail_fast`'s fill, or
+/// (Task 5) an item the *run* ran out of budget before reaching. This item did
+/// run; it ran too much. So it takes the ordinary path any other inner-step
+/// failure takes, and `on_item_error` governs what that does to the rest of
+/// the fan-out, with the reason in the message rather than in a comment.
+pub(crate) fn per_item_dispatch_refusal(
+    map_step_id: &str,
+    inner_step_id: &str,
+    item_index: u32,
+    dispatches_so_far: u32,
+    item_caps: &ResourceCaps,
+) -> Option<ItemOutcome> {
+    let allowed = item_caps.max_tool_calls;
+    (dispatches_so_far >= allowed).then(|| {
+        ItemOutcome::Failed(format!(
+            "map step `{map_step_id}`, item {item_index}: inner step `{inner_step_id}` needs a \
+             real dispatch, and this item has already made {dispatches_so_far} of the {allowed} \
+             it is allowed — its even share of the run's remaining `max_tool_calls` at the \
+             moment this `map` started. §8.9 makes an item's budget a transfer out of the run's \
+             remaining budget rather than an independent pool, so the dispatch is refused here \
+             rather than letting one item spend the whole run's allowance while its siblings \
+             starve"
+        ))
+    })
+}
+
+/// **§8.9's cooperative run-budget exhaustion, as the one question a `map` can
+/// ask before it starts another item** (Phase 8 Task 25.7, #64, Task 5).
+/// `true` once the fan-out's own real dispatches have used up what the *run*
+/// had left, which is where §8.9 stops new items starting.
+///
+/// # A different bound from [`per_item_dispatch_refusal`], not a second copy of it
+///
+/// That one is a **fairness** bound: one item's tally against
+/// [`split_budget`]'s even share, so no item spends the whole allowance while
+/// its siblings starve. Because the share is rounded *up*, every item keeps at
+/// least one call while the run has any allowance at all — so an n-item `map`
+/// over a run with two calls left still issues n real dispatches, and no
+/// per-item ceiling can stop it. This is the **aggregate** bound that one's
+/// doc comment defers to: the whole fan-out against the run's remainder.
+///
+/// # Why `max_tool_calls`, and why that field alone
+///
+/// The same reason [`per_item_dispatch_refusal`] records, unchanged:
+/// `max_cost_usd`, `max_tokens` and `max_bytes_written` are measured outside
+/// the run and nothing carries them back — `crate::exec::run_loop::WorkDone`,
+/// the only thing a finished dispatch hands this crate, has no field for any
+/// of the three — so a ceiling on them would bound a figure that is always
+/// zero.
+///
+/// The two elapsed-time windows are left out for a different and sharper
+/// reason: [`crate::ledger::admit_spend`] checks both on **every** call
+/// regardless of what is being spent, and the `map` step passes through that
+/// chokepoint on every segment of its fan-out (a real charge on the first,
+/// `Spend::ZERO` on each resumed wave — see
+/// `crate::exec::run_loop::Loop::observe_admission`). A `map` whose wall or
+/// active window has run out is therefore already refused in
+/// `Loop::run_phase`, before this loop is reached at all. `max_tasks` and
+/// `max_subagents` are likewise the run-level admission's to enforce, and it
+/// charges neither for a `map` item's inner step.
+///
+/// # What `>=` means here, and what moves on each side of it
+///
+/// `run_remaining` is re-read from the ledger before every segment. What
+/// usually moves is the left-hand side — the fan-out's own dispatch count —
+/// which is why this becomes true part-way through a `map` rather than only
+/// ever at its start.
+///
+/// **The right-hand side moves too, since Phase 8 Task 25.7 Task 7.** This
+/// section used to say the figure "is constant for the life of one fan-out",
+/// on the grounds that no part of a fan-out charges `max_tool_calls` at the
+/// run level. A nested `call:` does: its child's grant is drawn from the run's
+/// ledger and `crate::ledger::Spend::for_grant` charges the parent every field
+/// of that grant, `max_tool_calls` included. So a fan-out that funds children
+/// lowers its own aggregate ceiling as it goes, and — through
+/// [`split_budget`], which is re-derived from the same figure every segment —
+/// each item's share with it.
+///
+/// # What it bounds, and the one thing it does not
+///
+/// Its caller asks it at the seam an item is **started**, never at the seam an
+/// inner step dispatches, because §8.9's rule is *"no new round-trips or new
+/// items start"* while an in-flight item *"finishes its current round-trip"* —
+/// and an item cut off half-way through its inner steps has no honest outcome
+/// to record (it is not `Skipped`, having run, and `Failed` is the
+/// conflation §8.9 forbids).
+///
+/// **The exemption that buys is permanent, not one round-trip long**, and the
+/// overshoot it leaves is correspondingly larger.
+/// `crate::exec::run_loop::Loop::map_item_is_in_flight` is true for an item
+/// from the moment any of its inner steps holds a durable row, and stays true —
+/// so an item already started when this first returns `true` goes on
+/// dispatching its remaining inner steps on every later segment. Nothing in
+/// *this* bound stops it: what does is [`per_item_dispatch_refusal`]'s share,
+/// the item's inner-step list running out, or whatever else ends the item
+/// first (an inner-step failure, a refusal).
+///
+/// The bound is therefore the **item count**, not `map.max_parallel` and not
+/// one dispatch per item in flight. Every item is held to [`split_budget`]'s
+/// share of `ceil(R / N)` — `R` the run's remainder, `N` the item count — so
+/// the fan-out's nominal total is `N * ceil(R / N)`, which exceeds `R` by
+/// `N - (R mod N)` when `N` does not divide `R` and by nothing when it does:
+/// at most `N - 1`, with `N` itself at most [`MAX_MAP_ITEMS`]. (Task 4's own
+/// re-decide overshoot, which
+/// `crate::exec::run_loop::Loop::map_item_dispatches_so_far` documents, sits on
+/// top of that nominal total rather than inside it.)
+///
+/// Measured, not reasoned, in `tests/run_loop.rs`:
+/// `an_already_started_item_keeps_dispatching_past_the_runs_remainder_unflagged`
+/// drives three items of three `tool:` steps with seven calls left and
+/// `max_parallel: 1`, and gets **nine** dispatches — item 2 starts at a tally
+/// of six, which is not yet seven, and then spends its whole share of three.
+///
+/// **And a run that overshoots this way is not flagged.** Every item completes,
+/// so nothing is `Skipped` and [`output_records_a_run_budget_skip`] finds
+/// nothing: §8.9's `needs_human` reports *"at least one item was withheld"*,
+/// never *"this run stayed inside its remainder"*. An operator reading it as an
+/// overspend alarm would miss exactly this case.
+///
+/// Closing either half would need a cut-off outcome §8.9 does not define.
+///
+/// **And the count on the left of `>=` is scoped to one `map`, not the run's
+/// whole lifetime.** `crate::exec::run_loop::Loop::map_dispatches_so_far`
+/// tallies only this fan-out's own inner-step rows, and the run ledger's
+/// `max_tool_calls` is charged only for a top-level `tool:` step
+/// (`crate::exec::run_loop::Loop::admit`) — every later wave of a `map`
+/// re-enters through `crate::exec::run_loop::Loop::observe_admission`'s
+/// `Spend::ZERO`, so no inner-step dispatch is ever charged there either. A
+/// workflow with `N` sequential `map` steps therefore gets each one its own
+/// near-full run remainder `R` as an aggregate ceiling — roughly `N * R` real
+/// dispatches in total, not `R` — which §8.9's "a transfer out of the run's
+/// remaining budget, not an independent pool" model makes correct, not a bug,
+/// just a residual this doc had not named.
+pub(crate) fn run_budget_is_exhausted(
+    map_dispatches_so_far: u32,
+    run_remaining: &ResourceCaps,
+) -> bool {
+    map_dispatches_so_far >= run_remaining.max_tool_calls
+}
+
 /// The result of a `map` step's fan-out: the per-item outcomes (never
 /// truncated — every item gets an entry, per §8.9), plus, when
 /// `on_item_error: collect`, the gathered error messages for the map step's
@@ -277,20 +543,23 @@ pub struct MapRunResult {
 }
 
 /// Runs `items` through `run_item`, respecting `on_item_error`.
-/// `max_parallel` is accepted (matching this task's Interfaces) but unused —
-/// sequential here, matching every other "real dispatch is Task 8's job"
-/// deferral in this crate: the real executor swaps this loop body for a
-/// bounded concurrent dispatcher once Task 8's durability layer owns actual
-/// task admission; nothing today gives a caller a live signal to parallelise
-/// against.
 ///
-/// **`max_parallel` bounds nothing today (fix round 1, "also record").** A
-/// workflow declaring `map.max_parallel: 20` runs its items fully
-/// sequentially, not "at most 20 concurrently" — the field is accepted and
-/// threaded through unread. This is a residual, documented here precisely so
-/// a future reader does not mistake `max_parallel` for a working concurrency
-/// *ceiling*: today it is neither a floor nor a ceiling, because nothing
-/// reads it at all.
+/// **`max_parallel` is unread *here*, and that is now a statement about this
+/// function rather than about `map`.** This is the in-memory fan-out, reached
+/// only from [`Executor::run_to_completion`] — a sequencer with no
+/// `workflow_run` row, no `Connection`, and therefore nothing to dispatch
+/// against: every `tool:`/`agent:` inner step it reaches becomes
+/// [`Executor::dispatch_step_or_stub`]'s fixed stub, so "how many at once" is
+/// not a question it can answer differently. Running items sequentially is
+/// the honest behaviour for it, not a deferral.
+///
+/// The loop that *does* read `max_parallel` is
+/// `crate::exec::run_loop::Loop::dispatch_map` (Phase 8 Task 25.7 Task 2),
+/// which drives a `map` inside a real run in waves bounded by it. See that
+/// function's own doc comment for why it is a second loop rather than a
+/// widening of this one's `run_item` signature — in short, [`ItemOutcome`]
+/// has no way to say "this item is half-way through and must suspend", and
+/// this function's only caller never needs one.
 ///
 /// **Never drops an item.** Every element of `items` produces exactly one
 /// [`ItemOutcome`] in [`MapRunResult::outcomes`], in order — §8.9's explicit
@@ -302,8 +571,14 @@ pub struct MapRunResult {
 /// using whatever ledger its caller threads in — "cooperative" names exactly
 /// this, the caller checking and reporting `Skipped` rather than this
 /// function silently withholding a call. `run_item` is still handed
-/// [`split_budget`]'s even-split allowance for the item, which is real and
-/// meaningful regardless (Task 8's admission ledger is what enforces it).
+/// [`split_budget`]'s even-split allowance for the item, and the closure at
+/// this function's one call site still leaves it unread — see that closure's
+/// own comment for why binding it *here* would bound nothing but stub work.
+/// The loop that enforces the same share for real is
+/// `crate::exec::run_loop::Loop::dispatch_map`, through
+/// [`per_item_dispatch_refusal`] — and it is also where the cooperative
+/// decision described above is actually made, through
+/// [`run_budget_is_exhausted`] and [`skipped_by_run_budget_exhausted`].
 ///
 /// `on_item_error` (finding 10's fix — previously `collect` and `continue`
 /// were indistinguishable):
@@ -327,16 +602,10 @@ pub fn run_map(
 ) -> MapRunResult {
     let per_item_caps = split_budget(&budget.total_remaining, items.len() as u32);
     let mut outcomes = Vec::with_capacity(items.len());
-    let mut collected_errors = Vec::new();
+    let mut policy = ItemErrorPolicy::new(on_item_error);
     for item in &items {
         let outcome = run_item(item, per_item_caps.clone());
-        if let ItemOutcome::Failed(message) = &outcome {
-            if on_item_error == OnItemError::Collect {
-                collected_errors.push(message.clone());
-            }
-        }
-        let should_stop =
-            matches!(outcome, ItemOutcome::Failed(_)) && on_item_error == OnItemError::FailFast;
+        let should_stop = policy.observe(&outcome);
         outcomes.push(outcome);
         if should_stop {
             break;
@@ -345,14 +614,123 @@ pub fn run_map(
     // Any items not yet visited because of an early `fail_fast` break are
     // recorded as `Skipped` rather than silently absent from the result.
     while outcomes.len() < items.len() {
-        outcomes.push(ItemOutcome::Skipped {
-            reason: "fail_fast: prior item failed".to_string(),
-        });
+        outcomes.push(ItemErrorPolicy::skipped_by_fail_fast());
     }
     MapRunResult {
         outcomes,
-        collected_errors,
+        collected_errors: policy.into_collected_errors(),
     }
+}
+
+/// The reason an item the fan-out never started carries, so a reader can tell
+/// it from an item its own `when:` skipped.
+pub(crate) const FAIL_FAST_SKIP_REASON: &str = "fail_fast: prior item failed";
+
+/// §8.9's `on_item_error` bookkeeping over a stream of finished per-item
+/// outcomes — what `collect` collects, and when `fail_fast` stops.
+///
+/// **One implementation, two fan-out loops.** [`run_map`]'s sequential loop
+/// and [`crate::exec::run_loop`]'s wave-driven one are genuinely different
+/// control flows (one runs an item to completion in a closure, the other
+/// advances every item one inner step per segment), but the *policy* applied
+/// to a finished item's outcome must be identical in both or a workflow's
+/// declared `on_item_error` would mean two different things depending on
+/// whether its inner steps happened to suspend. That is the same reasoning
+/// [`evaluate_when_gate`]'s own doc comment records for sharing the `when:`
+/// split rather than writing it twice — and the same defect class it names,
+/// reached from the other direction.
+pub(crate) struct ItemErrorPolicy {
+    on_item_error: OnItemError,
+    collected_errors: Vec<String>,
+}
+
+impl ItemErrorPolicy {
+    pub(crate) fn new(on_item_error: OnItemError) -> Self {
+        ItemErrorPolicy {
+            on_item_error,
+            collected_errors: Vec::new(),
+        }
+    }
+
+    /// Records one item's finished outcome, returning whether the fan-out
+    /// must stop starting further items.
+    pub(crate) fn observe(&mut self, outcome: &ItemOutcome) -> bool {
+        let ItemOutcome::Failed(message) = outcome else {
+            return false;
+        };
+        match self.on_item_error {
+            OnItemError::Collect => {
+                self.collected_errors.push(message.clone());
+                false
+            }
+            OnItemError::Continue => false,
+            OnItemError::FailFast => true,
+        }
+    }
+
+    /// The outcome an item the fan-out never started is recorded with —
+    /// §8.9's "never drop an item", as a value rather than a string literal
+    /// written at each of the two fan-out loops.
+    pub(crate) fn skipped_by_fail_fast() -> ItemOutcome {
+        ItemOutcome::Skipped {
+            reason: FAIL_FAST_SKIP_REASON.to_string(),
+        }
+    }
+
+    pub(crate) fn into_collected_errors(self) -> Vec<String> {
+        self.collected_errors
+    }
+}
+
+/// The reason §8.9 gives an item the *run* ran out of budget before reaching,
+/// so a reader can tell it from an item `fail_fast` withheld
+/// ([`FAIL_FAST_SKIP_REASON`]) and from one its own `when:` skipped. The
+/// literal §8.9 itself writes.
+pub(crate) const RUN_BUDGET_EXHAUSTED_SKIP_REASON: &str = "run_budget_exhausted";
+
+/// [`ItemErrorPolicy::skipped_by_fail_fast`]'s counterpart for §8.9's
+/// cooperative run-budget exhaustion — the same "never drop an item" record,
+/// for the other of the two reasons a fan-out stops starting items.
+///
+/// **Deliberately a free function rather than a second method on
+/// [`ItemErrorPolicy`], and deliberately not that constructor reused.**
+/// `fail_fast` is an `on_item_error` policy, driven by
+/// [`ItemErrorPolicy::observe`], which fires only on a real item *failure*;
+/// running out of run budget is environmental and no item failed. Sharing the
+/// constructor — or the reason string — would make the two indistinguishable
+/// in a `map`'s own output, which is what §8.9's "never conflated with a real
+/// failure" forbids, and would also make
+/// [`output_records_a_run_budget_skip`] fire on a `fail_fast` cutoff.
+pub(crate) fn skipped_by_run_budget_exhausted() -> ItemOutcome {
+    ItemOutcome::Skipped {
+        reason: RUN_BUDGET_EXHAUSTED_SKIP_REASON.to_string(),
+    }
+}
+
+/// Whether a `map` step's own aggregate output records at least one item
+/// [`skipped_by_run_budget_exhausted`] withheld — the signal
+/// `crate::exec::run_loop::Loop::synthesise_report` turns into §8.9's
+/// `needs_human: true`.
+///
+/// It reads the shape [`map_step_outcome`] writes, through the same
+/// [`item_outcome_to_json`] mapping that wrote it, so the two cannot drift.
+///
+/// **Structural, so it is stated as what it matches rather than as what it
+/// means.** Any output at all can be handed to it, and `false` is simply
+/// "nothing of this shape is in there" — but it does not verify that the
+/// output came from a `map` step, because its callers hold a
+/// [`StepOutcome`]/`workflow_step_run` row rather than the `StepDef` that
+/// would say so. The one way to reach a false positive is a non-`map` step
+/// whose own output contains an `items` array carrying this crate's private
+/// reason constant, and its only effect is to flag a run for an operator that
+/// did not need flagging — the safe direction for a field whose purpose is to
+/// stop an incomplete run being silently buried.
+pub(crate) fn output_records_a_run_budget_skip(output: &Value) -> bool {
+    output["items"].as_array().is_some_and(|items| {
+        items.iter().any(|item| {
+            item["status"] == "skipped" && item["reason"] == RUN_BUDGET_EXHAUSTED_SKIP_REASON
+        })
+    })
 }
 
 fn item_outcome_to_json(o: &ItemOutcome) -> Value {
@@ -471,13 +849,739 @@ fn map_isolation_tier_name(def: &MapIsolationDef) -> &'static str {
     }
 }
 
+// ---------------------------------------------------------------------------
+// The per-item evaluation this file owns, factored out of
+// `Executor::dispatch_map_step`'s own closure so the **other** fan-out loop —
+// `crate::exec::run_loop::Loop::dispatch_map`, the wave-driven one that alone
+// can suspend a run — calls the same code rather than a second copy of it
+// (Phase 8 Task 25.7 Task 2).
+//
+// Which loop runs a `map` is decided by who dispatched the step: a caller
+// with a `workflow_run` row behind it (`run_loop::run_workflow`) drives the
+// wave loop, and the in-memory sequencer (`Executor::run_to_completion`)
+// drives this file's synchronous one. Everything *below* that split —
+// evaluating `over:`, the item-count cap, binding `as:`, materializing and
+// releasing an item's worktree, refusing a nested `report:`, folding an inner
+// step's outcome into the item's, and assembling the map's own aggregate
+// output — is the same decision either way, so it lives here, once.
+// ---------------------------------------------------------------------------
+
+/// `map.over`'s evaluation, [`MAX_MAP_ITEMS`] check and array type check —
+/// every refusal being a `StepOutcome` the caller returns for the whole `map`
+/// step, exactly as `dispatch_map_step` always did.
+///
+/// Returns the collection's own [`Evaluated`] alongside the items, because
+/// binding one item goes through [`Evaluated::derive`] off it rather than
+/// re-asserting a per-item taint — see [`Executor::dispatch_map_step`]'s own
+/// doc comment for the ruling P37/P45 argument that makes that the only
+/// sanctioned binding route.
+///
+/// The refusal is boxed because [`StepOutcome`] is the larger of the two
+/// variants by an order of magnitude and every call here succeeds in the
+/// ordinary case (`clippy::result_large_err`).
+pub(crate) fn resolve_map_items(
+    ctx: &crate::expr::ExprContext,
+    step_id: &str,
+    over: &str,
+) -> Result<(crate::expr::Evaluated, Vec<Value>), Box<StepOutcome>> {
+    let over_evaluated =
+        match eval_delimited_expression(TemplateSource::from_workflow_file(over), ctx) {
+            Ok(v) => v,
+            Err(e) => {
+                return Err(Box::new(StepOutcome::failed(
+                    step_id,
+                    format!("evaluating `map.over`: {e}"),
+                )));
+            }
+        };
+    let items: Vec<Value> = match over_evaluated.value() {
+        Value::Array(items) => {
+            // Fix round 2, item 4: the cap check runs on the *borrowed*
+            // array, before it is cloned into `items: Vec<Value>`, so a
+            // rejected call never even pays for that clone — see
+            // `Executor::dispatch_map_step`'s own doc comment,
+            // "`MAX_MAP_ITEMS`", for what this bounds and does not.
+            if items.len() > MAX_MAP_ITEMS {
+                return Err(Box::new(StepOutcome::failed(
+                    step_id,
+                    format!(
+                        "`map.over` yielded {} items, exceeding the {MAX_MAP_ITEMS}-item \
+                         limit for a single `map` step",
+                        items.len()
+                    ),
+                )));
+            }
+            items.clone()
+        }
+        other => {
+            return Err(Box::new(StepOutcome::failed(
+                step_id,
+                format!(
+                    "`map.over` must evaluate to an array, got {}",
+                    value_type_name(other)
+                ),
+            )));
+        }
+    };
+    Ok((over_evaluated, items))
+}
+
+/// The `map`'s own `steps:` list, parsed once per dispatch. A parse failure
+/// fails the whole `map` step — workflow YAML is untrusted input, so it is a
+/// step outcome rather than a panic. Boxed for the reason
+/// [`resolve_map_items`] records.
+pub(crate) fn parse_map_inner_steps(
+    step_id: &str,
+    inner_step_yaml: &[serde_yaml::Value],
+) -> Result<Vec<StepDef>, Box<StepOutcome>> {
+    inner_step_yaml
+        .iter()
+        .map(parse_step)
+        .collect::<Result<Vec<StepDef>, _>>()
+        .map_err(|e| {
+            Box::new(StepOutcome::failed(
+                step_id,
+                format!("parsing `map` inner steps: {e}"),
+            ))
+        })
+}
+
+/// **A `report:` is a property of the run, not of a map item** — the argument
+/// [`crate::exec::Executor::dispatch_step`]'s catch-all arm used to make for a
+/// nested `call:` too, applied to another step kind with run-wide meaning
+/// (B12c fix round, ruling P116 §B).
+///
+/// **And it is the one of the three that stays refused.** A nested `gate:`
+/// carried the same "this is run-wide" objection until Phase 8 Task 25.7
+/// Task 6, which resolved it rather than accepting it: a park *is* run-wide,
+/// so one item's gate now parks the whole run and the durable record says
+/// which item. A nested `call:` went the same way in Task 7: its child run is
+/// funded out of the item's own share, so what looked run-wide turned out to
+/// be divisible. `report:` has no such resolution, and not for want of
+/// plumbing — a run has exactly one report (ruling P112), so an item cannot
+/// be given one without taking it from the run.
+///
+/// Refused where the nesting *is* visible rather than in that arm, because
+/// `dispatch_step` is also how a *top-level* `report:` step is run, by both
+/// `run_to_completion` and `run_loop::run_workflow`, and the arm cannot tell
+/// the two callers apart.
+///
+/// What it costs to leave open: `run_workflow`'s §8.6 "exactly one report"
+/// pre-check flattens only the three phase step lists, so it structurally
+/// cannot see a `report:` under a `map` — and a nested one emits one
+/// `TaskKind::Report` task **per item**, into a log that physically rejects
+/// `UPDATE`/`DELETE`. Ruling P112's invariant would then be violated by a
+/// workflow the pre-check accepted.
+pub(crate) fn nested_report_refusal(inner: &StepDef) -> Option<ItemOutcome> {
+    matches!(inner.body, StepBody::Report { .. }).then(|| {
+        ItemOutcome::Failed(format!(
+            "step `{}`: a `report:` step cannot run inside a `map`: §8.6's report is a \
+             property of the run, and one per item would leave the Runs inbox choosing \
+             between them",
+            inner.id
+        ))
+    })
+}
+
+/// Folds one inner step's [`StepOutcome`] into the item's running result and
+/// the `map`'s aggregate taint, returning whether the item's inner loop must
+/// stop.
+///
+/// **Fix round 1, item 4: an item fails as soon as ANY inner step fails.**
+/// The first landed version tracked only the most recently dispatched inner
+/// step's outcome, unconditionally overwritten by every subsequent one — so a
+/// *non-final* inner step's failure was silently replaced by whatever the
+/// following step returned, and both `fail_fast` and `collect` reported full
+/// success. Stopping here, on the first `Failed`, is what keeps the failure.
+///
+/// **Unless the step declared `continue_on_error: true`** (Phase 8 Task 25.7
+/// Task 10). The flag is the inner step's own `continue_on_error:` field,
+/// passed in by the caller because this function is otherwise not handed the
+/// step it is folding — which is exactly why the flag used to be *inert*
+/// inside a `map`, while `crate::exec::run_loop::Loop::run_phase` honours it
+/// for a top-level step at both of its own failure seams. §8.9's own
+/// reference workflow turns on that reading: its `tests` step is a
+/// `tool: shell` with `continue_on_error: true`, so that a red test suite
+/// still lets the review be posted.
+///
+/// **A continuing failure leaves `last` alone — it does not write itself into
+/// the item's outcome at all** (Task 10, fix round 1). The first version of
+/// this arm assigned `last` on both branches, reasoning that the item should
+/// report "the last inner step that ran failed" until a later step overwrote
+/// it. That is right for every position but the one that matters: when the
+/// continuing step is the item's **last**, nothing comes after to overwrite it,
+/// so the item reported `Failed` — which [`ItemErrorPolicy`] then collected
+/// under `collect` and tripped `fail_fast` on, stopping the fan-out over a
+/// failure the author had declared non-fatal. `run_phase`'s standard is
+/// positional-independent — a top-level step's `continue_on_error` failure
+/// never fails the phase, wherever it sits — and §8.9's own wording is why:
+/// the flag *"distinguishes 'the command may fail, keep going' from 'a failure
+/// here is fatal'"*, and "fatal" cannot mean one thing for an item's last step
+/// and another for the rest. So the item keeps the outcome it had before the
+/// step ran (the previous step's, or the initial `Completed(Value::Null)` if
+/// the continuing step was its first), and an item allowed to continue is not
+/// a *failed item* at all: [`ItemErrorPolicy`] neither collects its message nor
+/// lets it trip `fail_fast`. Measured in `tests/run_loop.rs`:
+/// `a_continuing_failure_as_an_items_last_step_does_not_stop_the_fan_out`,
+/// `a_continuing_failure_as_an_items_last_step_is_not_collected`, and — for
+/// the parenthetical, an item whose continuing failure is also its first step —
+/// `an_items_only_inner_step_failing_non_fatally_leaves_a_null_output`.
+///
+/// **This changes what the item reports, never what is on the record.** The
+/// step's own durable `workflow_step_run` row still says `Failed`, with its
+/// real message: `crate::exec::run_loop::Loop::checkpoint_map_item_step` has
+/// written it before this is called, and nothing here can reach it. The
+/// in-memory fan-out ([`Executor::dispatch_map_step`]) has no such rows, so
+/// there a continued failure's message is kept nowhere at all — the cost of
+/// declaring a failure non-fatal in a loop with no durable record, recorded
+/// rather than repaired.
+///
+/// **Fix round 3, item 1: both taint bits are folded, not just the output
+/// one.** [`ItemOutcome`] has no field for an inner step's
+/// `gate_condition_was_secret_derived`, so without this the flag
+/// [`evaluate_when_gate`] computed — including the `Err` arm's deliberate,
+/// fail-safe `true` — was dropped at every item boundary. Both mean the same
+/// thing to a caller deciding whether `${{ steps.<map_id>.output }}` needs
+/// redaction downstream, so one aggregate carries both. A continued failure
+/// folds its taint here the same way, before the walk goes on.
+pub(crate) fn fold_inner_step_outcome(
+    last: &mut ItemOutcome,
+    outcome: StepOutcome,
+    continue_on_error: bool,
+    any_item_secret_derived: &mut bool,
+) -> bool {
+    *any_item_secret_derived |= outcome.output_is_secret_derived;
+    *any_item_secret_derived |= outcome.gate_condition_was_secret_derived;
+    match outcome.status {
+        StepStatus::Failed { message } => {
+            if continue_on_error {
+                // Deliberately without touching `last` — see this function's
+                // own doc comment, "A continuing failure leaves `last` alone".
+                return false;
+            }
+            *last = ItemOutcome::Failed(message);
+            true
+        }
+        StepStatus::Skipped { reason } => {
+            *last = ItemOutcome::Skipped { reason };
+            false
+        }
+        StepStatus::Completed => {
+            *last = ItemOutcome::Completed(outcome.output);
+            false
+        }
+    }
+}
+
+/// The `${{ }}` roots one `map` step's item loop rebinds, captured before the
+/// first item and reverted after the last.
+pub(crate) struct MapRootSnapshots {
+    as_name: crate::expr::RootSnapshot,
+    /// `None` unless this `map` step *explicitly* declared `isolation:
+    /// worktree` — the common case (the field absent, inheriting
+    /// `Defaults.isolation`) must leave any outer binding of
+    /// [`WORKTREE_ROOT_NAME`] completely undisturbed.
+    worktree: Option<crate::expr::RootSnapshot>,
+}
+
+/// Opens the one snapshot/restore span a `map` step's item loop runs inside —
+/// see [`Executor::dispatch_map_step`]'s own doc comment, "Why binding onto
+/// the shared context and reverting by name is correct against
+/// cross-step/cross-level poisoning", for the atomicity argument both fan-out
+/// loops depend on. Shared rather than written twice precisely because that
+/// argument is what makes a nested `map` reusing the same `as:` name safe.
+pub(crate) fn snapshot_map_roots(
+    ctx: &crate::expr::ExprContext,
+    as_name: &str,
+    isolation: Option<&MapIsolationDef>,
+) -> MapRootSnapshots {
+    MapRootSnapshots {
+        as_name: ctx.snapshot_root(as_name),
+        worktree: matches!(isolation, Some(MapIsolationDef::Worktree { .. }))
+            .then(|| ctx.snapshot_root(WORKTREE_ROOT_NAME)),
+    }
+}
+
+/// Closes the span [`snapshot_map_roots`] opened.
+pub(crate) fn restore_map_roots(
+    ctx: &mut crate::expr::ExprContext,
+    as_name: &str,
+    snapshots: MapRootSnapshots,
+) {
+    ctx.restore_root(as_name, snapshots.as_name);
+    if let Some(snapshot) = snapshots.worktree {
+        ctx.restore_root(WORKTREE_ROOT_NAME, snapshot);
+    }
+}
+
+/// The `map` step's own [`StepOutcome`], assembled from every item's result.
+///
+/// **Fix round 2, item 5 (recorded, not fixed here — Task 8's job):** the
+/// status is unconditionally `Completed`, even when every item failed. See
+/// [`Executor::dispatch_map_step`]'s own doc comment, "The map's own
+/// aggregate status is unconditionally `Completed`", for the measured
+/// payload and why deciding what it *should* be is a policy question that
+/// belongs with a stop-on-failure mechanism rather than a one-line change
+/// made here.
+pub(crate) fn map_step_outcome(
+    step_id: &str,
+    result: &MapRunResult,
+    any_item_secret_derived: bool,
+) -> StepOutcome {
+    StepOutcome {
+        step_id: step_id.to_string(),
+        output: serde_json::json!({
+            "items": result.outcomes.iter().map(item_outcome_to_json).collect::<Vec<_>>(),
+            "collected_errors": result.collected_errors,
+        }),
+        status: StepStatus::Completed,
+        output_is_secret_derived: any_item_secret_derived,
+        // This is the map STEP'S OWN gate — whether *this* `map` step's own
+        // `when:` (if it has one) read secret material — not a record of its
+        // inner items' gates; those are folded into
+        // `output_is_secret_derived` above (fix round 3, item 1), the only
+        // field this outcome has that can carry an aggregate. `false` here is
+        // a placeholder identical in kind to `StepOutcome::failed`'s own
+        // (`crate::exec::mod`): every caller overwrites this field
+        // immediately after, from *their* `evaluate_when_gate` call on *this*
+        // step. Do not read the `false` below as a statement about this map's
+        // own gate.
+        gate_condition_was_secret_derived: false,
+    }
+}
+
+/// One item's isolation, for as long as that item's inner steps are running.
+///
+/// Carries the guard **and** the withhold decision its `base_ref` produced,
+/// because the release path at the end of the item has to apply the same
+/// withhold rule the materialize path did (final round part 2, M1) — two
+/// paths out of one worktree's lifecycle that must not diverge.
+pub(crate) struct ItemWorktree {
+    guard: Option<WorktreeGuard>,
+    /// Whether this item's `base_ref` carried secret *material*, either
+    /// because provenance marked the value or because a declared secret's raw
+    /// value is inside it. See [`Executor::prepare_item_isolation`] for why
+    /// the second disjunct exists.
+    base_ref_carried_secret_material: bool,
+}
+
+impl ItemWorktree {
+    /// Whether a real worktree was materialized for this item — `false` for
+    /// every `map` step that did not explicitly declare `isolation:
+    /// worktree`, which is the common case.
+    pub(crate) fn holds_worktree(&self) -> bool {
+        self.guard.is_some()
+    }
+}
+
+/// `Err(ItemOutcome::Failed(..))`, as one name, so
+/// [`Executor::prepare_item_isolation`]'s refusals read as the item failures
+/// they are rather than as `Result` plumbing.
+fn item_isolation_failed(message: String) -> Result<ItemWorktree, ItemOutcome> {
+    Err(ItemOutcome::Failed(message))
+}
+
 impl<'a> Executor<'a> {
-    /// Dispatches a `StepBody::Map` — evaluates `over:` for real against the
-    /// current expression context, then for each item binds it under the
-    /// step's `as:` name (so `${{ pr.number }}` inside the map's inner steps
-    /// resolves to that item, not `Null`) before recursively dispatching the
-    /// inner steps via the same [`Executor::dispatch_step`] sequencing every
-    /// other step kind uses.
+    /// Task 34, and Phase 8 Task 25.7 Task 2's extraction of it: materialize
+    /// one item's worktree when this `map` step explicitly demanded one.
+    ///
+    /// The whole reasoning lives on [`Self::dispatch_map_step`]'s own doc
+    /// comment — "Task 34: `isolation: worktree` materialization" (fail-closed
+    /// on a missing provider, per-item `base_ref` interpolation, the binding
+    /// mechanism) and "Fix round 1, item 1" (the taint-leak fix). What is new
+    /// here is only *where it lives*: both fan-out loops call this one
+    /// function, so the withhold rules a `base_ref` carrying secret material
+    /// triggers cannot be got right in one loop and wrong in the other.
+    ///
+    /// `any_item_secret_derived` is taken by `&mut` rather than returned,
+    /// because the `base_ref` taint must be folded in **before** `materialize`
+    /// is attempted — so it is set on the failure path too, not only when a
+    /// worktree comes back.
+    pub(crate) fn prepare_item_isolation(
+        &mut self,
+        step_id: &str,
+        isolation: Option<&MapIsolationDef>,
+        item_evaluated: &crate::expr::Evaluated,
+        any_item_secret_derived: &mut bool,
+    ) -> Result<ItemWorktree, ItemOutcome> {
+        let mut worktree_guard: Option<WorktreeGuard> = None;
+        // Carried out of the match below and returned on
+        // `ItemWorktree`, so that `Self::release_item_isolation` can apply
+        // the same withhold rule the materialize arm does (final round part
+        // 2, M1). A release error from *this* crate's adapter never sees
+        // `base_ref` — `remove_worktree` is handed a generated uuid path and
+        // `--force` — but `WorktreeProvider` is a `pub` trait whose doc tells
+        // an implementor its release errors are persisted under the same
+        // rule, and a caller that ignored that on one of the two paths would
+        // make the promise a half-truth.
+        //
+        // Named for what it actually holds (part 3, W5-48): secret
+        // *material*, either because provenance marked the value or because a
+        // declared secret's raw value is inside it. See the assignment below
+        // for why the second disjunct exists.
+        let mut base_ref_carried_secret_material = false;
+        match isolation {
+            // Fix round 1, item 6 / fix round 2, item 3 (ruling W5-33):
+            // `None` (the field absent) and an explicit `isolation: none`
+            // take the same no-op arm, but they are not the same claim — see
+            // `Executor::dispatch_map_step`'s own doc comment, "Task 34", for
+            // why `None` here is a known, tolerated gap (P42's shape for the
+            // *inherited* default) and not "genuinely deliverable" the way
+            // explicit `none` is. See the match arm below for the other three
+            // tiers, which this crate cannot deliver and does not tolerate
+            // silently.
+            None | Some(MapIsolationDef::None) => {}
+            Some(MapIsolationDef::Worktree { base_ref }) => {
+                let provider = match &self.worktree_provider {
+                    Some(provider) => Arc::clone(provider),
+                    None => {
+                        return item_isolation_failed(format!(
+                            "map step `{step_id}` declares `isolation: worktree`, but no \
+                             WorktreeProvider is configured for this run \
+                             (RunContext::worktree_provider is None) — refusing to run \
+                             this item without the isolation it explicitly asked for, \
+                             rather than silently running it unisolated"
+                        ));
+                    }
+                };
+                // Fix round 1, item 1 (CRITICAL): `base_ref` may
+                // contain `${{ secrets.* }}`, and `interpolate`
+                // computes both renderings from one evaluation
+                // (ruling P33) precisely so a caller never has to
+                // evaluate twice to get a safe-to-log copy. The
+                // *redacted* rendering is what goes into every
+                // message this arm can return; the *unredacted*
+                // one is used strictly for the
+                // `provider.materialize` call itself — mirroring
+                // `Executor::dispatch_step`'s own `Agent`/`Tool`
+                // arms (`resolved_prompt`/`resolved_with` vs.
+                // `logged_prompt`/`logged_with`), which this arm
+                // did not follow the first time it was written.
+                let (unredacted_base_ref, redacted_base_ref, base_ref_is_secret_derived) =
+                    match base_ref {
+                        Some(text) => {
+                            match interpolate(TemplateSource::from_workflow_file(text), &self.ctx) {
+                                Ok(interpolated) => {
+                                    // The part that actually repairs the
+                                    // persisted taint flag — see
+                                    // `Executor::dispatch_map_step`'s own
+                                    // doc comment, "Fix round 1, item 1".
+                                    // Folded in unconditionally, before
+                                    // `materialize` is even attempted, so it
+                                    // is set on both the success and the
+                                    // failure path below — which is why this
+                                    // function takes the flag by `&mut`
+                                    // rather than returning it.
+                                    let is_secret_derived = interpolated.is_secret_derived();
+                                    *any_item_secret_derived |= is_secret_derived;
+                                    let redacted = interpolated.redacted_for_logging().clone();
+                                    (
+                                        interpolated.into_unredacted_for_dispatch(),
+                                        redacted,
+                                        is_secret_derived,
+                                    )
+                                }
+                                Err(e) => {
+                                    // No needle scrub here, unlike
+                                    // the two arms below (final
+                                    // round part 2, recorded rather
+                                    // than changed). Clean by
+                                    // construction, not by
+                                    // oversight: every `ExprError`
+                                    // payload is *source text*
+                                    // captured before evaluation
+                                    // (never a value), and a pasted
+                                    // credential cannot be inside
+                                    // that source text — `"`, `'`
+                                    // and `\` are all in
+                                    // `parse/steps.rs`'s
+                                    // `FORBIDDEN_GIT_REF_CHARS`, so
+                                    // a `base_ref` carrying an
+                                    // expression cannot also carry a
+                                    // quoted literal. If that
+                                    // charset is ever relaxed, this
+                                    // arm needs the same backstop
+                                    // the failure arms below have.
+                                    return item_isolation_failed(format!(
+                                        "map step `{step_id}`: resolving \
+                                         `isolation.worktree.base_ref`: {e}"
+                                    ));
+                                }
+                            }
+                        }
+                        None => (
+                            DEFAULT_WORKTREE_BASE_REF.to_string(),
+                            DEFAULT_WORKTREE_BASE_REF.to_string(),
+                            false,
+                        ),
+                    };
+                // **Provenance is not the only reason to withhold
+                // (final round part 3, ruling W5-48).** A declared
+                // secret's raw value can reach `base_ref` through a
+                // channel provenance treats as clean, and the needle
+                // scrub alone cannot cover that case: `git` does not
+                // always echo a *copy* of what it was given.
+                // `@{upstream}`-style syntax makes it die
+                // mid-interpretation and report only the prefix
+                // before the mark (measured: 27 of a 38-byte secret,
+                // cleartext), and a value past `git`'s own `vreportf`
+                // stderr buffer — **`git`'s buffer, ~4KB, not this
+                // workspace's `OUTPUT_CAP`**; a 3024-byte value
+                // scrubs fully and a 5029-byte one does not — comes
+                // back as a shorter, still-sensitive prefix. A
+                // whole-value needle matches neither.
+                //
+                // These are the exact two lossy transforms ruling
+                // W5-36 already answered with withhold-don't-scrub
+                // for the secret-*derived* branch; the scrub-only
+                // branch silently inherited the limitation. So a
+                // declared secret's *presence* in the value is
+                // treated the same as provenance: it is a property
+                // of the input, so nothing `git` does to the value
+                // afterwards can defeat it.
+                //
+                // **What this costs, and why it is not a bug to fix
+                // (ruling W5-49).** This withholds strictly more
+                // often than provenance alone would: a declared
+                // secret appearing anywhere inside `base_ref` — as a
+                // substring, not only as the whole value —
+                // suppresses the provider's own diagnostic text for
+                // that item, so an operator debugging a genuine
+                // `git` failure gets `safe_summary()`'s rendering —
+                // the variant, the program name, the repository
+                // root, the generated worktree path and the exit
+                // status, all crate-generated — instead of `git`'s
+                // own message and argv. That is accepted, for
+                // three reasons a future reader should weigh before
+                // narrowing it:
+                //
+                // 1. The failure direction is **diagnostics, not
+                //    secrecy** — the correct way to fail at this
+                //    boundary, and the same trade ruling W5-36 made
+                //    when it chose withholding over scrubbing.
+                // 2. It cannot fire on an ordinary short string.
+                //    `Executor::new` **refuses to build a run at
+                //    all** if any declared secret is shorter than
+                //    `MIN_REDACTABLE_SECRET_LEN` (8 bytes) — see
+                //    `ExecutorError::SecretTooShortToRedact` — so
+                //    nothing like `main` or `HEAD` can ever be a
+                //    needle here.
+                // 3. Narrowing it means **not** withholding when a
+                //    declared secret is demonstrably present in the
+                //    value, i.e. trading secrecy back for
+                //    diagnostics. That is the wrong direction, and
+                //    it reintroduces exactly the gap the two
+                //    transforms above make reachable.
+                let base_ref_carries_secret_material = base_ref_is_secret_derived
+                    || self
+                        .redaction_needles
+                        .iter()
+                        .any(|needle| unredacted_base_ref.contains(needle.as_str()));
+                base_ref_carried_secret_material = base_ref_carries_secret_material;
+                match provider.materialize(&unredacted_base_ref) {
+                    Ok(path) => {
+                        // Derived from `item_evaluated`, not asserted fresh
+                        // via `set_public`/`set_secret` — see
+                        // `Executor::dispatch_map_step`'s own doc comment,
+                        // "Task 34", for why, even though the path's own
+                        // content is never secret material.
+                        let workspace_evaluated = item_evaluated
+                            .derive(serde_json::json!({ "path": path.display().to_string() }));
+                        self.ctx.set_from(WORKTREE_ROOT_NAME, &workspace_evaluated);
+                        worktree_guard = Some(WorktreeGuard::new(provider, path));
+                    }
+                    Err(e) => {
+                        // Fix round 1, item 1 found a secret-derived
+                        // `base_ref` reaching `{e}`'s free text
+                        // (git's stderr, the echoed argv) verbatim.
+                        // Fix round 2 tried closing it by adding
+                        // `unredacted_base_ref` as an extra
+                        // needle-based scrub. Fix round 3, item 1
+                        // (ruling W5-36) retracts that shape:
+                        // `git`'s stderr is not always a **copy** of
+                        // what it was given — `@{upstream}`-style
+                        // syntax makes `git` die mid-interpretation
+                        // and echo only a prefix, and `git`'s own
+                        // stderr buffer silently truncates values
+                        // past ~4KB — so an exact-match needle keyed
+                        // on the whole original value can miss a
+                        // still-sensitive transformed or truncated
+                        // echo entirely, no matter how the needle is
+                        // chosen. No scrub of a *lossy* transform
+                        // can be made reliable.
+                        //
+                        // **Fix: withhold, don't scrub.** When
+                        // `base_ref` is secret-derived, this message
+                        // uses [`WorktreeProviderError::safe_summary`]
+                        // instead of `e`'s own `Display` — it keeps
+                        // this crate's own vocabulary (which
+                        // variant, the exit status) and drops every
+                        // piece of free text from outside this
+                        // crate's control (argv, stderr, OS error
+                        // text) entirely, rather than trying to
+                        // predict what a lossy external transform
+                        // might do to a scrub. See that method's own
+                        // doc comment for the full reasoning. A
+                        // `base_ref` that is *not* secret-derived
+                        // still gets the full, unwithheld message —
+                        // scrubbed through the declared-secrets
+                        // needle backstop below, which is a
+                        // different guard closing a different hole
+                        // (see [`redact_message`]'s own doc comment,
+                        // "Why this is needed on top of the
+                        // withhold"). Fix round 3 deleted that
+                        // backstop along with the scrub it was
+                        // replacing; the final round restored it.
+                        let detail = if base_ref_carries_secret_material {
+                            e.safe_summary().to_string()
+                        } else {
+                            e.to_string()
+                        };
+                        // **Scrubbed here, as a plain string, before
+                        // the `format!` below embeds it (final round
+                        // part 2, item 1).** The first version of
+                        // this fix assembled the message first and
+                        // scrubbed the whole thing afterwards, which
+                        // the security lens defeated: `Debug for str`
+                        // escapes `"`, `\` and control characters, so
+                        // a declared secret containing any of them no
+                        // longer matches the plain-substring needle
+                        // *in the `{:?}` copy* while the raw copies
+                        // (the argv echo, `git`'s stderr) scrub fine.
+                        // Reproduced end to end — two of three
+                        // occurrences became `***` and the escaped
+                        // one reached the append-only log in
+                        // trivially reversible form. Scrubbing first
+                        // means `{:?}` has only `***` to escape.
+                        let echoed_base_ref =
+                            redact_message(redacted_base_ref, &self.redaction_needles);
+                        let message = format!(
+                            "map step `{step_id}`: materializing a worktree for \
+                             base_ref {echoed_base_ref:?}: {detail}"
+                        );
+                        return item_isolation_failed(if base_ref_is_secret_derived {
+                            // Nothing here for a needle to find:
+                            // `safe_summary()` carries no text from
+                            // outside this crate at all, and
+                            // `redacted_base_ref` was already `***`
+                            // because provenance caught it.
+                            message
+                        } else {
+                            // Still the whole message, for the
+                            // `{detail}` half: that is raw `Display`
+                            // text (`git`'s stderr and the echoed
+                            // argv), so it scrubs correctly after
+                            // assembly. Only the `{:?}` half had to
+                            // move ahead of the `format!`.
+                            redact_message(message, &self.redaction_needles)
+                        });
+                    }
+                }
+            }
+            // Fix round 1, item 6: `sandbox`/`container`/`remote`
+            // parse successfully (`parse/steps.rs` accepts all five
+            // tiers) but this crate can only ever materialize
+            // `worktree` — falling through silently here would be
+            // exactly Phase 5 ruling P42's shape for three of the
+            // four non-`none` tiers, in a diff whose own docs now
+            // claim P42 is closed. Fails the item closed, the same
+            // way a missing `WorktreeProvider` does, rather than
+            // running it with no isolation and no warning.
+            Some(
+                other @ (MapIsolationDef::Sandbox
+                | MapIsolationDef::Container
+                | MapIsolationDef::Remote),
+            ) => {
+                return item_isolation_failed(format!(
+                    "map step `{step_id}` declares `isolation: {}`, but this crate can \
+                     only materialize `worktree` isolation today — refusing to run this \
+                     item with no isolation at all rather than silently ignoring the \
+                     tier it explicitly asked for",
+                    map_isolation_tier_name(other)
+                ));
+            }
+        }
+
+        Ok(ItemWorktree {
+            guard: worktree_guard,
+            base_ref_carried_secret_material,
+        })
+    }
+
+    /// The other half of one item's worktree lifecycle, extracted for the
+    /// same reason [`Self::prepare_item_isolation`] is: two fan-out loops,
+    /// one release rule.
+    pub(crate) fn release_item_isolation(
+        &self,
+        step_id: &str,
+        item_worktree: ItemWorktree,
+        last: ItemOutcome,
+    ) -> ItemOutcome {
+        let ItemWorktree {
+            guard: worktree_guard,
+            base_ref_carried_secret_material,
+        } = item_worktree;
+        let mut worktree_guard = worktree_guard;
+        let mut last = last;
+        // Task 34: called on **every** path out of an item — the caller's
+        // inner-step loop may have broken on a failure, fallen through after
+        // every inner step ran, or (via `nested_report_refusal`) never
+        // entered its body at all; all three reach here. A release failure
+        // only overwrites `last` when the item would otherwise have reported
+        // success/skip — an item that already failed for its own reason keeps
+        // that reason, which is more actionable than a release failure
+        // piggy-backing on it. See `WorktreeGuard::release`'s own doc comment
+        // for why this explicit call, not `Drop` alone, is what lets a
+        // release failure reach `last` at all on this (the non-panicking)
+        // path.
+        if let Some(guard) = worktree_guard.take() {
+            if let Err(e) = guard.release() {
+                if !matches!(last, ItemOutcome::Failed(_)) {
+                    // Both guards the materialize arm applies, for
+                    // the same reasons, so the two paths out of one
+                    // item's worktree lifecycle cannot diverge:
+                    // withhold when this item's `base_ref` was
+                    // secret-derived (final round part 2, M1 —
+                    // `safe_summary()` is what the trait promises an
+                    // implementor is used), and the declared-secrets
+                    // needle backstop on top either way (item A1 —
+                    // `{e}` embeds free text this crate does not
+                    // control). See [`redact_message`]'s own doc
+                    // comment for why the two are independent.
+                    let detail = if base_ref_carried_secret_material {
+                        e.safe_summary().to_string()
+                    } else {
+                        e.to_string()
+                    };
+                    last = ItemOutcome::Failed(redact_message(
+                        format!(
+                            "map step `{step_id}`: releasing the item's worktree: \
+                             {detail}"
+                        ),
+                        &self.redaction_needles,
+                    ));
+                }
+            }
+        }
+
+        last
+    }
+    /// Dispatches a `StepBody::Map` for the **in-memory** sequencer —
+    /// evaluates `over:` for real against the current expression context,
+    /// then for each item binds it under the step's `as:` name (so
+    /// `${{ pr.number }}` inside the map's inner steps resolves to that item,
+    /// not `Null`) before dispatching the inner steps via
+    /// [`Executor::dispatch_step_or_stub`].
+    ///
+    /// **A `map` inside a real run does not come here** (Phase 8 Task 25.7
+    /// Task 2): `run_loop::Loop::run_phase` intercepts `StepBody::Map` the
+    /// same way it already intercepts `gate:`/`call:`, and
+    /// `run_loop::Loop::dispatch_map` drives the fan-out in suspendable
+    /// waves. See this module's own doc comment, "There are two `map` fan-out
+    /// loops", for the split and for the list of per-item decisions both
+    /// loops share rather than duplicate. Everything below describes the
+    /// per-item evaluation, which is common to both; only the dispatch of an
+    /// inner step differs.
     ///
     /// # Per-item binding: `Evaluated::derive` plus a per-root snapshot/restore, not a context clone (ruling P40/P44/P45/P46, R-1/R-2)
     ///
@@ -1026,47 +2130,14 @@ impl<'a> Executor<'a> {
         isolation: Option<&MapIsolationDef>,
         inner_step_yaml: &[serde_yaml::Value],
     ) -> StepOutcome {
-        let over_evaluated =
-            match eval_delimited_expression(TemplateSource::from_workflow_file(over), &self.ctx) {
-                Ok(v) => v,
-                Err(e) => {
-                    return StepOutcome::failed(step_id, format!("evaluating `map.over`: {e}"));
-                }
-            };
-        let items: Vec<Value> = match over_evaluated.value() {
-            Value::Array(items) => {
-                // Fix round 2, item 4: the cap check moved here, onto the
-                // *borrowed* array, so a rejected call never even pays for
-                // cloning `items` — see this function's own doc comment,
-                // "`MAX_MAP_ITEMS`", for what this bounds and does not.
-                if items.len() > MAX_MAP_ITEMS {
-                    return StepOutcome::failed(
-                        step_id,
-                        format!(
-                            "`map.over` yielded {} items, exceeding the {MAX_MAP_ITEMS}-item \
-                             limit for a single `map` step",
-                            items.len()
-                        ),
-                    );
-                }
-                items.clone()
-            }
-            other => {
-                return StepOutcome::failed(
-                    step_id,
-                    format!(
-                        "`map.over` must evaluate to an array, got {}",
-                        value_type_name(other)
-                    ),
-                );
-            }
+        let (over_evaluated, items) = match resolve_map_items(&self.ctx, step_id, over) {
+            Ok(resolved) => resolved,
+            Err(outcome) => return *outcome,
         };
 
-        let inner_steps: Vec<StepDef> = match inner_step_yaml.iter().map(parse_step).collect() {
+        let inner_steps: Vec<StepDef> = match parse_map_inner_steps(step_id, inner_step_yaml) {
             Ok(v) => v,
-            Err(e) => {
-                return StepOutcome::failed(step_id, format!("parsing `map` inner steps: {e}"));
-            }
+            Err(outcome) => return *outcome,
         };
 
         // B12c (ruling P108 §C): the run loop sets this from
@@ -1083,17 +2154,10 @@ impl<'a> Executor<'a> {
         // context — see this function's own doc comment, "Why binding onto
         // the shared context and reverting by name is correct", for the
         // atomicity argument this depends on and the measured cost this
-        // replaces under nesting.
-        let outer_snapshot = self.ctx.snapshot_root(as_name);
-        // Task 34: only an *explicit* `isolation: worktree` on this map
-        // step snapshots `WORKTREE_ROOT_NAME` at all — see
-        // `Executor::dispatch_map_step`'s own doc comment, "Task 34:
-        // `isolation: worktree` materialization", for why `None` here (the
-        // common case — the field absent, inheriting `Defaults.isolation`)
-        // must leave any outer binding of this name completely undisturbed.
-        let materializes_worktree = matches!(isolation, Some(MapIsolationDef::Worktree { .. }));
-        let outer_worktree_snapshot =
-            materializes_worktree.then(|| self.ctx.snapshot_root(WORKTREE_ROOT_NAME));
+        // replaces under nesting. Shared with the wave loop through
+        // `snapshot_map_roots`/`restore_map_roots`, which also decide (Task
+        // 34) whether `WORKTREE_ROOT_NAME` is in the span at all.
+        let snapshots = snapshot_map_roots(&self.ctx, as_name, isolation);
         // Fix-round-3-style step-boundary taint: if any item's own inner
         // steps produced secret-derived output, or the collection itself was
         // secret-derived, the map step's *own* aggregate output
@@ -1113,371 +2177,71 @@ impl<'a> Executor<'a> {
             max_parallel,
             on_item_error,
             &mut budget,
-            // **`_item_caps` is where ruling P108 §C stops being discharged,
-            // and this binding is the reason** (named here, at the site a
-            // future implementer works, not only where the value is sourced).
-            // `run_loop::run_workflow` computes a real, live
-            // `split_budget(&budget.total_remaining, n)` from the run's
-            // ledger and `run_map` hands it to this closure — and nothing
-            // reads it, so per-item *enforcement* does not exist. B12c's
-            // mutation sweep measured exactly that: the two survivors it
-            // could not kill (`M1`/`M2`) both mutate the split arithmetic,
-            // and both are `EQUIVALENT` **because of this underscore**.
+            // **`_item_caps` stays unread *here*, and that is now a statement
+            // about this loop rather than about `map`** (Phase 8 Task 25.7
+            // Task 4). Ruling P108 §C's enforcement half landed at the other
+            // fan-out loop, `run_loop::Loop::dispatch_map`, which refuses an
+            // item's next dispatch once its running tally would exceed this
+            // same `split_budget` share — see `per_item_dispatch_refusal`.
             //
-            // Whoever gives `map` real fan-out owns closing it: bind the
-            // parameter, and admit each item's spend against it through
-            // `ledger::admit_spend` the way `run_loop::Loop::admit` does for
-            // a top-level step. Until then the sourcing is correct and the
-            // ceiling is the run-level one.
+            // It is not mirrored here because there is nothing here to
+            // refuse: every `tool:`/`agent:` inner step this loop reaches
+            // becomes `Executor::dispatch_step_or_stub`'s fabricated `{}`, so
+            // an item of *this* fan-out cannot spend a call in the first
+            // place. A ceiling on stub work would be enforcement theatre.
+            //
+            // **That holds whether or not the budget behind it is real, and
+            // the distinction is worth stating because both cases occur.**
+            // `Executor::run_to_completion`'s in-memory sequencer has no run
+            // behind it and falls back to `MapBudget::unenforced_placeholder`
+            // — but a `map:` nested *inside* another `map`'s inner steps
+            // reaches this same function from a **real** run
+            // (`run_loop::Loop::advance_map_item` →
+            // `Executor::dispatch_step`'s `StepBody::Map` arm, which is not
+            // intercepted the way a top-level `map:` is), and there the
+            // divided ceiling is real and ledger-sourced, exactly as the
+            // `budget` binding above says. What makes the conclusion the same
+            // either way is the stub, not the budget.
+            //
+            // So this is the line to revisit if a future task ever makes a
+            // nested `map`'s own inner steps dispatch for real: at that point
+            // this loop acquires a per-item spend, and the argument above
+            // stops holding.
+            //
+            // B12c's mutation sweep left two survivors (`M1`/`M2`), both
+            // mutations of the split arithmetic, both `EQUIVALENT` because of
+            // this underscore. The arithmetic is observable now — at the loop
+            // that dispatches for real. `tests/run_loop.rs`'s per-item
+            // admission section asserts on *which dispatches happen* rather
+            // than on the number, so a changed divisor and a changed rounding
+            // both move the wave sequence and fail:
+            // `a_per_item_cap_refuses_an_items_second_dispatch_instead_of_running_it`
+            // pins the divisor, and
+            // `an_inner_step_that_never_dispatched_does_not_spend_an_items_share`
+            // is written over an odd grant so that it pins the `ceil`.
             |item, _item_caps| {
                 let item_evaluated = over_evaluated.derive(item.clone());
                 self.ctx.set_from(as_name, &item_evaluated);
 
-                // Task 34: materialize this item's worktree, if this map
-                // step explicitly demanded one — see
-                // `Executor::dispatch_map_step`'s own doc comment, "Task
-                // 34: `isolation: worktree` materialization", for the full
-                // reasoning (fail-closed on a missing provider, per-item
-                // `base_ref` interpolation, the binding mechanism, and the
-                // cleanup guarantee `worktree_guard` below provides), and
-                // "Fix round 1, item 1" for the taint-leak fix below.
-                let mut worktree_guard: Option<WorktreeGuard> = None;
-                // Carried out of the match below so the release arm at the
-                // end of this closure can apply the same withhold rule the
-                // materialize arm does (final round part 2, M1). A release
-                // error from *this* crate's adapter never sees `base_ref`
-                // — `remove_worktree` is handed a generated uuid path and
-                // `--force` — but `WorktreeProvider` is a `pub` trait whose
-                // doc now tells an implementor its release errors are
-                // persisted under the same rule, and a caller that ignored
-                // that on one of the two paths would make the promise a
-                // half-truth.
-                //
-                // Named for what it actually holds (part 3, W5-48): secret
-                // *material*, either because provenance marked the value or
-                // because a declared secret's raw value is inside it. See
-                // the assignment below for why the second disjunct exists.
-                let mut base_ref_carried_secret_material = false;
-                match isolation {
-                    // Fix round 1, item 6 / fix round 2, item 3 (ruling
-                    // W5-33): `None` (the field absent) and an explicit
-                    // `isolation: none` take the same no-op arm, but they
-                    // are not the same claim — see this function's own doc
-                    // comment, "Task 34", for why `None` here is a known,
-                    // tolerated gap (P42's shape for the *inherited*
-                    // default) and not "genuinely deliverable" the way
-                    // explicit `none` is. See the match arm below for the
-                    // other three tiers, which this crate cannot deliver
-                    // and does not tolerate silently.
-                    None | Some(MapIsolationDef::None) => {}
-                    Some(MapIsolationDef::Worktree { base_ref }) => {
-                        let provider = match &self.worktree_provider {
-                            Some(provider) => Arc::clone(provider),
-                            None => {
-                                return ItemOutcome::Failed(format!(
-                                    "map step `{step_id}` declares `isolation: worktree`, but no \
-                                     WorktreeProvider is configured for this run \
-                                     (RunContext::worktree_provider is None) — refusing to run \
-                                     this item without the isolation it explicitly asked for, \
-                                     rather than silently running it unisolated"
-                                ));
-                            }
-                        };
-                        // Fix round 1, item 1 (CRITICAL): `base_ref` may
-                        // contain `${{ secrets.* }}`, and `interpolate`
-                        // computes both renderings from one evaluation
-                        // (ruling P33) precisely so a caller never has to
-                        // evaluate twice to get a safe-to-log copy. The
-                        // *redacted* rendering is what goes into every
-                        // message this arm can return; the *unredacted*
-                        // one is used strictly for the
-                        // `provider.materialize` call itself — mirroring
-                        // `Executor::dispatch_step`'s own `Agent`/`Tool`
-                        // arms (`resolved_prompt`/`resolved_with` vs.
-                        // `logged_prompt`/`logged_with`), which this arm
-                        // did not follow the first time it was written.
-                        let (unredacted_base_ref, redacted_base_ref, base_ref_is_secret_derived) =
-                            match base_ref {
-                                Some(text) => {
-                                    match interpolate(
-                                        TemplateSource::from_workflow_file(text),
-                                        &self.ctx,
-                                    ) {
-                                        Ok(interpolated) => {
-                                            // The part that actually
-                                            // repairs the persisted taint
-                                            // flag — see this function's
-                                            // own doc comment. Folded in
-                                            // unconditionally, before
-                                            // `materialize` is even
-                                            // attempted, so it is set on
-                                            // both the success and the
-                                            // failure path below.
-                                            let is_secret_derived =
-                                                interpolated.is_secret_derived();
-                                            any_item_secret_derived |= is_secret_derived;
-                                            let redacted =
-                                                interpolated.redacted_for_logging().clone();
-                                            (
-                                                interpolated.into_unredacted_for_dispatch(),
-                                                redacted,
-                                                is_secret_derived,
-                                            )
-                                        }
-                                        Err(e) => {
-                                            // No needle scrub here, unlike
-                                            // the two arms below (final
-                                            // round part 2, recorded rather
-                                            // than changed). Clean by
-                                            // construction, not by
-                                            // oversight: every `ExprError`
-                                            // payload is *source text*
-                                            // captured before evaluation
-                                            // (never a value), and a pasted
-                                            // credential cannot be inside
-                                            // that source text — `"`, `'`
-                                            // and `\` are all in
-                                            // `parse/steps.rs`'s
-                                            // `FORBIDDEN_GIT_REF_CHARS`, so
-                                            // a `base_ref` carrying an
-                                            // expression cannot also carry a
-                                            // quoted literal. If that
-                                            // charset is ever relaxed, this
-                                            // arm needs the same backstop
-                                            // the failure arms below have.
-                                            return ItemOutcome::Failed(format!(
-                                                "map step `{step_id}`: resolving \
-                                                 `isolation.worktree.base_ref`: {e}"
-                                            ));
-                                        }
-                                    }
-                                }
-                                None => (
-                                    DEFAULT_WORKTREE_BASE_REF.to_string(),
-                                    DEFAULT_WORKTREE_BASE_REF.to_string(),
-                                    false,
-                                ),
-                            };
-                        // **Provenance is not the only reason to withhold
-                        // (final round part 3, ruling W5-48).** A declared
-                        // secret's raw value can reach `base_ref` through a
-                        // channel provenance treats as clean, and the needle
-                        // scrub alone cannot cover that case: `git` does not
-                        // always echo a *copy* of what it was given.
-                        // `@{upstream}`-style syntax makes it die
-                        // mid-interpretation and report only the prefix
-                        // before the mark (measured: 27 of a 38-byte secret,
-                        // cleartext), and a value past `git`'s own `vreportf`
-                        // stderr buffer — **`git`'s buffer, ~4KB, not this
-                        // workspace's `OUTPUT_CAP`**; a 3024-byte value
-                        // scrubs fully and a 5029-byte one does not — comes
-                        // back as a shorter, still-sensitive prefix. A
-                        // whole-value needle matches neither.
-                        //
-                        // These are the exact two lossy transforms ruling
-                        // W5-36 already answered with withhold-don't-scrub
-                        // for the secret-*derived* branch; the scrub-only
-                        // branch silently inherited the limitation. So a
-                        // declared secret's *presence* in the value is
-                        // treated the same as provenance: it is a property
-                        // of the input, so nothing `git` does to the value
-                        // afterwards can defeat it.
-                        //
-                        // **What this costs, and why it is not a bug to fix
-                        // (ruling W5-49).** This withholds strictly more
-                        // often than provenance alone would: a declared
-                        // secret appearing anywhere inside `base_ref` — as a
-                        // substring, not only as the whole value —
-                        // suppresses the provider's own diagnostic text for
-                        // that item, so an operator debugging a genuine
-                        // `git` failure gets `safe_summary()`'s rendering —
-                        // the variant, the program name, the repository
-                        // root, the generated worktree path and the exit
-                        // status, all crate-generated — instead of `git`'s
-                        // own message and argv. That is accepted, for
-                        // three reasons a future reader should weigh before
-                        // narrowing it:
-                        //
-                        // 1. The failure direction is **diagnostics, not
-                        //    secrecy** — the correct way to fail at this
-                        //    boundary, and the same trade ruling W5-36 made
-                        //    when it chose withholding over scrubbing.
-                        // 2. It cannot fire on an ordinary short string.
-                        //    `Executor::new` **refuses to build a run at
-                        //    all** if any declared secret is shorter than
-                        //    `MIN_REDACTABLE_SECRET_LEN` (8 bytes) — see
-                        //    `ExecutorError::SecretTooShortToRedact` — so
-                        //    nothing like `main` or `HEAD` can ever be a
-                        //    needle here.
-                        // 3. Narrowing it means **not** withholding when a
-                        //    declared secret is demonstrably present in the
-                        //    value, i.e. trading secrecy back for
-                        //    diagnostics. That is the wrong direction, and
-                        //    it reintroduces exactly the gap the two
-                        //    transforms above make reachable.
-                        let base_ref_carries_secret_material = base_ref_is_secret_derived
-                            || self
-                                .redaction_needles
-                                .iter()
-                                .any(|needle| unredacted_base_ref.contains(needle.as_str()));
-                        base_ref_carried_secret_material = base_ref_carries_secret_material;
-                        match provider.materialize(&unredacted_base_ref) {
-                            Ok(path) => {
-                                // Derived from `item_evaluated`, not
-                                // asserted fresh via
-                                // `set_public`/`set_secret` — see this
-                                // function's own doc comment for why, even
-                                // though the path's own content is never
-                                // secret material.
-                                let workspace_evaluated = item_evaluated.derive(
-                                    serde_json::json!({ "path": path.display().to_string() }),
-                                );
-                                self.ctx.set_from(WORKTREE_ROOT_NAME, &workspace_evaluated);
-                                worktree_guard = Some(WorktreeGuard::new(provider, path));
-                            }
-                            Err(e) => {
-                                // Fix round 1, item 1 found a secret-derived
-                                // `base_ref` reaching `{e}`'s free text
-                                // (git's stderr, the echoed argv) verbatim.
-                                // Fix round 2 tried closing it by adding
-                                // `unredacted_base_ref` as an extra
-                                // needle-based scrub. Fix round 3, item 1
-                                // (ruling W5-36) retracts that shape:
-                                // `git`'s stderr is not always a **copy** of
-                                // what it was given — `@{upstream}`-style
-                                // syntax makes `git` die mid-interpretation
-                                // and echo only a prefix, and `git`'s own
-                                // stderr buffer silently truncates values
-                                // past ~4KB — so an exact-match needle keyed
-                                // on the whole original value can miss a
-                                // still-sensitive transformed or truncated
-                                // echo entirely, no matter how the needle is
-                                // chosen. No scrub of a *lossy* transform
-                                // can be made reliable.
-                                //
-                                // **Fix: withhold, don't scrub.** When
-                                // `base_ref` is secret-derived, this message
-                                // uses [`WorktreeProviderError::safe_summary`]
-                                // instead of `e`'s own `Display` — it keeps
-                                // this crate's own vocabulary (which
-                                // variant, the exit status) and drops every
-                                // piece of free text from outside this
-                                // crate's control (argv, stderr, OS error
-                                // text) entirely, rather than trying to
-                                // predict what a lossy external transform
-                                // might do to a scrub. See that method's own
-                                // doc comment for the full reasoning. A
-                                // `base_ref` that is *not* secret-derived
-                                // still gets the full, unwithheld message —
-                                // scrubbed through the declared-secrets
-                                // needle backstop below, which is a
-                                // different guard closing a different hole
-                                // (see [`redact_message`]'s own doc comment,
-                                // "Why this is needed on top of the
-                                // withhold"). Fix round 3 deleted that
-                                // backstop along with the scrub it was
-                                // replacing; the final round restored it.
-                                let detail = if base_ref_carries_secret_material {
-                                    e.safe_summary().to_string()
-                                } else {
-                                    e.to_string()
-                                };
-                                // **Scrubbed here, as a plain string, before
-                                // the `format!` below embeds it (final round
-                                // part 2, item 1).** The first version of
-                                // this fix assembled the message first and
-                                // scrubbed the whole thing afterwards, which
-                                // the security lens defeated: `Debug for str`
-                                // escapes `"`, `\` and control characters, so
-                                // a declared secret containing any of them no
-                                // longer matches the plain-substring needle
-                                // *in the `{:?}` copy* while the raw copies
-                                // (the argv echo, `git`'s stderr) scrub fine.
-                                // Reproduced end to end — two of three
-                                // occurrences became `***` and the escaped
-                                // one reached the append-only log in
-                                // trivially reversible form. Scrubbing first
-                                // means `{:?}` has only `***` to escape.
-                                let echoed_base_ref =
-                                    redact_message(redacted_base_ref, &self.redaction_needles);
-                                let message = format!(
-                                    "map step `{step_id}`: materializing a worktree for \
-                                     base_ref {echoed_base_ref:?}: {detail}"
-                                );
-                                return ItemOutcome::Failed(if base_ref_is_secret_derived {
-                                    // Nothing here for a needle to find:
-                                    // `safe_summary()` carries no text from
-                                    // outside this crate at all, and
-                                    // `redacted_base_ref` was already `***`
-                                    // because provenance caught it.
-                                    message
-                                } else {
-                                    // Still the whole message, for the
-                                    // `{detail}` half: that is raw `Display`
-                                    // text (`git`'s stderr and the echoed
-                                    // argv), so it scrubs correctly after
-                                    // assembly. Only the `{:?}` half had to
-                                    // move ahead of the `format!`.
-                                    redact_message(message, &self.redaction_needles)
-                                });
-                            }
-                        }
-                    }
-                    // Fix round 1, item 6: `sandbox`/`container`/`remote`
-                    // parse successfully (`parse/steps.rs` accepts all five
-                    // tiers) but this crate can only ever materialize
-                    // `worktree` — falling through silently here would be
-                    // exactly Phase 5 ruling P42's shape for three of the
-                    // four non-`none` tiers, in a diff whose own docs now
-                    // claim P42 is closed. Fails the item closed, the same
-                    // way a missing `WorktreeProvider` does, rather than
-                    // running it with no isolation and no warning.
-                    Some(
-                        other @ (MapIsolationDef::Sandbox
-                        | MapIsolationDef::Container
-                        | MapIsolationDef::Remote),
-                    ) => {
-                        return ItemOutcome::Failed(format!(
-                            "map step `{step_id}` declares `isolation: {}`, but this crate can \
-                             only materialize `worktree` isolation today — refusing to run this \
-                             item with no isolation at all rather than silently ignoring the \
-                             tier it explicitly asked for",
-                            map_isolation_tier_name(other)
-                        ));
-                    }
-                }
+                // Task 34, per item, through the helper both fan-out loops
+                // share (Phase 8 Task 25.7 Task 2) — see
+                // `Executor::prepare_item_isolation`.
+                let item_worktree = match self.prepare_item_isolation(
+                    step_id,
+                    isolation,
+                    &item_evaluated,
+                    &mut any_item_secret_derived,
+                ) {
+                    Ok(worktree) => worktree,
+                    Err(outcome) => return outcome,
+                };
 
                 let mut last = ItemOutcome::Completed(Value::Null);
                 for inner in &inner_steps {
-                    // **A `report:` is a property of the run, not of a map
-                    // item** — the same argument already written for the
-                    // nested `gate:` and `call:` refusals in
-                    // `Executor::dispatch_step`'s catch-all arm, applied to
-                    // the third step kind that has run-wide meaning (B12c fix
-                    // round, ruling P116 §B).
-                    //
-                    // Refused **here** rather than in that arm because
-                    // `dispatch_step` is also how a *top-level* `report:` step
-                    // is run, by both `run_to_completion` and
-                    // `run_loop::run_workflow`; the arm cannot tell the two
-                    // callers apart, and this loop is the one that knows the
-                    // step is nested.
-                    //
-                    // What it costs to leave open: `run_workflow`'s §8.6
-                    // "exactly one report" pre-check flattens only the three
-                    // phase step lists, so it structurally cannot see a
-                    // `report:` under a `map` — and a nested one emits one
-                    // `TaskKind::Report` task **per item**, into a log that
-                    // physically rejects `UPDATE`/`DELETE`. Ruling P112's
-                    // invariant would then be violated by a workflow the
-                    // pre-check accepted.
-                    if matches!(inner.body, StepBody::Report { .. }) {
-                        last = ItemOutcome::Failed(format!(
-                            "step `{}`: a `report:` step cannot run inside a `map`: \
-                             §8.6's report is a property of the run, and one per item \
-                             would leave the Runs inbox choosing between them",
-                            inner.id
-                        ));
+                    // Ruling P116 §B, through the helper both fan-out loops
+                    // share — see `nested_report_refusal`.
+                    if let Some(refusal) = nested_report_refusal(inner) {
+                        last = refusal;
                         break;
                     }
                     // Fix round 2, item 1: evaluate the inner step's own
@@ -1500,127 +2264,52 @@ impl<'a> Executor<'a> {
                             // outcome, not whatever `dispatch_step` fills the
                             // field with when `inner` is itself a nested
                             // `map` (which is the unconditional `false`
-                            // placeholder at the bottom of this function — a
+                            // placeholder `map_step_outcome` writes — a
                             // nested map's own inner taint travels on
-                            // `output_is_secret_derived`, folded on the next
-                            // line, not on this field).
-                            // `dispatch_step_or_stub`, not `dispatch_step`: a
-                            // `map` item has no `workflow_run` row of its own
-                            // to suspend (see `Executor::dispatch_step_or_stub`'s
-                            // own doc) — real per-item `tool:`/`agent:`
-                            // concurrency is Phase 8 Task 25.7's scope.
+                            // `output_is_secret_derived`, folded by
+                            // `fold_inner_step_outcome` below, not on this
+                            // field).
+                            //
+                            // **`dispatch_step_or_stub`, not
+                            // `dispatch_step`, and that is what makes this
+                            // the in-memory loop.** This function's caller
+                            // (`Executor::run_to_completion`) has no
+                            // `workflow_run` row, so an item here has
+                            // nothing to suspend *into*; a `tool:`/`agent:`
+                            // inner step therefore takes the same stub every
+                            // other run-less dispatch takes. The loop that
+                            // suspends for real is
+                            // `run_loop::Loop::dispatch_map` (Phase 8 Task
+                            // 25.7 Task 2), which holds the `Connection`
+                            // this one deliberately does not.
                             let mut outcome = self.dispatch_step_or_stub(inner);
                             outcome.gate_condition_was_secret_derived =
                                 gate_condition_was_secret_derived;
                             outcome
                         }
                     };
-                    any_item_secret_derived |= outcome.output_is_secret_derived;
-                    // Fix round 3, item 1: fold this inner step's own
-                    // `when:` gate taint into the map's aggregate too, not
-                    // just its output taint — see this function's own doc
-                    // comment, "An inner step's own
-                    // `gate_condition_was_secret_derived` was discarded",
-                    // for why this is fail-safe rather than cosmetic.
-                    any_item_secret_derived |= outcome.gate_condition_was_secret_derived;
-                    match outcome.status {
-                        // Fix round 1, item 4: an item fails as soon as ANY
-                        // inner step fails — stop dispatching this item's
-                        // remaining inner steps and keep the failure, rather
-                        // than letting a later inner step's success
-                        // overwrite it. See this function's own doc comment
-                        // for the measured fail-open payload this replaces.
-                        StepStatus::Failed { message } => {
-                            last = ItemOutcome::Failed(message);
-                            break;
-                        }
-                        StepStatus::Skipped { reason } => {
-                            last = ItemOutcome::Skipped { reason };
-                        }
-                        StepStatus::Completed => {
-                            last = ItemOutcome::Completed(outcome.output);
-                        }
+                    // Both taint bits and the "an item fails as soon as any
+                    // inner step fails, unless it said otherwise" rule,
+                    // through the helper both fan-out loops share — see
+                    // `fold_inner_step_outcome`.
+                    if fold_inner_step_outcome(
+                        &mut last,
+                        outcome,
+                        inner.continue_on_error,
+                        &mut any_item_secret_derived,
+                    ) {
+                        break;
                     }
                 }
 
-                // Task 34: release on **every** path out of this item —
-                // the inner loop above may have `break`d on a failure,
-                // fallen through after every inner step ran, or (via
-                // `report:`'s refusal above) never entered the loop body at
-                // all; all three reach here. A release failure only
-                // overwrites `last` when the item would otherwise have
-                // reported success/skip — an item that already failed for
-                // its own reason keeps that reason, which is more
-                // actionable than a release failure piggy-backing on it.
-                // See `WorktreeGuard::release`'s own doc comment for why
-                // this explicit call, not `Drop` alone, is what lets a
-                // release failure reach `last` at all on this (the
-                // non-panicking) path.
-                if let Some(guard) = worktree_guard.take() {
-                    if let Err(e) = guard.release() {
-                        if !matches!(last, ItemOutcome::Failed(_)) {
-                            // Both guards the materialize arm applies, for
-                            // the same reasons, so the two paths out of one
-                            // item's worktree lifecycle cannot diverge:
-                            // withhold when this item's `base_ref` was
-                            // secret-derived (final round part 2, M1 —
-                            // `safe_summary()` is what the trait promises an
-                            // implementor is used), and the declared-secrets
-                            // needle backstop on top either way (item A1 —
-                            // `{e}` embeds free text this crate does not
-                            // control). See [`redact_message`]'s own doc
-                            // comment for why the two are independent.
-                            let detail = if base_ref_carried_secret_material {
-                                e.safe_summary().to_string()
-                            } else {
-                                e.to_string()
-                            };
-                            last = ItemOutcome::Failed(redact_message(
-                                format!(
-                                    "map step `{step_id}`: releasing the item's worktree: \
-                                     {detail}"
-                                ),
-                                &self.redaction_needles,
-                            ));
-                        }
-                    }
-                }
-
-                last
+                // Task 34: release on **every** path out of this item, through
+                // the same shared helper — see
+                // `Executor::release_item_isolation`.
+                self.release_item_isolation(step_id, item_worktree, last)
             },
         );
 
-        self.ctx.restore_root(as_name, outer_snapshot);
-        if let Some(snapshot) = outer_worktree_snapshot {
-            self.ctx.restore_root(WORKTREE_ROOT_NAME, snapshot);
-        }
-
-        StepOutcome {
-            step_id: step_id.to_string(),
-            output: serde_json::json!({
-                "items": result.outcomes.iter().map(item_outcome_to_json).collect::<Vec<_>>(),
-                "collected_errors": result.collected_errors,
-            }),
-            // Fix round 2, item 5 (recorded, not fixed here — Task 8's job):
-            // unconditionally `Completed`, even when every item failed. See
-            // this function's own doc comment, "The map's own aggregate
-            // status is unconditionally `Completed`".
-            status: StepStatus::Completed,
-            output_is_secret_derived: any_item_secret_derived,
-            // This is the map STEP'S OWN gate — whether *this* `map` step's
-            // own `when:` (if it has one) read secret material — not a
-            // record of its inner items' gates; those are folded into
-            // `output_is_secret_derived` above (fix round 3, item 1), the
-            // only field this function has that can carry an aggregate.
-            // `false` here is a placeholder identical in kind to
-            // `StepOutcome::failed`'s own (`crate::exec::mod`): the only
-            // callers of this function — `Executor::run_to_completion` and,
-            // when this `map` is itself nested inside an enclosing one,
-            // `dispatch_map_step`'s own inner loop above — always overwrite
-            // this field immediately after calling `dispatch_step`, from
-            // *their* `evaluate_when_gate` call on *this* step. Do not read
-            // the `false` below as a statement about this map's own gate.
-            gate_condition_was_secret_derived: false,
-        }
+        restore_map_roots(&mut self.ctx, as_name, snapshots);
+        map_step_outcome(step_id, &result, any_item_secret_derived)
     }
 }

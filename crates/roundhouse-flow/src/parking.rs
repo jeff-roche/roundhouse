@@ -373,6 +373,22 @@ pub struct ParkResult {
     pub awaiting_until: Option<Timestamp>,
     /// What the caller must do with the worktree.
     pub workspace: WorkspaceDisposition,
+    /// Which `map` item's nested `gate:` this park is about, echoed from
+    /// [`AwaitingHuman::item_index`] (Phase 8 Task 25.7 Task 6) — `None` for
+    /// every park with no item dimension, which is every other park.
+    ///
+    /// **An in-process echo, and not of a column.** The rest of this struct
+    /// echoes `workflow_run`; this field does not, because `workflow_run` has
+    /// exactly *one* park slot (`state`/`awaiting_until`/`checkpoint_ref`)
+    /// and no item dimension anywhere in it — §8.11's own invariant, that a
+    /// run has at most one live suspension at a time, is what makes one slot
+    /// enough. The durable record of *which item was mid-map* is the item's
+    /// own `workflow_step_run` row, written before the park by
+    /// `crate::exec::run_loop::Loop::checkpoint_map_item_step_waiting` under
+    /// migration 0007's `item_index` column. This field is here so a caller
+    /// acting on the park in-process (rendering it, logging it) need not
+    /// re-read that row.
+    pub item_index: Option<u32>,
 }
 
 /// Why a park failed.
@@ -636,6 +652,11 @@ pub fn park(
         session_id,
         awaiting_until,
         workspace,
+        // Read off the wait rather than taken as a parameter, for the reason
+        // `session_id` above is read off the row: a caller that could supply
+        // it independently could label this park with an item the wait it
+        // handed over is not about.
+        item_index: awaiting.item_index,
     })
 }
 
