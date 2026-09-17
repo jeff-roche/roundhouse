@@ -259,6 +259,146 @@ fn a_leading_dash_worktree_path_cannot_inject_a_git_flag() {
     let _ = std::fs::remove_dir_all(&wt);
 }
 
+/// **Concurrent `add_worktree`/`remove_worktree` against the same repository
+/// must all succeed** (Phase 8 Task 25.7 Task 8).
+///
+/// Per-item worktree *paths* cannot collide — `SandboxWorktreeProvider` mints
+/// a fresh uuid subdirectory per call — but `git worktree add` and `git
+/// worktree remove` both mutate, and both enumerate, the repository's shared
+/// `<repo>/.git/worktrees/` administrative directory. That is a different
+/// question from path collision, and empirically (git 2.55.0, this host) it
+/// is **not** safe: with no serialization, a `git worktree remove` deleting
+/// worktree *A*'s admin directory makes a concurrent `git worktree add`, or a
+/// concurrent `git worktree remove` of some unrelated worktree *B*, die with
+///
+/// ```text
+/// fatal: Invalid path '<repo>/.git/worktrees/A': No such file or directory
+/// fatal: failed to read .git/worktrees/A/commondir: No such file or directory
+/// ```
+///
+/// — a hard failure of an operation that has nothing to do with *A*. See
+/// `roundhouse_sandbox::worktree`'s module doc comment, section "Concurrency:
+/// one `git worktree` mutation at a time per repository", for the measured
+/// failure rates and for what the serialization added there does and does not
+/// cover.
+///
+/// The shape below is the one that reproduces it: adds running concurrently
+/// with removes, which is what a fan-out does as soon as one item releases
+/// its worktree while another materializes one. Both halves are asserted
+/// `Ok`, because the harm is not corruption of the repository — git's own
+/// junk cleanup unwinds a failed `add` — but a *spurious failure* of the
+/// sibling operation, which reaches a workflow as an item that failed for
+/// something another item did.
+#[test]
+fn concurrent_add_and_remove_against_one_repo_all_succeed() {
+    if !git_available() {
+        eprintln!("skipping: git not available on this host");
+        return;
+    }
+    // Sized to reproduce reliably rather than minimally, because the window
+    // is narrow: every `git worktree` invocation enumerates
+    // `<repo>/.git/worktrees/` and then resolves each entry it found, and the
+    // race is a concurrent removal landing between those two. `BALLAST`
+    // worktrees stay registered for the whole test purely to widen that
+    // enumeration, `WAVE` adds then race `WAVE` removes on top, and `ROUNDS`
+    // repeats the race. Measured on this host at git 2.55.0, by deleting the
+    // serialization and running this test sixteen times: 8 of 16 runs failed
+    // without it and 16 of 16 passed with it. At `BALLAST: 0, WAVE: 40,
+    // ROUNDS: 1` only 1 run in 8 failed, which is why the ballast is here.
+    const BALLAST: usize = 40;
+    const WAVE: usize = 16;
+    const ROUNDS: usize = 3;
+
+    let repo = TempRepo::new();
+    let repo_root: &Path = &repo.path;
+    for i in 0..BALLAST {
+        let path = worktree_path(&repo, &format!("ballast{i}"));
+        add_worktree(repo_root, &path, "HEAD").expect("seeding a ballast worktree must succeed");
+    }
+
+    // The wave that is *removed* during round 0; each round's adds become the
+    // next round's removes, which is the shape a fan-out actually has.
+    let mut live: Vec<PathBuf> = (0..WAVE)
+        .map(|i| worktree_path(&repo, &format!("r0-{i}")))
+        .collect();
+    for path in &live {
+        add_worktree(repo_root, path, "HEAD").expect("seeding the first wave must succeed");
+    }
+
+    for round in 1..=ROUNDS {
+        let fresh: Vec<PathBuf> = (0..WAVE)
+            .map(|i| worktree_path(&repo, &format!("r{round}-{i}")))
+            .collect();
+        let results: Vec<(&'static str, &PathBuf, Result<(), WorktreeError>)> =
+            std::thread::scope(|scope| {
+                let mut handles = Vec::new();
+                for path in &fresh {
+                    handles.push(
+                        scope.spawn(move || ("add", path, add_worktree(repo_root, path, "HEAD"))),
+                    );
+                }
+                for path in &live {
+                    handles.push(
+                        scope.spawn(move || ("remove", path, remove_worktree(repo_root, path))),
+                    );
+                }
+                handles
+                    .into_iter()
+                    .map(|h| h.join().expect("no worktree thread may panic"))
+                    .collect()
+            });
+
+        for (op, path, result) in &results {
+            assert!(
+                result.is_ok(),
+                "round {round}: concurrent {op} of {path:?} failed: {result:?}"
+            );
+        }
+
+        let listing = repo.worktree_list();
+        for path in &fresh {
+            assert!(
+                listing.contains(path.to_str().unwrap()),
+                "round {round}: every concurrently added worktree must be registered, missing \
+                 {path:?}:\n{listing}"
+            );
+            assert!(path.is_dir(), "{path:?} must exist on disk");
+        }
+        for path in &live {
+            assert!(
+                !listing.contains(path.to_str().unwrap()),
+                "round {round}: every concurrently removed worktree must be gone, still listed \
+                 {path:?}:\n{listing}"
+            );
+            assert!(!path.exists(), "{path:?} must be gone from disk");
+        }
+        live = fresh;
+    }
+
+    // Releasing a whole wave at once is the other half of the shape: a fan-out
+    // finishing together is all-removes, with no add to interleave with.
+    std::thread::scope(|scope| {
+        let handles: Vec<_> = live
+            .iter()
+            .map(|path| scope.spawn(move || (path, remove_worktree(repo_root, path))))
+            .collect();
+        for handle in handles {
+            let (path, result) = handle.join().expect("no worktree thread may panic");
+            assert!(
+                result.is_ok(),
+                "concurrent remove of {path:?} failed: {result:?}"
+            );
+        }
+    });
+
+    let listing = repo.worktree_list();
+    assert_eq!(
+        listing.lines().count(),
+        1 + BALLAST,
+        "only the repository's own primary worktree and the ballast may remain:\n{listing}"
+    );
+}
+
 #[test]
 fn add_worktree_defaults_are_reasonable_when_git_is_unavailable() {
     // Not gated on `git_available()` — this asserts behaviour when `git`

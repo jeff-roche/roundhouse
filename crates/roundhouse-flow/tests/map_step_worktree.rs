@@ -133,6 +133,48 @@ impl WorktreeProvider for ObservingWorktreeProvider {
     }
 }
 
+/// A real [`SandboxWorktreeProvider`] that records every
+/// `materialize`/`release` path, and **shells out to nothing of its own**.
+///
+/// [`ObservingWorktreeProvider`]'s per-call `git worktree list` is what makes
+/// it unusable under concurrency: that listing runs outside
+/// `roundhouse_sandbox::worktree`'s own per-repository lock, so a sibling
+/// thread's `git worktree remove` can race it — which would make a test flake
+/// for a reason that has nothing to do with what it is asserting. This
+/// wrapper defers every check to after the fan-out is quiescent.
+struct RecordingWorktreeProvider {
+    inner: SandboxWorktreeProvider,
+    materialized: Mutex<Vec<PathBuf>>,
+    released: Mutex<Vec<PathBuf>>,
+}
+
+impl RecordingWorktreeProvider {
+    fn new(repo_root: PathBuf) -> Self {
+        Self {
+            inner: SandboxWorktreeProvider::new(repo_root),
+            materialized: Mutex::new(Vec::new()),
+            released: Mutex::new(Vec::new()),
+        }
+    }
+}
+
+impl WorktreeProvider for RecordingWorktreeProvider {
+    fn materialize(&self, base_ref: &str) -> Result<PathBuf, WorktreeProviderError> {
+        let path = self.inner.materialize(base_ref)?;
+        self.materialized.lock().unwrap().push(path.clone());
+        Ok(path)
+    }
+
+    fn release(&self, worktree_path: &Path) -> Result<(), WorktreeProviderError> {
+        self.inner.release(worktree_path)?;
+        self.released
+            .lock()
+            .unwrap()
+            .push(worktree_path.to_path_buf());
+        Ok(())
+    }
+}
+
 /// A provider whose `materialize` always fails — no real repo needed, since
 /// nothing ever reaches `git`. Used to pin that a materialize failure (as
 /// opposed to a *missing* provider) also fails the item, with a message,
@@ -365,6 +407,242 @@ fn explicit_worktree_isolation_creates_one_real_git_worktree_per_item_and_remove
         emitted_paths, materialized_paths,
         "`${{ worktree.path }}` inside the map body must equal the real materialized path"
     );
+}
+
+/// **The fan-out shape Phase 8 Task 25.7 Task 8 asks for**: a `map` with
+/// `max_parallel: 4` and `isolation: worktree` over eight items makes eight
+/// *distinct* worktrees and releases every one of them, against a real
+/// `TempRepo`.
+///
+/// **`max_parallel` is not a concurrency knob for a worktree item on any path
+/// this crate has today, and this test does not pretend otherwise.** Two
+/// independent reasons, either sufficient:
+///
+/// - The loop this test drives (`Executor::run_to_completion` →
+///   `map_step::Executor::dispatch_map_step`) does not read `max_parallel` at
+///   all — see that function's own `_max_parallel` parameter and the doc
+///   comment above it.
+/// - The loop that *does* read it (`run_loop::Loop::dispatch_map`, where
+///   `max_parallel` is the wave ceiling) can never put a worktree item in a
+///   wave: an item holding a worktree is refused the moment an inner step
+///   would suspend, by `run_loop`'s `worktree_cannot_span_a_suspend`. A
+///   worktree's whole lifecycle therefore happens inside one synchronous
+///   `advance_map_item` call, and `dispatch_map` advances items one at a time.
+///
+/// So what this test pins is the *count and cleanup* half of the requirement —
+/// eight distinct worktrees, eight releases, nothing left behind in the
+/// repository. The *concurrency* half is
+/// [`concurrent_runs_sharing_one_repo_each_release_every_worktree_they_make`]
+/// below, which reproduces the one concurrency that is genuinely reachable
+/// today (several runs, one repository), and
+/// `roundhouse-sandbox`'s own `concurrent_add_and_remove_against_one_repo_all_succeed`,
+/// which pins the primitive.
+#[test]
+fn eight_items_at_max_parallel_four_make_eight_distinct_worktrees_all_released() {
+    if !git_available() {
+        eprintln!("skipping: git not available on this host");
+        return;
+    }
+    const ITEMS: usize = 8;
+
+    let repo = TempRepo::new();
+    let provider = Arc::new(ObservingWorktreeProvider::new(repo.path.clone()));
+
+    let yaml = format!(
+        "{WORKFLOW_PREAMBLE}steps:\n\
+         \x20\x20- id: per_item\n\
+         \x20\x20\x20\x20map:\n\
+         \x20\x20\x20\x20\x20\x20over: \"${{{{ inputs.items }}}}\"\n\
+         \x20\x20\x20\x20\x20\x20as: item\n\
+         \x20\x20\x20\x20\x20\x20max_parallel: 4\n\
+         \x20\x20\x20\x20\x20\x20on_item_error: continue\n\
+         \x20\x20\x20\x20\x20\x20isolation: worktree\n\
+         \x20\x20\x20\x20steps:\n\
+         \x20\x20\x20\x20\x20\x20- id: emit_path\n\
+         \x20\x20\x20\x20\x20\x20\x20\x20emit: {{ path: \"${{{{ worktree.path }}}}\" }}\n"
+    );
+    let def = parse_workflow(&yaml).expect("workflow must parse");
+    let mut sink = RecordingSink(Vec::new());
+    let items: Vec<serde_json::Value> = (0..ITEMS).map(|i| serde_json::json!(i)).collect();
+    let ctx = run_ctx(
+        serde_json::json!({ "items": items }),
+        Some(provider.clone()),
+    );
+    let mut exec = Executor::new(&def, &mut sink, ctx).unwrap();
+    let outcomes = exec.run_to_completion().expect("run must not error");
+
+    let map_outcome = &outcomes[0];
+    let entries = map_outcome.output["items"].as_array().unwrap();
+    assert_eq!(entries.len(), ITEMS, "one ItemOutcome per fan-out item");
+    for entry in entries {
+        assert_eq!(entry["status"], "completed", "item outcome: {entry:?}");
+    }
+
+    let materialized = provider.materialized.lock().unwrap().clone();
+    let released = provider.released.lock().unwrap().clone();
+    assert_eq!(materialized.len(), ITEMS, "one worktree per item");
+    let distinct: std::collections::BTreeSet<&PathBuf> = materialized.iter().collect();
+    assert_eq!(
+        distinct.len(),
+        ITEMS,
+        "every item's worktree must be its own — no two items may share a path: {materialized:?}"
+    );
+    assert_eq!(
+        materialized, released,
+        "every worktree materialized is released, and the path released is the path materialized"
+    );
+
+    // Ground truth, not this crate's bookkeeping: the repository is back to
+    // its own primary worktree, and nothing is left on disk.
+    let listing = repo.worktree_list();
+    assert_eq!(
+        listing.lines().count(),
+        1,
+        "only the repository's own primary worktree may remain:\n{listing}"
+    );
+    for path in &materialized {
+        assert!(!path.exists(), "{path:?} must be gone from disk");
+    }
+}
+
+/// **The concurrency that is actually reachable today: several workflow runs,
+/// one repository** (Phase 8 Task 25.7 Task 8).
+///
+/// `roundhouse-daemon` drives each claimed delivery in its own
+/// `tokio::spawn`ed task and builds a **fresh** `SandboxWorktreeProvider` per
+/// run (every `RunContext` it constructs in `scheduler_driver.rs` makes its
+/// own), so two runs over one workspace reach `git worktree add`/`remove`
+/// against the same repository
+/// at the same time through two different provider instances. This test is
+/// that shape, on real OS threads, with a real repository and a real
+/// `SandboxWorktreeProvider` per thread — which is also why the serialization
+/// `roundhouse_sandbox::worktree` adds has to be process-wide-per-repository
+/// rather than a field on the provider: a per-instance mutex would not make
+/// this test pass.
+///
+/// Measured before that serialization existed (git 2.55.0, this host): runs of
+/// this test failed with git dying on an admin-directory entry belonging to
+/// *another* thread's worktree. See `roundhouse_sandbox::worktree`'s module doc
+/// comment, "Concurrency: one `git worktree` mutation at a time per
+/// repository".
+#[test]
+fn concurrent_runs_sharing_one_repo_each_release_every_worktree_they_make() {
+    if !git_available() {
+        eprintln!("skipping: git not available on this host");
+        return;
+    }
+    // `RUNS` concurrent runs of `ITEMS` items each, so `RUNS * ITEMS` adds
+    // interleaved with `RUNS * ITEMS` removes against one repository — each
+    // item is an add immediately followed by a release, so at steady state
+    // roughly half the in-flight `git` calls are the removals that are the
+    // hazard.
+    //
+    // `BALLAST` worktrees are checked out before the fan-out starts and left
+    // there, which is both realistic (a developer's repository routinely has
+    // worktrees of its own) and load-bearing for what this test can detect:
+    // git's race is a removal landing between another invocation's listing of
+    // `<repo>/.git/worktrees/` and its resolution of the entries it listed, so
+    // a long standing population is what makes the window wide enough to hit.
+    // Measured on this host at git 2.55.0 by deleting the serialization: 8 of
+    // 10 runs failed without it, against 1 of 10 with no ballast.
+    const RUNS: usize = 16;
+    const ITEMS: usize = 8;
+    const BALLAST: usize = 40;
+
+    let repo = TempRepo::new();
+    let ballast_provider = SandboxWorktreeProvider::new(repo.path.clone());
+    let ballast: Vec<PathBuf> = (0..BALLAST)
+        .map(|_| {
+            ballast_provider
+                .materialize("HEAD")
+                .expect("a ballast worktree must materialize")
+        })
+        .collect();
+    let yaml = format!(
+        "{WORKFLOW_PREAMBLE}steps:\n\
+         \x20\x20- id: per_item\n\
+         \x20\x20\x20\x20map:\n\
+         \x20\x20\x20\x20\x20\x20over: \"${{{{ inputs.items }}}}\"\n\
+         \x20\x20\x20\x20\x20\x20as: item\n\
+         \x20\x20\x20\x20\x20\x20max_parallel: 4\n\
+         \x20\x20\x20\x20\x20\x20on_item_error: continue\n\
+         \x20\x20\x20\x20\x20\x20isolation: worktree\n\
+         \x20\x20\x20\x20steps:\n\
+         \x20\x20\x20\x20\x20\x20- id: emit_path\n\
+         \x20\x20\x20\x20\x20\x20\x20\x20emit: {{ path: \"${{{{ worktree.path }}}}\" }}\n"
+    );
+    let def = parse_workflow(&yaml).expect("workflow must parse");
+    let items: Vec<serde_json::Value> = (0..ITEMS).map(|i| serde_json::json!(i)).collect();
+
+    let per_run: Vec<(Vec<PathBuf>, Vec<PathBuf>)> = std::thread::scope(|scope| {
+        let handles: Vec<_> = (0..RUNS)
+            .map(|_| {
+                let def = &def;
+                let items = &items;
+                let repo_root = repo.path.clone();
+                scope.spawn(move || {
+                    // One provider per run, exactly as the daemon builds one
+                    // per claimed delivery.
+                    let provider = Arc::new(RecordingWorktreeProvider::new(repo_root));
+                    let mut sink = RecordingSink(Vec::new());
+                    let ctx = run_ctx(
+                        serde_json::json!({ "items": items }),
+                        Some(provider.clone()),
+                    );
+                    let mut exec = Executor::new(def, &mut sink, ctx).unwrap();
+                    let outcomes = exec.run_to_completion().expect("run must not error");
+                    let entries = outcomes[0].output["items"].as_array().unwrap().clone();
+                    assert_eq!(entries.len(), ITEMS);
+                    for entry in &entries {
+                        assert_eq!(
+                            entry["status"], "completed",
+                            "an item failed under concurrent fan-out: {entry:?}"
+                        );
+                    }
+                    let materialized = provider.materialized.lock().unwrap().clone();
+                    let released = provider.released.lock().unwrap().clone();
+                    (materialized, released)
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|h| h.join().expect("no run thread may panic"))
+            .collect()
+    });
+
+    let mut all: Vec<PathBuf> = Vec::new();
+    for (materialized, released) in &per_run {
+        assert_eq!(materialized.len(), ITEMS, "one worktree per item, per run");
+        assert_eq!(
+            materialized, released,
+            "every worktree a run materialized is released, by that same run, at that same path"
+        );
+        all.extend(materialized.iter().cloned());
+    }
+    let distinct: std::collections::BTreeSet<&PathBuf> = all.iter().collect();
+    assert_eq!(
+        distinct.len(),
+        RUNS * ITEMS,
+        "every item of every run gets its own worktree path — no two runs may collide"
+    );
+
+    let listing = repo.worktree_list();
+    assert_eq!(
+        listing.lines().count(),
+        1 + BALLAST,
+        "every worktree of every run is released: only the repository's own primary worktree \
+         and the untouched ballast may remain:\n{listing}"
+    );
+    for path in &all {
+        assert!(!path.exists(), "{path:?} must be gone from disk");
+    }
+    for path in &ballast {
+        assert!(
+            path.is_dir(),
+            "a concurrent fan-out must not disturb worktrees it does not own: {path:?}"
+        );
+    }
 }
 
 #[test]
