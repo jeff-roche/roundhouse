@@ -47,7 +47,8 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use roundhouse_core::{SessionId, SessionSpec, SessionState};
+use roundhouse_bus::spawn_tree::SpawnTree;
+use roundhouse_core::{SessionId, SessionOutcome, SessionSpec, SessionState};
 use roundhouse_engine::SessionActor;
 use roundhouse_mcp::host::McpHost;
 use roundhouse_net::proxy::LoopbackProxy;
@@ -57,6 +58,7 @@ use crate::session_bootstrap::{
     RealSession,
 };
 use crate::session_registry::SessionRegistry;
+use crate::sub_agent_host::SubAgentSessions;
 
 /// Everything that can go wrong building a headless session:
 /// [`create_real_session`]'s own errors, plus the one failure mode that is
@@ -337,6 +339,7 @@ async fn build_headless_session(
         mcp_host_for_reaper,
         resources.proxy.clone(),
         proxy_token_for_reaper,
+        ReapAction::Teardown,
     );
 
     Ok(HeadlessSession {
@@ -424,6 +427,80 @@ impl HeadlessSession {
     /// await point drops it there, releasing the `Arc`.
     pub async fn teardown(self, registry: &SessionRegistry, proxy: &LoopbackProxy) {
         self.reaper.abort();
+        self.finish_teardown(registry, proxy).await;
+    }
+
+    /// The reaper-safe counterpart to [`Self::teardown`] (Phase 8, T19a Task
+    /// 5): the identical resource teardown, except it never aborts this
+    /// session's own reaper — it just lets `self` (and therefore
+    /// `self.reaper`'s `JoinHandle`) drop normally at the end of the call.
+    ///
+    /// [`Self::teardown`] and [`Self::close_and_teardown`] both call
+    /// `self.reaper.abort()` because whatever calls them runs on some OTHER
+    /// task than the reaper's own. [`spawn_session_reaper`]'s
+    /// `RetireSubAgent` reap action calls THIS method instead, from inside
+    /// the very reaper task whose `JoinHandle` this `HeadlessSession` holds
+    /// — `abort()`ing there would cancel the task currently executing this
+    /// call at its next await point, truncating whatever teardown steps
+    /// below had not yet run. Dropping the handle instead detaches the task
+    /// without cancelling it, which is exactly right here: the reaper has
+    /// already reached its terminal branch and is on its own way to
+    /// returning regardless.
+    async fn teardown_from_reaper(self, registry: &SessionRegistry, proxy: &LoopbackProxy) {
+        self.finish_teardown(registry, proxy).await;
+    }
+
+    /// Explicitly closes this session through the real, ordered
+    /// [`SessionActor::close`] path and then tears it down regardless of
+    /// whether that close succeeded (Phase 8, T19a Task 5) — the sequence a
+    /// caller with a connected client (a socket connection reacting to that
+    /// client's own close request, among others) drives, as opposed to a
+    /// reaper merely reacting to a `Closed` it happened to observe.
+    ///
+    /// 1. Abort the reaper. This call is about to durably close and tear the
+    ///    session down itself, so the reaper's own redundant reap of the
+    ///    same `Closed` transition must never run concurrently with it —
+    ///    and, per [`Self::teardown`]'s own doc comment, `abort()` is what
+    ///    actually retires that task rather than leaking it.
+    /// 2. [`SessionActor::close`]. A failure here (a durable store error) is
+    ///    logged at error level, never panicked on or propagated: this
+    ///    method's caller is tearing the session down either way, and
+    ///    reporting the failure onward to whatever peer asked for the close
+    ///    is that caller's job, not this one's.
+    /// 3. Tear the session's real resources down regardless of step 2's
+    ///    outcome. A `close()` that failed leaves the actor `Cancelling`,
+    ///    never `Closed` (see `close`'s own doc comment) — but it still
+    ///    holds a real isolation handle, MCP host and egress token that must
+    ///    not be leaked just because its terminator failed to append.
+    ///
+    /// **Must never be called from inside this session's own reaper task.**
+    /// Step 1's `abort()` targets that exact task; calling this method from
+    /// inside it would self-abort the very call in progress. The reaper's
+    /// own path is [`Self::teardown_from_reaper`], never this method.
+    pub async fn close_and_teardown(
+        self,
+        outcome: SessionOutcome,
+        registry: &SessionRegistry,
+        proxy: &LoopbackProxy,
+    ) {
+        self.reaper.abort();
+        if let Err(err) = self.actor.close(outcome).await {
+            tracing::error!(
+                session_id = %self.session_id,
+                error = %err,
+                "failed to durably close this session; tearing it down anyway"
+            );
+        }
+        self.finish_teardown(registry, proxy).await;
+    }
+
+    /// The resource-teardown tail shared by [`Self::teardown`],
+    /// [`Self::teardown_from_reaper`] and [`Self::close_and_teardown`]:
+    /// registry bookkeeping, the real isolation handle, any MCP host, and
+    /// the egress-proxy token. Deciding what happens to the reaper's own
+    /// `JoinHandle` is each caller's own concern, not this one's — see
+    /// their own doc comments for why they differ.
+    async fn finish_teardown(&self, registry: &SessionRegistry, proxy: &LoopbackProxy) {
         registry.remove(self.session_id);
         self.actor.teardown().await;
         if let Some(host) = &self.mcp_host {
@@ -437,6 +514,42 @@ impl HeadlessSession {
         }
         proxy.deregister_session(&self.proxy_token);
     }
+}
+
+/// What [`spawn_session_reaper`] does with a session once it observes that
+/// session's actor reach `SessionState::Closed` (Phase 8, T19a Task 5).
+///
+/// A plain headless root session and a tracked sub-agent child need
+/// different endings: a root session's reaper is the sole owner of retiring
+/// it ([`Self::Teardown`]), but a child tracked in [`SubAgentSessions`] also
+/// has a `SpawnTree` edge and a `SubAgentSessions` record that must end
+/// alongside it — ending only the session and leaving those behind would
+/// hold one of the parent's §7.7 fan-out slots forever.
+///
+/// **`RetireSubAgent` has no production caller yet.** The real production
+/// call site for a sub-agent child's reaper is
+/// `DaemonSubAgentHost::create_child_session`, which today always builds its
+/// child's reaper with [`Self::Teardown`] (via [`create_headless_session`])
+/// — the same one a root session gets. Threading a real choice between the
+/// two through that call (and `create_headless_session`'s own signature) is
+/// a later task's job, not this one's; this variant, `spawn_session_reaper`'s
+/// dispatch on it, and `SubAgentSessions::take_for_reap` are covered directly
+/// by this module's own tests in the meantime.
+pub enum ReapAction {
+    /// Tear this session's own tracked resources down directly: the registry
+    /// entry, the real isolation handle, any MCP host, and the egress-proxy
+    /// token. What every headless root session's reaper does today.
+    Teardown,
+    /// This session is a tracked sub-agent child: retiring it ends its
+    /// `SubAgentSessions` record and drops its parent's `SpawnTree` edge,
+    /// then tears its own resources down via
+    /// [`HeadlessSession::teardown_from_reaper`] — never
+    /// [`HeadlessSession::teardown`] or [`HeadlessSession::close_and_teardown`],
+    /// both of which abort the reaper task that IS the caller here.
+    RetireSubAgent {
+        sub_agents: Arc<SubAgentSessions>,
+        tree: Arc<SpawnTree>,
+    },
 }
 
 /// The "do-reap-when-the-actor-ends" half of ruling W1-R51 (fix round 1,
@@ -453,22 +566,26 @@ impl HeadlessSession {
 /// verbatim from `socket_server.rs` (Phase 8, Task 4) so a headless session
 /// (no connection at all) is torn down by the exact same mechanism.
 ///
-/// Nothing in this crate currently drives an actor to `SessionState::Closed`
-/// (there is no live work-submission path yet — see `main.rs`'s own module
-/// doc comment), so this loop simply never observes that value today and the
-/// task sits parked on `state.changed()` for the daemon's whole life,
-/// exactly as inert as `remove`'s previous zero-caller state was loud about
-/// being unwired. The difference is that the mechanism is now real and
-/// wired at every call site that creates a session, so the moment a future
-/// task adds a real terminal transition, this reaper closes the loop with no
-/// further wiring needed.
+/// `SessionActor::close` (Phase 8, T19a Task 4) is the one production path
+/// that ever drives an actor to `SessionState::Closed` today; before it
+/// existed this loop simply never observed that value and sat parked on
+/// `state.changed()` for the daemon's whole life, exactly as inert as
+/// `remove`'s previous zero-caller state was loud about being unwired. The
+/// mechanism itself has been real and wired at every call site that creates
+/// a session since this reaper was written, so no further wiring was needed
+/// once a real terminal transition existed to observe.
 ///
 /// **Returns the task's `JoinHandle` (Phase 8, Task 6).** A caller that
-/// retires its session explicitly — [`HeadlessSession::teardown`], because a
-/// scheduled run cannot afford to wait for a `Closed` that never arrives —
-/// needs to abort this task rather than leave it parked forever holding an
-/// `Arc<SessionActor>`. The socket path ignores the handle, which is exactly
-/// the previous behaviour.
+/// retires its session explicitly — [`HeadlessSession::teardown`] or
+/// [`HeadlessSession::close_and_teardown`], because a scheduled run cannot
+/// afford to wait for a `Closed` this reaper alone would never even be asked
+/// to produce — needs to abort this task rather than leave it parked forever
+/// holding an `Arc<SessionActor>`. The socket path ignores the handle, which
+/// is exactly the previous behaviour.
+///
+/// `action` (Phase 8, T19a Task 5) picks what happens once `Closed` is
+/// observed — see [`ReapAction`]'s own doc comment for why a plain headless
+/// root session and a tracked sub-agent child need different endings.
 pub(crate) fn spawn_session_reaper(
     registry: Arc<SessionRegistry>,
     session_id: SessionId,
@@ -476,28 +593,48 @@ pub(crate) fn spawn_session_reaper(
     mcp_host: Option<Arc<McpHost>>,
     proxy: Arc<LoopbackProxy>,
     proxy_token: String,
+    action: ReapAction,
 ) -> tokio::task::JoinHandle<()> {
     let mut state = actor.subscribe();
     tokio::spawn(async move {
         loop {
             if *state.borrow() == SessionState::Closed {
-                registry.remove(session_id);
-                // Fix round 2, MUST 2: before this, only the BOOKKEEPING
-                // was cleared here (the registry entry, the proxy's
-                // session-token map entry) — the REAL resources behind
-                // them (a real bwrap isolation handle, real MCP child
-                // processes) were never torn down on this path at all.
-                actor.teardown().await;
-                if let Some(host) = &mcp_host {
-                    if let Err(err) = host.shutdown().await {
-                        tracing::warn!(
-                            session_id = %session_id,
-                            error = %err,
-                            "failed to shut down this session's MCP host"
-                        );
+                match action {
+                    ReapAction::Teardown => {
+                        registry.remove(session_id);
+                        // Fix round 2, MUST 2: before this, only the
+                        // BOOKKEEPING was cleared here (the registry entry,
+                        // the proxy's session-token map entry) — the REAL
+                        // resources behind them (a real bwrap isolation
+                        // handle, real MCP child processes) were never torn
+                        // down on this path at all.
+                        actor.teardown().await;
+                        if let Some(host) = &mcp_host {
+                            if let Err(err) = host.shutdown().await {
+                                tracing::warn!(
+                                    session_id = %session_id,
+                                    error = %err,
+                                    "failed to shut down this session's MCP host"
+                                );
+                            }
+                        }
+                        proxy.deregister_session(&proxy_token);
+                    }
+                    ReapAction::RetireSubAgent { sub_agents, tree } => {
+                        // Idempotent: a second reap of the same child (there
+                        // should never be one, but `take_for_reap` costs
+                        // nothing to make safe regardless) finds no record
+                        // and does nothing further.
+                        if let Some((parent, headless)) = sub_agents.take_for_reap(session_id) {
+                            tree.remove_child(parent, session_id);
+                            // Never `headless.teardown()`/`close_and_teardown()`
+                            // here — both abort the reaper task, which IS the
+                            // task currently executing this call. See
+                            // `teardown_from_reaper`'s own doc comment.
+                            headless.teardown_from_reaper(&registry, &proxy).await;
+                        }
                     }
                 }
-                proxy.deregister_session(&proxy_token);
                 return;
             }
             if state.changed().await.is_err() {
@@ -528,23 +665,28 @@ mod tests {
     //! itself
     //!
     //! `create_real_session` (which `create_headless_session` calls) always
-    //! constructs its actor with `SessionState::Running` — nothing in this
-    //! crate drives a real actor to `Closed` yet (see
-    //! `spawn_session_reaper`'s own doc comment; this is the same reason
-    //! `socket_server`'s pre-relocation reaper tests construct an actor
-    //! already `Closed` at birth via `real_actor_with_state`, rather than
-    //! transitioning a real one there). This module's reaper test follows
-    //! the identical pattern, through `register_headless` instead of
+    //! constructs its actor with `SessionState::Running`, and nothing in
+    //! this crate closes a headless session it just built until the caller
+    //! decides to (there is no scripted end-to-end flow that would call
+    //! `SessionActor::close` on one within this module's own tests). So
+    //! `register_headless_session_is_reaped_once_its_actor_is_closed` below
+    //! builds its actor directly via `real_actor_with_state` and drives a
+    //! real `close()` on it itself, through `register_headless` instead of
     //! `create` — proving the SAME relocated reaper function correctly
     //! tears down a session that started life in the registry with zero
     //! subscribers, which is exactly what `create_headless_session` composes
     //! it with.
 
     use super::*;
+    use crate::sub_agent_host::SubAgentSessions;
     use crate::test_support::{daemon_resources, real_actor_with_state, runner};
-    use roundhouse_core::{Tier, WorkspaceId};
+    use roundhouse_core::{OnDegrade, Tier, WorkspaceId};
     use roundhouse_net::policy::EgressPolicy;
+    use roundhouse_sandbox::{
+        Attestation, Child, CommandSpec, Handle, Isolate, IsolationError, ProbeResult,
+    };
     use roundhouse_store::spawn_writer;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     /// The shared `DaemonResources` fixture, with no workspace registry —
     /// this module's tests pass a workspace root directly and never resolve
@@ -564,6 +706,107 @@ mod tests {
             on_degrade: resources.default_on_degrade,
             parent: None,
         }
+    }
+
+    /// An `Isolate` double that counts its own `teardown` calls — for the
+    /// `close_and_teardown`/`ReapAction::RetireSubAgent` tests below, which
+    /// need to prove teardown runs exactly once, not merely that it runs.
+    /// Never spawns anything for real; these tests never dispatch a shell.
+    struct CountingIsolate {
+        teardown_calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl Isolate for CountingIsolate {
+        fn declared(&self) -> Tier {
+            Tier::Sandbox
+        }
+
+        async fn probe(&self) -> ProbeResult {
+            ProbeResult {
+                achieved: Tier::Sandbox,
+                degradations: vec![],
+            }
+        }
+
+        async fn prepare(&self, _spec: &SessionSpec) -> Result<Handle, IsolationError> {
+            Ok(Handle {
+                id: "counting-isolate".into(),
+            })
+        }
+
+        async fn spawn(&self, _h: &Handle, _cmd: CommandSpec) -> Result<Child, IsolationError> {
+            unreachable!("this module's close/reap tests never dispatch a real shell")
+        }
+
+        fn attest(&self, _h: &Handle) -> Attestation {
+            Attestation {
+                tier: Tier::Sandbox,
+                digest: "counting-isolate".into(),
+                net_enforced: false,
+            }
+        }
+
+        async fn teardown(&self, _h: Handle) -> Result<(), IsolationError> {
+            self.teardown_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    /// A minimal, real `SessionActor` (state `Running`) over a
+    /// caller-supplied `isolate` — unlike `real_actor_with_state`, which is
+    /// pinned to this crate's shared `available_isolate()`, so it cannot
+    /// observe how many times an actor's isolation handle was torn down.
+    async fn actor_with_isolate(
+        dir: &std::path::Path,
+        isolate: Arc<dyn Isolate>,
+    ) -> Arc<SessionActor> {
+        let store = roundhouse_store::open(&dir.join("events.db"))
+            .await
+            .unwrap();
+        let writer = roundhouse_store::spawn_writer(store).await;
+        let policy = Arc::new(roundhouse_policy::engine::PolicyEngine::from_rules(vec![]));
+        let spec = SessionSpec::test_requesting(Tier::Sandbox, OnDegrade::Refuse);
+        let handle = isolate.prepare(&spec).await.unwrap();
+        Arc::new(SessionActor::new(
+            SessionId::new(),
+            writer,
+            SessionState::Running,
+            runner(),
+            policy,
+            dir.join("state"),
+            dir.join("daemon-binary"),
+            isolate,
+            handle,
+            spec,
+            vec![],
+        ))
+    }
+
+    /// A real, `serve()`d [`LoopbackProxy`] with one freshly registered
+    /// session token — the same fixture shape
+    /// `register_headless_session_is_reaped_once_its_actor_is_closed` and
+    /// `socket_server`'s own reaper tests already use, factored out here
+    /// since this module's Task 5 tests need it twice more.
+    async fn real_proxy_with_registered_token(
+        dir: &std::path::Path,
+    ) -> (Arc<LoopbackProxy>, String) {
+        let proxy = Arc::new(LoopbackProxy::new());
+        let proxy_store = roundhouse_store::open(&dir.join("proxy-events.db"))
+            .await
+            .unwrap();
+        let proxy_writer = spawn_writer(proxy_store).await;
+        proxy.clone().serve(runner(), proxy_writer).await.unwrap();
+        let proxy_handle = proxy
+            .register_session(
+                SessionId::new(),
+                EgressPolicy {
+                    allowed_hosts: vec![],
+                },
+            )
+            .unwrap();
+        let token = proxy_handle.token().to_string();
+        (proxy, token)
     }
 
     #[tokio::test]
@@ -713,22 +956,26 @@ mod tests {
     /// Proves the relocated [`spawn_session_reaper`] tears down a
     /// headlessly-registered session once its actor reaches
     /// `SessionState::Closed` — the composition [`create_headless_session`]
-    /// wires together, exercised directly through `register_headless` (see
-    /// this module's own doc comment for why `create_headless_session`
-    /// itself cannot yet produce a `Closed` actor). No real-clock timing:
-    /// the actor is already `Closed` at birth, so the reaper's very first
-    /// poll of `state.borrow()` observes it, with no timer or sleep needed
-    /// on either side — `tokio::task::yield_now` merely lets the already-
-    /// spawned reaper task run before this test asserts on its effect.
+    /// wires together, exercised directly through `register_headless`.
+    ///
+    /// Phase 8, T19a Task 5: this now drives a REAL close
+    /// ([`SessionActor::close`], landed by Task 4) instead of constructing
+    /// an already-`Closed` actor at birth — `close()` is real production
+    /// code now, not a gap this test has to work around. Still no
+    /// real-clock timing: `close()` itself durably appends the terminator
+    /// and publishes `Closed` to the state watch before returning, so the
+    /// reaper is already woken (not merely eligible to be) by the time this
+    /// test starts polling; `tokio::task::yield_now` only lets that already-
+    /// woken task actually run.
     #[tokio::test]
     async fn register_headless_session_is_reaped_once_its_actor_is_closed() {
         let dir = tempfile::tempdir().unwrap();
         let registry = Arc::new(SessionRegistry::new());
-        let actor = real_actor_with_state(dir.path(), roundhouse_core::SessionState::Closed).await;
+        let actor = real_actor_with_state(dir.path(), roundhouse_core::SessionState::Running).await;
         let actor_for_reaper = actor.clone();
 
         let session_id = registry
-            .register_headless(actor, None, None)
+            .register_headless(actor.clone(), None, None)
             .expect("registering against a fresh, non-full registry must succeed");
         assert_eq!(registry.subscriber_count_for_test(session_id), Some(0));
 
@@ -755,12 +1002,17 @@ mod tests {
             None,
             proxy.clone(),
             token.clone(),
+            ReapAction::Teardown,
         );
 
-        // The reaper's own first poll of `state.borrow()` already observes
-        // `Closed` (the actor was constructed that way) — `yield_now` just
-        // lets the spawned task actually run at least once before this
-        // assertion, with no real-clock wait involved.
+        actor
+            .close(SessionOutcome::Completed)
+            .await
+            .expect("closing a session with no open tasks and no gate must succeed");
+
+        // `yield_now` lets the reaper task — already woken by `close()`'s
+        // own state-watch publish above — actually run before this
+        // assertion; no real-clock wait involved.
         for _ in 0..1000 {
             if registry.actor(session_id).is_none() {
                 break;
@@ -775,6 +1027,179 @@ mod tests {
         assert!(
             !proxy.is_registered(&token),
             "the reaper must deregister this session's real proxy token"
+        );
+    }
+
+    /// [`HeadlessSession::close_and_teardown`] must tear this session's real
+    /// isolation handle down exactly once (Phase 8, T19a Task 5) — not zero
+    /// times (leaked), and not twice (a double `Isolate::teardown` call,
+    /// which that method's own doc comment says is not guaranteed safe).
+    /// The double-call hazard this guards against: `close_and_teardown`
+    /// aborts this session's reaper BEFORE calling `SessionActor::close`, so
+    /// the reaper can never independently observe `Closed` and run its own
+    /// teardown concurrently with this call's.
+    #[tokio::test]
+    async fn close_and_teardown_tears_down_the_real_isolation_handle_exactly_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let teardown_calls = Arc::new(AtomicUsize::new(0));
+        let isolate: Arc<dyn Isolate> = Arc::new(CountingIsolate {
+            teardown_calls: Arc::clone(&teardown_calls),
+        });
+        let actor = actor_with_isolate(dir.path(), isolate).await;
+
+        let registry = Arc::new(SessionRegistry::new());
+        let session_id = registry
+            .register_headless(actor.clone(), None, None)
+            .expect("registering against a fresh, non-full registry must succeed");
+
+        let (proxy, token) = real_proxy_with_registered_token(dir.path()).await;
+
+        let reaper = spawn_session_reaper(
+            registry.clone(),
+            session_id,
+            actor.clone(),
+            None,
+            proxy.clone(),
+            token.clone(),
+            ReapAction::Teardown,
+        );
+        let headless = HeadlessSession {
+            session_id,
+            actor: actor.clone(),
+            mcp_host: None,
+            proxy_token: token.clone(),
+            reaper,
+        };
+
+        assert_eq!(
+            teardown_calls.load(Ordering::SeqCst),
+            0,
+            "sanity: nothing has torn this session's isolation handle down yet"
+        );
+
+        headless
+            .close_and_teardown(SessionOutcome::Completed, &registry, &proxy)
+            .await;
+
+        assert_eq!(
+            teardown_calls.load(Ordering::SeqCst),
+            1,
+            "close_and_teardown must tear this session's real isolation handle down exactly \
+             once"
+        );
+        assert!(
+            registry.actor(session_id).is_none(),
+            "close_and_teardown must remove the registry entry"
+        );
+        assert!(
+            !proxy.is_registered(&token),
+            "close_and_teardown must deregister the real egress token"
+        );
+    }
+
+    /// A child tracked in [`SubAgentSessions`] whose actor is closed
+    /// directly ([`SessionActor::close`]) — never through
+    /// `HeadlessSession::close_and_teardown`/`teardown` — must still be
+    /// fully retired: its `SubAgentSessions` record and its parent's
+    /// `SpawnTree` edge dropped, its registry entry and real isolation
+    /// handle/egress token torn down, all by the reaper's own
+    /// `ReapAction::RetireSubAgent` dispatch (Phase 8, T19a Task 5).
+    ///
+    /// This is also the test that proves `HeadlessSession::teardown_from_reaper`
+    /// really does drop its own `JoinHandle` rather than abort it: this test
+    /// never calls `.abort()` on anything, so the ONLY way every one of the
+    /// assertions below can pass is for the reaper's retire-arm dispatch to
+    /// run to completion inside its own task — an `abort()` on the reaper's
+    /// own handle from inside that same call would cancel it at its next
+    /// await point, most likely leaving the registry entry, the isolation
+    /// teardown, or the proxy deregistration incomplete.
+    #[tokio::test]
+    async fn a_sub_agent_child_closed_directly_is_retired_without_the_reaper_aborting_itself() {
+        let dir = tempfile::tempdir().unwrap();
+        let teardown_calls = Arc::new(AtomicUsize::new(0));
+        let isolate: Arc<dyn Isolate> = Arc::new(CountingIsolate {
+            teardown_calls: Arc::clone(&teardown_calls),
+        });
+        let actor = actor_with_isolate(dir.path(), isolate).await;
+
+        let registry = Arc::new(SessionRegistry::new());
+        let session_id = registry
+            .register_headless(actor.clone(), None, None)
+            .expect("registering against a fresh, non-full registry must succeed");
+
+        let (proxy, token) = real_proxy_with_registered_token(dir.path()).await;
+
+        let sub_agents = Arc::new(SubAgentSessions::new());
+        let tree = Arc::new(SpawnTree::new());
+        let parent = SessionId::new();
+        tree.record_child(parent, session_id);
+
+        let reaper = spawn_session_reaper(
+            registry.clone(),
+            session_id,
+            actor.clone(),
+            None,
+            proxy.clone(),
+            token.clone(),
+            ReapAction::RetireSubAgent {
+                sub_agents: Arc::clone(&sub_agents),
+                tree: Arc::clone(&tree),
+            },
+        );
+        let headless = HeadlessSession {
+            session_id,
+            actor: actor.clone(),
+            mcp_host: None,
+            proxy_token: token.clone(),
+            reaper,
+        };
+        sub_agents.insert_for_test(session_id, parent, headless);
+        assert_eq!(
+            tree.direct_children(parent),
+            1,
+            "sanity: the edge is recorded"
+        );
+
+        // Close the actor directly — the ordinary durable-close path, never
+        // HeadlessSession::teardown/close_and_teardown. Only the reaper's
+        // own observation of Closed drives retirement here.
+        actor
+            .close(SessionOutcome::Completed)
+            .await
+            .expect("closing a session with no open tasks and no gate must succeed");
+
+        // No real-clock wait: `close()` already published `Closed` to the
+        // state watch above, so the reaper is already woken; `yield_now`
+        // just lets it actually run.
+        for _ in 0..1000 {
+            if sub_agents.is_empty() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+
+        assert!(
+            sub_agents.is_empty(),
+            "ReapAction::RetireSubAgent must remove this child's SubAgentSessions record once \
+             its actor closes on its own"
+        );
+        assert_eq!(
+            tree.direct_children(parent),
+            0,
+            "ReapAction::RetireSubAgent must drop the parent's SpawnTree edge"
+        );
+        assert!(
+            registry.actor(session_id).is_none(),
+            "ReapAction::RetireSubAgent must still remove the registry entry"
+        );
+        assert!(
+            !proxy.is_registered(&token),
+            "ReapAction::RetireSubAgent must still deregister the real egress token"
+        );
+        assert_eq!(
+            teardown_calls.load(Ordering::SeqCst),
+            1,
+            "ReapAction::RetireSubAgent must tear the real isolation handle down exactly once"
         );
     }
 

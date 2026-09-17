@@ -23,7 +23,7 @@ use tokio::sync::{mpsc, Semaphore};
 use tokio_util::codec::{FramedRead, LinesCodec, LinesCodecError};
 
 use crate::session_bootstrap::{self, DaemonResources};
-use crate::session_manager::spawn_session_reaper;
+use crate::session_manager::{spawn_session_reaper, ReapAction};
 use crate::session_registry::SessionRegistry;
 
 /// How many in-flight `ClientRequest`s one connection's driver will buffer
@@ -1279,6 +1279,7 @@ pub async fn drive_session(
                 mcp_host_for_reaper,
                 resources.proxy.clone(),
                 proxy_token_for_reaper,
+                ReapAction::Teardown,
             );
             let created = ClientEvent::TaskEvent {
                 session_id,
@@ -2095,6 +2096,7 @@ mod session_reaper_tests {
             None,
             proxy.clone(),
             token.clone(),
+            ReapAction::Teardown,
         );
 
         let reaped = tokio::time::timeout(std::time::Duration::from_secs(2), async {
@@ -2138,6 +2140,7 @@ mod session_reaper_tests {
             None,
             proxy.clone(),
             token.clone(),
+            ReapAction::Teardown,
         );
 
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;

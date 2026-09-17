@@ -139,6 +139,31 @@ impl SubAgentSessions {
         self.live.lock().ok()?.remove(&child)
     }
 
+    /// Removes `child`'s record and hands back its parent id and its live
+    /// session handle, without touching the spawn tree or retiring the
+    /// session itself (Phase 8, T19a Task 5).
+    ///
+    /// For [`crate::session_manager::spawn_session_reaper`]'s own
+    /// `RetireSubAgent` reap action, which must run its own
+    /// `SpawnTree::remove_child` and
+    /// [`crate::session_manager::HeadlessSession::teardown_from_reaper`] —
+    /// never through [`Self::retire_child`] (which calls
+    /// [`LiveSubAgent::retire`], i.e.
+    /// [`crate::session_manager::HeadlessSession::teardown`]) — because that
+    /// reap action runs from inside the very reaper task the returned
+    /// `HeadlessSession`'s own `JoinHandle` identifies, and `teardown`
+    /// aborts it.
+    ///
+    /// Idempotent for the same reason [`Self::take`] is: a second call for
+    /// an already-taken child finds no record and returns `None`.
+    pub(crate) fn take_for_reap(
+        &self,
+        child: SessionId,
+    ) -> Option<(SessionId, crate::session_manager::HeadlessSession)> {
+        self.take(child)
+            .map(|record| (record.parent, record.session))
+    }
+
     /// Ends one live sub-agent: drops its parent's spawn-tree edge and tears
     /// the session down. Returns whether there was a live sub-agent to end.
     ///
@@ -195,6 +220,37 @@ impl SubAgentSessions {
 
     pub fn is_empty(&self) -> bool {
         self.len() == 0
+    }
+
+    /// Test-only direct insertion (Phase 8, T19a Task 5). The real path that
+    /// populates this map is `DaemonSubAgentHost::create_child_session`,
+    /// which today always builds its child's reaper with `ReapAction::Teardown`
+    /// rather than `ReapAction::RetireSubAgent` (see
+    /// [`crate::session_manager::ReapAction`]'s own doc comment for why
+    /// threading a real choice through that call is a later task's job) —
+    /// this lets `spawn_session_reaper`'s own `RetireSubAgent`
+    /// tests, in `session_manager`'s test module, exercise a tracked
+    /// sub-agent record without that wiring existing yet.
+    #[cfg(test)]
+    pub(crate) fn insert_for_test(
+        &self,
+        child: SessionId,
+        parent: SessionId,
+        session: crate::session_manager::HeadlessSession,
+    ) {
+        if self
+            .insert(
+                child,
+                LiveSubAgent {
+                    parent,
+                    depth: 0,
+                    session,
+                },
+            )
+            .is_err()
+        {
+            panic!("the live-sub-agent map's lock is not poisoned in tests");
+        }
     }
 }
 
