@@ -783,6 +783,53 @@ impl EventWriter {
         redactor.safe_split_len(bytes, max)
     }
 
+    /// The production [`crate::delta_sink`]-shaped split primitive (Phase 8 Task 19 lane B,
+    /// Task 7): computes BOTH of `roundhouse_engine::delta_sink::SplitFn`'s modes from a
+    /// SINGLE `ArcSwap::load` of the live redactor, so one non-final-or-final flush decision
+    /// sees one consistent redactor snapshot throughout — the same race [`Self::
+    /// redaction_split_for_flush`] closes for its own (no-`max`, non-final-only) caller.
+    ///
+    /// `max` is an EXTERNAL cap this method always honors on top of whatever the redactor
+    /// itself would allow — never a hint an implementation may ignore. `SplitFn`'s contract
+    /// requires the returned `k <= min(max, bytes.len())`; a wrapper that dropped `max` here
+    /// would hand `DeltaCoalescer` a cut its own size-shrink loop never verified, since the
+    /// coalescer clamps to `max` before trusting the answer (see `DeltaCoalescer::
+    /// attempt_nonfinal_flush`'s doc comment).
+    ///
+    /// - `final_flush == false`: applies the holdback (`redaction_holdback()`) THEN caps at
+    ///   `max` — `redactor.safe_split_len(bytes, max.min(bytes.len().saturating_sub(holdback)))`
+    ///   — mirroring `redaction_split_for_flush`'s own holdback formula, but honoring an
+    ///   externally supplied `max` too instead of only ever asking about the whole buffer.
+    /// - `final_flush == true`: no holdback (nothing more is coming for this run) —
+    ///   `redactor.safe_split_len(bytes, max)` directly.
+    ///
+    /// **Monotonicity in `max` (load-bearing for `DeltaCoalescer::carve_final_chunk`'s R13
+    /// narrowest-cut search, which calls this ONLY with `final_flush = true`):** the
+    /// `final_flush = true` branch is a direct, unmodified call to `Redactor::safe_split_len`,
+    /// so it inherits that method's own documented property verbatim — it answers `0` exactly
+    /// when a match starting at offset `0` extends past `min(max, bytes.len())`, and is
+    /// non-decreasing in `max` (a larger `max` can only ever admit a cut at least as large,
+    /// since `safe_split_len` starts its own candidate at `max.min(bytes.len())` and only ever
+    /// walks it down to an earlier match's `start()`, never below what a smaller `max` would
+    /// have produced). The `final_flush = false` branch composes two non-decreasing functions
+    /// of `max` (the `min` cap, then `safe_split_len` itself), so it is non-decreasing too,
+    /// though `carve_final_chunk`'s search never exercises that branch.
+    pub fn redaction_split_for_coalescer(
+        &self,
+        bytes: &[u8],
+        max: usize,
+        final_flush: bool,
+    ) -> usize {
+        let redactor = self.redactor.load();
+        if final_flush {
+            redactor.safe_split_len(bytes, max)
+        } else {
+            let holdback = redactor.max_pattern_len().saturating_sub(1);
+            let capped = max.min(bytes.len().saturating_sub(holdback));
+            redactor.safe_split_len(bytes, capped)
+        }
+    }
+
     /// Append an event to the log. The event's `seq` field is ignored (the writer
     /// assigns a monotonic sequence number per session). Returns the assigned `seq`,
     /// or an error if serialization, database locking, or the writer task fails.

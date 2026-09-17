@@ -10,7 +10,14 @@ use roundhouse_provider::{
 };
 use std::collections::BTreeMap;
 
-/// Folds a provider's normalized `StreamEvent` stream into final `ContentBlock`s.
+/// The incremental fold state behind [`fold_stream_to_blocks`], split out (Phase 8 Task 19
+/// lane B, Task 7) so `chat.rs`'s `run_chat_turn_with_clock` can feed the SAME stream events
+/// that build the final `ContentBlock`s into a `DeltaCoalescer` as they arrive — the stream
+/// is consumed exactly once, from the one loop that does both — instead of folding it twice
+/// (once here, once for deltas) or discarding delta content the way this module did before
+/// this task. [`fold_stream_to_blocks`] is now a thin wrapper over this type: same public
+/// signature and behavior as before, for its existing callers/tests (`chat_infer_tree.rs`,
+/// `anthropic_cassette_stream.rs`, `roundhouse-daemon`'s `demo.rs`).
 ///
 /// A `Thinking` block folds to `ContentBlock::Thinking`, never `ContentBlock::Text` —
 /// its text and signature are tracked in their own map, separate from plain `Text`
@@ -28,50 +35,55 @@ use std::collections::BTreeMap;
 /// structurally: a provider that requires its own prior signed thinking block to be
 /// echoed back verbatim on the next turn (Anthropic extended thinking) would receive a
 /// plain `Text` block with no signature instead, and resuming the session would fail
-/// or be rejected by the provider. This function tracks thinking text and signature in
-/// their own map (`thinking_by_index`), keyed separately from plain text, and the
-/// final mapping below has an explicit `BlockKind::Thinking` arm — plus an exhaustive
-/// (not catch-all) `BlockKind::Text`/`None` arm, so a future `BlockKind` variant that
-/// isn't explicitly handled here fails to compile instead of silently falling through
-/// to `ContentBlock::Text` the same way.
-///
-/// **T19b Task 4:** `ChatStream` items are fallible (Task 1); a mid-stream
-/// `Err` item is a real provider failure (e.g. a truncated response), not a
-/// clean end of stream — it must fail this fold, not be silently folded as a
-/// short success. This function stops at the first `Err` item and returns
-/// that item's error rather than the partial `Vec` folded so far; `chat.rs`'s
-/// `run_chat_turn` takes its provider-failure branch on that `Err`, the same
-/// branch it already takes when `provider.stream_chat` itself fails.
-pub async fn fold_stream_to_blocks(
-    mut stream: ChatStream,
-) -> Result<Vec<ContentBlock>, ProviderError> {
-    let mut text_by_index: BTreeMap<u32, String> = BTreeMap::new();
-    let mut thinking_by_index: BTreeMap<u32, (String, Option<String>)> = BTreeMap::new();
-    let mut tool_args_by_index: BTreeMap<u32, String> = BTreeMap::new();
-    let mut tool_meta_by_index: BTreeMap<u32, (String, Option<String>)> = BTreeMap::new();
-    let mut order: Vec<u32> = Vec::new();
-    let mut kinds: BTreeMap<u32, BlockKind> = BTreeMap::new();
+/// or be rejected by the provider. This type tracks thinking text and signature in
+/// their own map (`thinking_by_index`), keyed separately from plain text, and
+/// [`Self::finish`]'s mapping has an explicit `BlockKind::Thinking` arm — plus an
+/// exhaustive (not catch-all) `BlockKind::Text`/`None` arm, so a future `BlockKind`
+/// variant that isn't explicitly handled here fails to compile instead of silently
+/// falling through to `ContentBlock::Text` the same way.
+pub(crate) struct StreamFold {
+    text_by_index: BTreeMap<u32, String>,
+    thinking_by_index: BTreeMap<u32, (String, Option<String>)>,
+    tool_args_by_index: BTreeMap<u32, String>,
+    tool_meta_by_index: BTreeMap<u32, (String, Option<String>)>,
+    order: Vec<u32>,
+    kinds: BTreeMap<u32, BlockKind>,
+}
 
-    while let Some(item) = stream.next().await {
-        let event = match item {
-            Ok(event) => event,
-            Err(err) => return Err(err),
-        };
+impl StreamFold {
+    pub(crate) fn new() -> Self {
+        StreamFold {
+            text_by_index: BTreeMap::new(),
+            thinking_by_index: BTreeMap::new(),
+            tool_args_by_index: BTreeMap::new(),
+            tool_meta_by_index: BTreeMap::new(),
+            order: Vec::new(),
+            kinds: BTreeMap::new(),
+        }
+    }
+
+    /// Folds one already-successful stream event into this fold's running state. The
+    /// caller (`fold_stream_to_blocks` below, or `chat.rs`'s own loop) is responsible for
+    /// handling a fallible `ChatStream` item's `Err` case before calling this — mirrors
+    /// exactly the match arms `fold_stream_to_blocks` used to run inline in its own loop
+    /// body before this task, unchanged.
+    pub(crate) fn accept(&mut self, event: StreamEvent) {
         match event {
             StreamEvent::BlockStart { index, kind } => {
-                order.push(index);
+                self.order.push(index);
                 if let BlockKind::ToolUse { name, provider_id } = &kind {
-                    tool_meta_by_index.insert(index, (name.clone(), provider_id.clone()));
+                    self.tool_meta_by_index
+                        .insert(index, (name.clone(), provider_id.clone()));
                 }
-                kinds.insert(index, kind);
+                self.kinds.insert(index, kind);
             }
             StreamEvent::BlockDelta { index, delta } => match delta {
-                BlockDelta::Text(t) => *text_by_index.entry(index).or_default() += &t,
+                BlockDelta::Text(t) => *self.text_by_index.entry(index).or_default() += &t,
                 BlockDelta::ToolArgsFragment(f) => {
-                    *tool_args_by_index.entry(index).or_default() += &f
+                    *self.tool_args_by_index.entry(index).or_default() += &f
                 }
                 BlockDelta::Thinking { text, signature } => {
-                    let entry = thinking_by_index.entry(index).or_default();
+                    let entry = self.thinking_by_index.entry(index).or_default();
                     entry.0 += &text;
                     // A signature fragment arrives as its own zero-text delta (Task
                     // 10's decoder) after the thinking text is complete; once set,
@@ -83,55 +95,96 @@ pub async fn fold_stream_to_blocks(
             },
             StreamEvent::BlockStop { .. } => {}
             StreamEvent::UsageDelta { .. } => {}
-            StreamEvent::MessageStop => break,
+            StreamEvent::MessageStop => {}
         }
     }
 
-    let blocks = order
-        .into_iter()
-        .map(|index| match kinds.get(&index) {
-            Some(BlockKind::ToolUse { .. }) => {
-                let (name, provider_id) = tool_meta_by_index.remove(&index).unwrap_or_default();
-                let raw_args = tool_args_by_index.remove(&index).unwrap_or_default();
-                let input = if raw_args.is_empty() {
-                    serde_json::json!({})
-                } else {
-                    serde_json::from_str(&raw_args).unwrap_or(serde_json::Value::Null)
-                };
-                // A provider-issued id gets `IdOrigin::Provider`; a locally synthesized
-                // one (the provider never assigned a tool-call id) gets
-                // `IdOrigin::Synthesized`, so downstream consumers can tell the two
-                // apart instead of both being reported as provider-issued.
-                let (id, id_origin) = match provider_id {
-                    Some(p) => (ToolCallId(p), IdOrigin::Provider),
-                    None => (ToolCallId(format!("synth_{index}")), IdOrigin::Synthesized),
-                };
-                ContentBlock::ToolUse {
-                    id,
-                    id_origin,
-                    name,
-                    input,
+    /// Maps the folded state into final `ContentBlock`s — exactly the mapping
+    /// `fold_stream_to_blocks` used to run inline after its loop, unchanged.
+    pub(crate) fn finish(self) -> Vec<ContentBlock> {
+        let StreamFold {
+            mut text_by_index,
+            mut thinking_by_index,
+            mut tool_args_by_index,
+            mut tool_meta_by_index,
+            order,
+            kinds,
+        } = self;
+
+        order
+            .into_iter()
+            .map(|index| match kinds.get(&index) {
+                Some(BlockKind::ToolUse { .. }) => {
+                    let (name, provider_id) = tool_meta_by_index.remove(&index).unwrap_or_default();
+                    let raw_args = tool_args_by_index.remove(&index).unwrap_or_default();
+                    let input = if raw_args.is_empty() {
+                        serde_json::json!({})
+                    } else {
+                        serde_json::from_str(&raw_args).unwrap_or(serde_json::Value::Null)
+                    };
+                    // A provider-issued id gets `IdOrigin::Provider`; a locally synthesized
+                    // one (the provider never assigned a tool-call id) gets
+                    // `IdOrigin::Synthesized`, so downstream consumers can tell the two
+                    // apart instead of both being reported as provider-issued.
+                    let (id, id_origin) = match provider_id {
+                        Some(p) => (ToolCallId(p), IdOrigin::Provider),
+                        None => (ToolCallId(format!("synth_{index}")), IdOrigin::Synthesized),
+                    };
+                    ContentBlock::ToolUse {
+                        id,
+                        id_origin,
+                        name,
+                        input,
+                        cache: None,
+                    }
+                }
+                Some(BlockKind::Thinking) => {
+                    let (text, signature) = thinking_by_index.remove(&index).unwrap_or_default();
+                    ContentBlock::Thinking {
+                        text,
+                        signature: signature.map(Signature),
+                        redacted: false,
+                    }
+                }
+                // Exhaustive, not a catch-all: `BlockKind` isn't `#[non_exhaustive]` today,
+                // but a future variant added here must fail to compile instead of silently
+                // downgrading to `ContentBlock::Text` the way `Thinking` used to (see this
+                // type's doc comment, audit finding 1).
+                Some(BlockKind::Text) | None => ContentBlock::Text {
+                    text: text_by_index.remove(&index).unwrap_or_default(),
                     cache: None,
-                }
-            }
-            Some(BlockKind::Thinking) => {
-                let (text, signature) = thinking_by_index.remove(&index).unwrap_or_default();
-                ContentBlock::Thinking {
-                    text,
-                    signature: signature.map(Signature),
-                    redacted: false,
-                }
-            }
-            // Exhaustive, not a catch-all: `BlockKind` isn't `#[non_exhaustive]` today,
-            // but a future variant added here must fail to compile instead of silently
-            // downgrading to `ContentBlock::Text` the way `Thinking` used to (see this
-            // function's doc comment, audit finding 1).
-            Some(BlockKind::Text) | None => ContentBlock::Text {
-                text: text_by_index.remove(&index).unwrap_or_default(),
-                cache: None,
-                citations: vec![],
-            },
-        })
-        .collect();
-    Ok(blocks)
+                    citations: vec![],
+                },
+            })
+            .collect()
+    }
+}
+
+/// Folds a provider's normalized `StreamEvent` stream into final `ContentBlock`s. A thin
+/// wrapper (Phase 8 T19b Task 7) over [`StreamFold`]: same public signature and behavior as
+/// before this task, for its existing callers/tests.
+///
+/// **T19b Task 4:** `ChatStream` items are fallible (Task 1); a mid-stream
+/// `Err` item is a real provider failure (e.g. a truncated response), not a
+/// clean end of stream — it must fail this fold, not be silently folded as a
+/// short success. This function stops at the first `Err` item and returns
+/// that item's error rather than the partial `Vec` folded so far; `chat.rs`'s
+/// `run_chat_turn` takes its provider-failure branch on that `Err`, the same
+/// branch it already takes when `provider.stream_chat` itself fails.
+pub async fn fold_stream_to_blocks(
+    mut stream: ChatStream,
+) -> Result<Vec<ContentBlock>, ProviderError> {
+    let mut fold = StreamFold::new();
+    while let Some(item) = stream.next().await {
+        let event = match item {
+            Ok(event) => event,
+            Err(err) => return Err(err),
+        };
+        let is_message_stop = matches!(event, StreamEvent::MessageStop);
+        fold.accept(event);
+        if is_message_stop {
+            break;
+        }
+    }
+    Ok(fold.finish())
 }

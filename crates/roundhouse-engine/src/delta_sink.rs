@@ -276,7 +276,7 @@ impl DeltaCoalescer {
             BlockDelta::Thinking { text, signature } => {
                 pending.text.push_str(&text);
                 // A signature fragment arrives as its own zero-text delta
-                // (see `fold_stream_to_blocks` in `infer.rs`) once the
+                // (see `StreamFold::accept` in `infer.rs`) once the
                 // thinking text is complete; once set, a later `None` must
                 // never clobber it.
                 if signature.is_some() {
@@ -1631,7 +1631,7 @@ mod tests {
             .is_empty());
         // Real providers (Anthropic) send the signature as its own zero-text
         // delta once the thinking text is complete -- see
-        // `fold_stream_to_blocks`'s `BlockDelta::Thinking` arm in `infer.rs`.
+        // `StreamFold::accept`'s `BlockDelta::Thinking` arm in `infer.rs`.
         assert!(sink
             .push(
                 BlockDelta::Thinking {
