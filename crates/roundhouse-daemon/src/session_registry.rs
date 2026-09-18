@@ -1,46 +1,24 @@
-//! `SessionId`-keyed fan-out registry for `socket_server::accept_loop`.
+//! `SessionId`-keyed registry of live sessions for `socket_server::accept_loop`.
 //!
 //! Task 2's `serve` served exactly one connection to exactly one session; a
 //! real daemon must let an arbitrary number of `round` clients create
 //! sessions and let an arbitrary number of *other* clients later attach to
-//! any of them (§11.3). That needs two things `serve` never had: a place to
-//! look a `SessionId` up by value (so `Attach` can find a session a
-//! *different* connection created), and, less obviously, **fan-out**: two
-//! independent attached connections must each see every event a session
-//! produces, so one `SessionId` cannot map to a single `Sender` the way a
-//! first pass at this might reach for.
+//! any of them (§11.3). That needs a place to look a `SessionId` up by value,
+//! so `Attach` can find a session a *different* connection created, and a
+//! way to route a creator's post-handshake requests to the session's live
+//! `SessionActor`.
 //!
-//! # Fan-out shape
+//! # Events do not flow through this registry (Phase 8 Task 21)
 //!
-//! Each session maps to a [`SessionEntry`] holding a `Vec` of that session's
-//! currently-live subscriber `Sender`s. `create`/`attach` each mint a fresh
-//! bounded `mpsc` channel, register the `Sender` half, and hand the
-//! `Receiver` half back to the caller (`socket_server`'s per-connection
-//! driver), which forwards everything it receives down that one
-//! connection's socket via
-//! [`serve_connection`](crate::socket_server::serve_connection). [`publish`]
-//! fans one event out to every live subscriber.
-//!
-//! `Vec<Sender>` rather than `tokio::sync::broadcast` deliberately: this
-//! registry's fan-out is dynamic (subscribers attach and detach across a
-//! session's whole lifetime, not just at the moment of a single `subscribe`
-//! call), and a `broadcast` channel's single ring buffer would force one
-//! global lag policy across every subscriber and every session, whereas a
-//! `Vec` of independent bounded `mpsc::Sender`s lets each subscriber's own
-//! backpressure be its own problem — a slow or stuck watcher only ever
-//! drops events destined for *it* (see `publish`'s doc comment), never
-//! events destined for anyone else.
-//!
-//! # Handling a lagging or dead subscriber
-//!
-//! [`publish`] is deliberately **not** `async`: it uses `Sender::try_send`
-//! rather than `send().await`, so a subscriber whose channel is full can
-//! never block whoever is publishing (a `SessionActor`'s own task, in the
-//! real wiring this registry exists to support) — that event is simply
-//! dropped for that one subscriber, which is the daemon choosing to shed
-//! load rather than stall the whole session over one slow watcher. A
-//! subscriber whose `Receiver` has been dropped entirely (its connection
-//! ended) is pruned from the `Vec` on the next `publish`.
+//! Events come from the store: each connection runs its own
+//! `roundhouse_store::SessionFollower`, which reads the session's committed
+//! log from its cursor and then waits on the store's `CommitFeed` for more
+//! (see `socket_server::drive_established_session`). The registry no longer
+//! fans anything out. A [`Subscription`] is just a counted token: it holds one
+//! of the session's [`DEFAULT_MAX_SUBSCRIBERS_PER_SESSION`] slots, which still
+//! bounds how many connections (each with its own follower and store reads)
+//! one session can have attached, and [`SessionRegistry::detach`] gives the
+//! slot back.
 //!
 //! # Entry lifetime = actor lifetime, not subscriber-list emptiness (ruling
 //! W1-R51, Phase 7 Task 7)
@@ -58,9 +36,9 @@
 //! is plainly still running.
 //!
 //! **The rule now: a [`SessionEntry`]'s lifetime is its actor's lifetime.**
-//! [`detach`] and [`publish`]'s own dead-subscriber pruning remove
-//! subscribers from the list exactly as before, but an emptied subscriber
-//! list is no longer, by itself, a reason to remove the whole entry — a
+//! [`detach`] removes subscribers from the list exactly as before, but an
+//! emptied subscriber list is no longer, by itself, a reason to remove the
+//! whole entry — a
 //! session with zero currently-attached clients is a completely ordinary,
 //! supported state (that is the entire point of headless `round run`).
 //! [`remove`] is the new, explicit, actor-lifetime-driven reap path: a
@@ -81,10 +59,12 @@
 //! delivery, with no socket client attached) starts a session there
 //! directly, rather than arriving after `create`'s one subscriber detaches.
 //! It shares `create`'s exact insertion semantics (the `max_sessions` check,
-//! keying on `actor.session_id()`) and mints no channel at all.
+//! keying on `actor.session_id()`) and takes no subscriber slot.
 //!
-//! (`attach`ing to a `SessionId` this registry never created still returns
-//! `None`, same as before — see [`attach`]'s doc comment.)
+//! (`attach`ing to a `SessionId` this registry has no entry for still returns
+//! `None` — see [`attach`]'s doc comment. `socket_server::drive_session` then
+//! falls back to the store, which can still replay a closed or reaped
+//! session's log.)
 //!
 //! # Locking (ruling W1-R8)
 //!
@@ -102,57 +82,46 @@
 
 use std::collections::hash_map::Entry;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use roundhouse_core::SessionId;
 use roundhouse_engine::mcp_spawner::SessionMcp;
 use roundhouse_engine::SessionActor;
 use roundhouse_mcp::host::McpHost;
-use roundhouse_proto::ClientEvent;
-use tokio::sync::mpsc;
-
-/// Per-subscriber channel depth. Small and finite on purpose: `publish`
-/// sheds load onto a slow subscriber (see the module doc comment) rather
-/// than growing an unbounded backlog for it, and a session's own event
-/// volume between two client-visible frames is small.
-const SUBSCRIBER_CHANNEL_CAPACITY: usize = 64;
 
 /// Default ceiling on the number of live sessions one registry will hold at
 /// once (security review Important 3 / ruling W1-R33). Generous relative to
 /// any realistic single-daemon workload — this is a circuit breaker against
 /// unbounded growth (a bug, or a peer that just keeps sending
 /// `CreateSession`), not an operational tuning knob. Each entry is small
-/// (a `Vec` of `Sender`s), so this bounds memory in the pathological case
+/// (an actor handle and a `Vec` of subscription ids), so this bounds memory
+/// in the pathological case
 /// without constraining real usage.
 const DEFAULT_MAX_SESSIONS: usize = 10_000;
 
 /// Default ceiling on the number of subscribers (creator + every `Attach`)
 /// one session will accept (security review Important 3 / ruling W1-R33).
-/// `publish` clones `event` once per subscriber (module doc comment,
-/// "Handling a lagging or dead subscriber"), so an unbounded subscriber
-/// count is an unbounded per-event memory/CPU amplifier. Matches
-/// [`SUBSCRIBER_CHANNEL_CAPACITY`]'s order of magnitude deliberately: a
-/// session with more concurrently attached watchers than it has buffer
-/// slots per watcher is already past any realistic operator scenario.
+/// Each subscriber is a connection running its own store follower, so an
+/// unbounded subscriber count is an unbounded per-commit read amplifier: every
+/// commit wakes every follower, and each one re-reads the store.
 const DEFAULT_MAX_SUBSCRIBERS_PER_SESSION: usize = 64;
 
-/// A handle identifying one call to [`SessionRegistry::create`] or
+/// A counted token for one call to [`SessionRegistry::create`] or
 /// [`SessionRegistry::attach`], to be handed back to [`SessionRegistry::detach`]
 /// once that subscriber's connection ends.
 ///
-/// Deliberately opaque and not `Clone`: it wraps the exact cloned `Sender`
-/// the registry stored for this subscription, since `Sender::same_channel`
-/// is the cheapest correct way to identify "this exact subscription" among
-/// a session's `Vec` of them without inventing and threading a second,
-/// parallel id space purely to name registry entries. It is not a
-/// general-purpose way to publish events — [`SessionRegistry::publish`] is.
-pub struct Subscription(mpsc::Sender<ClientEvent>);
+/// Deliberately opaque and not `Clone`: it holds one of the session's
+/// subscriber slots, and the id inside it names exactly that slot among the
+/// session's `Vec` of them. It carries no events: those come from the store
+/// (see the module doc comment).
+pub struct Subscription(u64);
 
 /// One session's registry-side bookkeeping: the real, already-constructed
 /// `SessionActor` that IS this session (Phase 7, Task 7 — the actor is built
 /// by the caller, in an async context with access to the isolate/policy/MCP
 /// resources this registry itself has none of, and handed to [`create`]
-/// already-built) and the subscriber fan-out list. See the module doc
+/// already-built) and the ids of its live subscriptions. See the module doc
 /// comment ("Entry lifetime = actor lifetime") for why the two no longer
 /// share one reap condition.
 struct SessionEntry {
@@ -174,14 +143,16 @@ struct SessionEntry {
     /// child processes alive, `mcp` is what routes a tool call to them.
     /// `None` for a session with zero configured MCP servers.
     mcp: Option<SessionMcp>,
-    subscribers: Vec<mpsc::Sender<ClientEvent>>,
+    subscribers: Vec<u64>,
 }
 
 /// The `SessionId`-keyed session/subscriber map `socket_server::accept_loop`
-/// consults on every accepted connection. See the module doc comment for the
-/// fan-out design.
+/// consults on every accepted connection. See the module doc comment.
 pub struct SessionRegistry {
     sessions: Mutex<HashMap<SessionId, SessionEntry>>,
+    /// Mints each [`Subscription`]'s id. Unique across every session this
+    /// registry ever holds, so a stale token can never name another slot.
+    next_subscription: AtomicU64,
     max_sessions: usize,
     max_subscribers_per_session: usize,
 }
@@ -205,6 +176,7 @@ impl SessionRegistry {
     pub fn with_limits(max_sessions: usize, max_subscribers_per_session: usize) -> Self {
         SessionRegistry {
             sessions: Mutex::new(HashMap::new()),
+            next_subscription: AtomicU64::new(0),
             max_sessions,
             max_subscribers_per_session,
         }
@@ -227,31 +199,20 @@ impl SessionRegistry {
     /// already holds `max_sessions` live entries (security review
     /// Important 3 / ruling W1-R33) — an unbounded map is an unbounded
     /// memory sink for a peer (or a bug) that just keeps sending
-    /// `CreateSession`. Otherwise returns the new id, a [`Subscription`] to
-    /// hand back to [`Self::detach`] once the creating connection ends, and
-    /// the `Receiver` half the caller forwards to that connection's socket.
+    /// `CreateSession`. Otherwise returns the new id and a [`Subscription`] to
+    /// hand back to [`Self::detach`] once the creating connection ends.
     ///
-    /// # The channel is minted *before* the lock is taken (fix round 2, M2)
-    ///
-    /// An earlier version of this method minted the channel *after*
-    /// acquiring `self.sessions`'s lock. This crate's `mpsc::channel` itself
-    /// cannot panic, but keeping the mint outside the critical section
-    /// (alongside `actor.session_id()`, an infallible getter) keeps the
-    /// critical section itself minimal and un-panicking by inspection,
-    /// which is what actually matters for `std::sync::Mutex` poisoning —
-    /// see the module doc comment's "Locking" section (ruling W1-R8).
-    ///
-    /// The `max_sessions` check and the `insert` still happen under this
-    /// one lock acquisition — see the module doc comment's "Locking"
-    /// section for the TOCTOU that pairing avoids.
+    /// The `max_sessions` check and the `insert` happen under one lock
+    /// acquisition — see the module doc comment's "Locking" section for the
+    /// TOCTOU that pairing avoids.
     pub fn create(
         &self,
         actor: Arc<SessionActor>,
         mcp_host: Option<Arc<McpHost>>,
         mcp: Option<SessionMcp>,
-    ) -> Option<(SessionId, Subscription, mpsc::Receiver<ClientEvent>)> {
+    ) -> Option<(SessionId, Subscription)> {
         let session_id = actor.session_id();
-        let (tx, rx) = mpsc::channel(SUBSCRIBER_CHANNEL_CAPACITY);
+        let subscription = self.mint_subscription();
 
         let mut sessions = self.sessions.lock().unwrap();
         if sessions.len() >= self.max_sessions {
@@ -270,17 +231,23 @@ impl SessionRegistry {
                 actor,
                 mcp_host,
                 mcp,
-                subscribers: vec![tx.clone()],
+                subscribers: vec![subscription.0],
             },
         );
-        Some((session_id, Subscription(tx), rx))
+        Some((session_id, subscription))
+    }
+
+    /// A fresh [`Subscription`] id, minted outside the lock (fix round 2,
+    /// M2's reasoning: keep the critical section minimal).
+    fn mint_subscription(&self) -> Subscription {
+        Subscription(self.next_subscription.fetch_add(1, Ordering::Relaxed))
     }
 
     /// Registers an already-constructed `actor` as a brand new session, the
-    /// same way [`Self::create`] does, but with **zero subscribers** and no
-    /// channel minted at all — for a headless caller (Phase 8, Task 4: a
-    /// scheduled trigger delivery) that has no connection to hand a
-    /// `Receiver` back to.
+    /// same way [`Self::create`] does, but with **zero subscribers** — for a
+    /// headless caller (Phase 8, Task 4: a
+    /// scheduled trigger delivery) that has no connection to hold a
+    /// subscriber slot.
     ///
     /// Zero-subscriber [`SessionEntry`]s are already a first-class, tested
     /// state in this module (ruling W1-R51: "entry lifetime = actor
@@ -385,33 +352,25 @@ impl SessionRegistry {
         self.sessions.lock().unwrap().len() >= self.max_sessions
     }
 
-    /// Looks up an existing session and registers a brand new subscriber
-    /// channel for it, so a *different* connection than the one that ran
-    /// [`Self::create`] can watch the same session's events.
+    /// Looks up a live session and takes one of its subscriber slots, so a
+    /// *different* connection than the one that ran [`Self::create`] can
+    /// watch the same session.
     ///
-    /// Returns `None` if `session_id` names a session that either never
-    /// existed on this registry, or whose actor has since ended and been
-    /// [`remove`](Self::remove)d (see the module doc comment, "Entry
-    /// lifetime = actor lifetime" — a session with zero CURRENTLY attached
-    /// subscribers, by contrast, is an ordinary, fully attachable state
-    /// since Task 7), **or** whose subscriber count is already at
-    /// `max_subscribers_per_session`
-    /// (security review Important 3 / ruling W1-R33) — `publish` clones the
-    /// event once per subscriber, so an unbounded subscriber count is an
-    /// unbounded per-event amplifier. A real daemon backed by a persisted
-    /// session store would fall back to that store here to distinguish
-    /// "never existed" from "exists but nobody is currently watching it" and
-    /// revive the session; this task's registry is purely in-memory and does
-    /// not have a store to fall back to, so both cases (and now the capacity
-    /// case) collapse to `None`. Documented rather than silently accepted as
-    /// correct.
+    /// Returns `None` if `session_id` has no entry here — it never existed on
+    /// this registry, or its actor has since ended and been
+    /// [`remove`](Self::remove)d (see the module doc comment, "Entry lifetime
+    /// = actor lifetime" — a session with zero CURRENTLY attached subscribers,
+    /// by contrast, is an ordinary, fully attachable state since Task 7) —
+    /// **or** its subscriber count is already at `max_subscribers_per_session`
+    /// (security review Important 3 / ruling W1-R33). A caller that needs to
+    /// tell the capacity case apart can check [`Self::actor`]:
+    /// `socket_server::drive_session` does, and replays a session with no
+    /// live entry from the store instead.
     ///
     /// Looks up and registers under one lock acquisition — see the module
     /// doc comment's "Locking" section for the TOCTOU this avoids.
-    pub fn attach(
-        &self,
-        session_id: SessionId,
-    ) -> Option<(Subscription, mpsc::Receiver<ClientEvent>)> {
+    pub fn attach(&self, session_id: SessionId) -> Option<Subscription> {
+        let subscription = self.mint_subscription();
         let mut sessions = self.sessions.lock().unwrap();
         // `get_mut`, never `entry(..).or_default()`: attaching must not be
         // able to conjure a session into existence.
@@ -419,12 +378,11 @@ impl SessionRegistry {
         if entry.subscribers.len() >= self.max_subscribers_per_session {
             return None;
         }
-        let (tx, rx) = mpsc::channel(SUBSCRIBER_CHANNEL_CAPACITY);
-        entry.subscribers.push(tx.clone());
-        Some((Subscription(tx), rx))
+        entry.subscribers.push(subscription.0);
+        Some(subscription)
     }
 
-    /// Removes one subscriber from `session_id`'s fan-out list. **Does not**
+    /// Gives one subscriber slot back. **Does not**
     /// remove the whole session entry, even if that was its last subscriber
     /// — see the module doc comment, "Entry lifetime = actor lifetime"
     /// (ruling W1-R51): a session's actor may still be doing real work with
@@ -444,92 +402,14 @@ impl SessionRegistry {
             entry
                 .get_mut()
                 .subscribers
-                .retain(|tx| !tx.same_channel(&subscription.0));
+                .retain(|id| *id != subscription.0);
         }
-    }
-
-    /// **Has zero production call sites as of Phase 7 Task 9** — `grep -rn
-    /// "\.publish(" crates/roundhouse-daemon/src/` finds only this file's own
-    /// tests. Nothing in this workspace forwards an appended event to a
-    /// subscriber by this transport, which is why an attached `round attach`
-    /// client receives the handshake `Ack`/`SessionCreated` frame and then
-    /// silence, forever — the `Degradation` `Note` `session_bootstrap.rs`
-    /// records is emitted but invisible to anyone watching. `roundhouse-web`'s
-    /// `sse::SseHub::publish` has the identical defect (that crate's own
-    /// module doc has the twin of this note): the two are one gap, not two,
-    /// and closing only one transport's half would leave the other's
-    /// subscribers just as silent. Fixing it needs a new observer seam on
-    /// `roundhouse-engine`'s side, threaded through every `EventWriter` a
-    /// session can append through (CF-12(a)) — recorded as an open item in
-    /// Task 9's report rather than built there, since neither this crate nor
-    /// `roundhouse-web` can be named from `roundhouse-engine` (the dependency
-    /// direction runs the other way) and the seam has to land after whatever
-    /// redaction step already protects a secret from reaching an append, or
-    /// forwarding becomes the leak.
-    ///
-    /// Fans `event` out to every live subscriber of `session_id`, dropping
-    /// it for any subscriber whose channel is currently full (see the module
-    /// doc comment: backpressure a publisher must never block on) — counted
-    /// and logged, never silent (code review Minor 1 / ruling W1-R33, the
-    /// same principle this lane already applied to redaction drops in
-    /// W1-R24) — and pruning any subscriber whose `Receiver` has already
-    /// been dropped. A no-op — not an error — if `session_id` names a
-    /// session with no (or no longer any) subscribers; there is no one to
-    /// tell.
-    ///
-    /// # This registry's one lossy point (fix 1's loss policy)
-    ///
-    /// `drive_session`/`serve_connection` (`socket_server.rs`) are lossless:
-    /// both apply real backpressure via `reserve()` rather than ever
-    /// dropping a `ClientEvent` or `ClientRequest` (ruling W1-R32). This
-    /// `try_send` is the one place in the whole pipeline that sheds instead
-    /// — deliberately, because the alternative is letting one slow *watcher*
-    /// stall the session for every other subscriber (module doc comment,
-    /// "Handling a lagging or dead subscriber"). So: the connection layer
-    /// never drops; the registry's per-subscriber fan-out does, bounded to a
-    /// slow subscriber's own [`SUBSCRIBER_CHANNEL_CAPACITY`]-deep backlog,
-    /// and every drop is counted here.
-    ///
-    /// Not `async`: `try_send` is the whole point (see the module doc
-    /// comment), so this never needs to await anything, and can be called
-    /// from a plain synchronous context — including, deliberately, this
-    /// crate's own tests.
-    pub fn publish(&self, session_id: SessionId, event: ClientEvent) {
-        let mut sessions = self.sessions.lock().unwrap();
-        let Entry::Occupied(mut entry) = sessions.entry(session_id) else {
-            return;
-        };
-        let mut dropped_full = 0usize;
-        entry.get_mut().subscribers.retain(|tx| {
-            match tx.try_send(event.clone()) {
-                Ok(()) => true,
-                Err(mpsc::error::TrySendError::Full(_)) => {
-                    dropped_full += 1;
-                    // Keep the subscriber — it is slow, not gone; only the
-                    // event is shed.
-                    true
-                }
-                Err(mpsc::error::TrySendError::Closed(_)) => false,
-            }
-        });
-        if dropped_full > 0 {
-            tracing::warn!(
-                session_id = %session_id,
-                dropped = dropped_full,
-                "publish: shed event for full subscriber channel(s) rather than \
-                 stalling the session over one slow watcher"
-            );
-        }
-        // Does NOT remove the entry even if `subscribers` is now empty —
-        // see the module doc comment, "Entry lifetime = actor lifetime"
-        // (ruling W1-R51). `entry` (an `Entry::Occupied`) is dropped here
-        // without a `.remove()` call, same as `detach` above.
     }
 
     /// Test-only observability: `session_id`'s current subscriber count, or
     /// `None` if this registry has no entry for it. `SessionEntry`'s
     /// `subscribers` field is private by design (every production reader
-    /// goes through `attach`/`detach`/`publish`, never a raw count), but
+    /// goes through `attach`/`detach`, never a raw count), but
     /// [`Self::register_headless`]'s whole distinguishing property from
     /// [`Self::create`] is that it starts a session with a subscriber count
     /// of exactly zero — `crate::session_manager`'s own tests need a direct
@@ -546,19 +426,7 @@ impl SessionRegistry {
 
 #[cfg(test)]
 mod tests {
-    //! Fix round 1, fix 7 (code review Minor 1): `publish`'s drop-on-full
-    //! path is now counted and logged rather than silent (see `publish`'s
-    //! doc comment). This is a functional regression test for the retained
-    //! behavior underneath that logging — a full-but-not-closed subscriber
-    //! must lose the one event, not be pruned — since `tracing::warn!`
-    //! output itself is not asserted here (this workspace has no
-    //! `tracing-test`-style capture harness; see
-    //! `roundhouse-engine::session_actor::wire_redaction_for_session` for
-    //! the precedent this lane already follows of testing the functional
-    //! behavior, not the log line, for exactly this kind of drop-count fix).
-
     use super::*;
-    use roundhouse_core::{EventPayload, NoteLevel};
 
     use crate::test_support::real_actor;
 
@@ -643,8 +511,7 @@ mod tests {
             let actor = real_actor(dir.path()).await;
             let mcp = fake_session_mcp(dir.path(), actor.writer().clone());
 
-            let (session_id, _subscription, _events) =
-                registry.create(actor, None, Some(mcp)).unwrap();
+            let (session_id, _subscription) = registry.create(actor, None, Some(mcp)).unwrap();
 
             let retained = registry
                 .session_mcp(session_id)
@@ -665,63 +532,9 @@ mod tests {
             let dir = tempfile::tempdir().unwrap();
             let registry = SessionRegistry::new();
             let actor = real_actor(dir.path()).await;
-            let (session_id, _subscription, _events) = registry.create(actor, None, None).unwrap();
+            let (session_id, _subscription) = registry.create(actor, None, None).unwrap();
             assert!(registry.session_mcp(session_id).is_none());
         }
-    }
-
-    fn note(session_id: SessionId, text: &str) -> ClientEvent {
-        ClientEvent::TaskEvent {
-            session_id,
-            task_id: None,
-            payload: Box::new(EventPayload::Note {
-                level: NoteLevel::Info,
-                text: text.into(),
-            }),
-        }
-    }
-
-    #[tokio::test]
-    async fn publish_sheds_on_a_full_subscriber_without_pruning_it() {
-        let dir = tempfile::tempdir().unwrap();
-        let registry = SessionRegistry::new();
-        let actor = real_actor(dir.path()).await;
-        let (session_id, _creator_subscription, mut creator_events) =
-            registry.create(actor, None, None).unwrap();
-
-        // Fill the subscriber channel to capacity without ever draining it.
-        for i in 0..SUBSCRIBER_CHANNEL_CAPACITY {
-            registry.publish(session_id, note(session_id, &i.to_string()));
-        }
-        // One more publish must be dropped (the channel is full, not
-        // closed) — never panic, and never prune the subscriber for being
-        // merely slow rather than gone.
-        registry.publish(session_id, note(session_id, "overflow"));
-
-        // Draining one slot and publishing again must succeed — proving
-        // the subscriber is still registered (a pruned subscriber's
-        // `Receiver` would instead have observed its `Sender` dropped).
-        let mut delivered = 0usize;
-        creator_events
-            .try_recv()
-            .expect("the subscriber must still be attached and hold its buffered events");
-        delivered += 1;
-        registry.publish(session_id, note(session_id, "after-drain"));
-
-        while creator_events.try_recv().is_ok() {
-            delivered += 1;
-        }
-        // `SUBSCRIBER_CHANNEL_CAPACITY` filled the channel, "overflow" was
-        // shed, and "after-drain" filled the one slot that draining above
-        // freed — exactly one publish (the overflow) must have been
-        // dropped out of `SUBSCRIBER_CHANNEL_CAPACITY + 2` total attempts.
-        assert_eq!(
-            delivered,
-            SUBSCRIBER_CHANNEL_CAPACITY + 1,
-            "exactly one publish (the overflow) must have been dropped; \
-             the channel must not have grown past its capacity nor lost \
-             more than the one shed event"
-        );
     }
 
     /// The load-bearing regression this whole rework exists to prove
@@ -736,8 +549,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let registry = SessionRegistry::new();
         let actor = real_actor(dir.path()).await;
-        let (session_id, creator_subscription, _creator_events) =
-            registry.create(actor, None, None).unwrap();
+        let (session_id, creator_subscription) = registry.create(actor, None, None).unwrap();
 
         registry.detach(session_id, &creator_subscription);
 
@@ -749,27 +561,33 @@ mod tests {
         );
     }
 
-    /// The same property from `publish`'s pruning side: a subscriber whose
-    /// `Receiver` has been dropped (observed by `publish` as `Closed`, not
-    /// merely `Full`) is pruned from the list, but — post-W1-R51 — that
-    /// pruning down to zero subscribers must not reap the entry either.
+    /// A [`Subscription`] is a counted slot: once a session holds
+    /// `max_subscribers_per_session` of them, `attach` refuses, and
+    /// detaching one gives exactly that slot back.
     #[tokio::test]
-    async fn publish_pruning_the_last_closed_subscriber_does_not_reap_the_session() {
+    async fn detach_frees_exactly_one_subscriber_slot() {
         let dir = tempfile::tempdir().unwrap();
-        let registry = SessionRegistry::new();
+        let registry = SessionRegistry::with_limits(4, 2);
         let actor = real_actor(dir.path()).await;
-        let (session_id, _creator_subscription, creator_events) =
-            registry.create(actor, None, None).unwrap();
-
-        // Drop the only receiver so the sender `publish` holds becomes
-        // `Closed` rather than merely `Full`.
-        drop(creator_events);
-        registry.publish(session_id, note(session_id, "nobody is listening"));
-
+        let (session_id, creator) = registry.create(actor, None, None).unwrap();
+        let viewer = registry.attach(session_id).expect("one slot is still free");
         assert!(
-            registry.attach(session_id).is_some(),
-            "pruning a closed subscriber down to zero must not reap the session either"
+            registry.attach(session_id).is_none(),
+            "a third subscriber must be refused at max_subscribers_per_session = 2"
         );
+
+        registry.detach(session_id, &viewer);
+        assert_eq!(registry.subscriber_count_for_test(session_id), Some(1));
+        let again = registry
+            .attach(session_id)
+            .expect("detaching the viewer must free its slot");
+
+        // Detaching the same token twice must not free a second slot.
+        registry.detach(session_id, &viewer);
+        assert_eq!(registry.subscriber_count_for_test(session_id), Some(2));
+        registry.detach(session_id, &creator);
+        registry.detach(session_id, &again);
+        assert_eq!(registry.subscriber_count_for_test(session_id), Some(0));
     }
 
     /// [`SessionRegistry::remove`] is the one thing that DOES end a
@@ -781,8 +599,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let registry = SessionRegistry::new();
         let actor = real_actor(dir.path()).await;
-        let (session_id, _creator_subscription, _creator_events) =
-            registry.create(actor, None, None).unwrap();
+        let (session_id, _creator_subscription) = registry.create(actor, None, None).unwrap();
 
         registry.remove(session_id);
 

@@ -53,7 +53,7 @@ fn create_session_line_of_exact_length(target_len: usize) -> (String, String) {
     (workspace_name, line)
 }
 
-/// Builds a `ClientEvent::TaskEvent`/`Note` whose serialized JSON line is
+/// Builds a `ClientEvent::Committed`/`Note` whose serialized JSON line is
 /// exactly `target_len` bytes (not counting the trailing `\n`), by padding
 /// the note's `text`. The client-side mirror of
 /// `create_session_line_of_exact_length`.
@@ -61,8 +61,9 @@ fn note_event_line_of_exact_length(
     session_id: roundhouse_core::SessionId,
     target_len: usize,
 ) -> String {
-    let build = |text: String| ClientEvent::TaskEvent {
+    let build = |text: String| ClientEvent::Committed {
         session_id,
+        seq: 0,
         task_id: None,
         payload: Box::new(roundhouse_core::EventPayload::Note {
             level: roundhouse_core::NoteLevel::Info,
@@ -135,9 +136,10 @@ async fn an_overlong_request_line_closes_only_that_connection_not_the_accept_loo
 
 #[tokio::test]
 async fn a_generously_long_but_legitimate_workspace_name_still_round_trips() {
-    // `placeholder_session_spec` echoes `workspace_name` straight back in
-    // the handshake reply (ruling W1-R6) — the cap must not be so tight it
-    // breaks a real, if unusually long, workspace name.
+    // The session's durable `SessionCreated` (its seq 0, which is the frame
+    // `connect_create` waits for) carries `workspace_name` straight back in
+    // its spec — the cap must not be so tight it breaks a real, if unusually
+    // long, workspace name.
     let dir = tempfile::tempdir().unwrap();
     let socket_path = dir.path().join("round.sock");
     let registry = Arc::new(SessionRegistry::new());

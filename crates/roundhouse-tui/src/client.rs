@@ -74,6 +74,14 @@ pub enum ConnectIntent {
         /// The session to attach to.
         session_id: SessionId,
     },
+    /// Ask the daemon to attach to an already-existing session and replay
+    /// only the events after `after_seq` (Phase 8 Task 21).
+    Resume {
+        /// The session to resume.
+        session_id: SessionId,
+        /// The last `seq` this client already has.
+        after_seq: u64,
+    },
 }
 
 impl From<ConnectIntent> for ClientRequest {
@@ -83,6 +91,13 @@ impl From<ConnectIntent> for ClientRequest {
                 ClientRequest::CreateSession { workspace_name }
             }
             ConnectIntent::Attach { session_id } => ClientRequest::Attach { session_id },
+            ConnectIntent::Resume {
+                session_id,
+                after_seq,
+            } => ClientRequest::Resume {
+                session_id,
+                after_seq,
+            },
         }
     }
 }
@@ -105,7 +120,8 @@ pub struct DaemonClient {
     /// [`connect`] (which has no opinion on session identity), set by
     /// [`connect_create`] once it reads the session id off the daemon's
     /// `SessionCreated` handshake frame, and set immediately by
-    /// [`connect_attach`], which already knew it from its caller.
+    /// [`connect_attach`]/[`connect_resume`], which already knew it from
+    /// their caller.
     session_id: Option<SessionId>,
     /// Set once a [`Self::recv`] call may have been dropped mid-read (Phase
     /// 8, T19a Task 8) — currently only [`Self::close_session`]'s
@@ -129,6 +145,11 @@ pub struct DaemonClient {
     /// either way rather than risk the rare case silently. It says nothing
     /// about `self.writer` — the write half is entirely unaffected.
     read_desynchronized: bool,
+    /// The `seq` of the last `ClientEvent::Committed` [`Self::recv`]
+    /// returned (Phase 8 Task 21) — the cursor to hand [`connect_resume`]
+    /// after a reconnect. Starts at `None`, or at the resumed-from cursor for
+    /// a client built by [`connect_resume`].
+    last_seq: Option<u64>,
 }
 
 /// Connect to the daemon's Unix socket at `socket_path`, then immediately
@@ -148,6 +169,7 @@ pub async fn connect(socket_path: &Path, intent: ConnectIntent) -> Result<Daemon
         writer: write_half,
         session_id: None,
         read_desynchronized: false,
+        last_seq: None,
     };
     client.send(&intent.into()).await?;
     Ok(client)
@@ -156,14 +178,13 @@ pub async fn connect(socket_path: &Path, intent: ConnectIntent) -> Result<Daemon
 /// [`connect`] with [`ConnectIntent::CreateSession`], then read the daemon's
 /// first reply frame to learn the `SessionId` it minted.
 ///
-/// `ClientEvent` carries no dedicated "session created" reply (adding one to
-/// `roundhouse-proto` would be a breaking edit to a frozen Phase 0 crate);
-/// instead the daemon's first frame on a `CreateSession` handshake is a
-/// `ClientEvent::TaskEvent` whose payload is `EventPayload::SessionCreated`
-/// (see `roundhouse-daemon`'s `socket_server::drive_session`), and this
-/// function is the client-side half of that convention: it reads frames
-/// until it sees that one, caching the session id it carries so
-/// [`DaemonClient::session_id`] can return it afterward.
+/// `ClientEvent` carries no dedicated "session created" reply. Instead the
+/// daemon durably appends the new session's `SessionCreated` as its seq 0 and
+/// streams it like every other event, as a `ClientEvent::Committed` (see
+/// `roundhouse-daemon`'s `socket_server::drive_session`). This function reads
+/// frames until it sees that one, caching the session id it carries so
+/// [`DaemonClient::session_id`] can return it afterward, and
+/// [`DaemonClient::last_seq`] reports its seq.
 ///
 /// # Errors
 /// Returns whatever [`connect`] or [`DaemonClient::recv`] returns. Also
@@ -183,7 +204,7 @@ pub async fn connect_create(
 
     loop {
         match client.recv().await? {
-            Some(ClientEvent::TaskEvent {
+            Some(ClientEvent::Committed {
                 session_id,
                 payload,
                 ..
@@ -191,9 +212,9 @@ pub async fn connect_create(
                 client.session_id = Some(session_id);
                 return Ok(client);
             }
-            // Anything else (an `Ack`, or a `TaskEvent` of some other kind)
-            // arriving before the handshake frame keeps this loop reading
-            // rather than misinterpreting it as the reply.
+            // Anything else (an `Ack`, or a `Committed` event of some other
+            // kind) arriving before the handshake frame keeps this loop
+            // reading rather than misinterpreting it as the reply.
             Some(_) => continue,
             None => {
                 return Err(TuiError::Io(std::io::Error::new(
@@ -209,41 +230,83 @@ pub async fn connect_create(
 /// `session_id`, then wait for the daemon's `Ack` confirming the attach
 /// succeeded before returning.
 ///
-/// The wait matters, not just the confirmation: `roundhouse-daemon`'s
-/// `SessionRegistry::attach` registers this connection's subscriber channel
-/// as part of handling the `Attach` request, which does not happen until the
-/// daemon actually reads that request off the wire — a delay `connect`
-/// itself has no visibility into. A caller that published an event
-/// immediately after `connect` returned, with no acknowledgement to wait
-/// for, could race that registration and have the event delivered to no
-/// one. Waiting for the `Ack` here closes that window: it cannot arrive
-/// until `attach` has already run.
+/// The `Ack` is what tells a caller the handshake succeeded: after it, the
+/// daemon streams the session's committed events from seq 0 as
+/// `ClientEvent::Committed` frames (Phase 8 Task 21), read from the store, so
+/// there is no registration for a caller to race.
 ///
 /// # Errors
 /// Returns whatever [`connect`]/[`DaemonClient::recv`] returns. Also returns
 /// `TuiError::Io` if the daemon closes the connection instead of
-/// acknowledging (e.g. `session_id` names a session `attach` could not find
-/// — see `SessionRegistry::attach`'s doc comment for why that is
-/// indistinguishable, on the wire, from a session that never existed at
-/// all), or if the very first frame back is something other than an `Ack`.
+/// acknowledging (e.g. `session_id` names a session with neither a live
+/// registry entry nor any stored events), or if the very first frame back is
+/// something other than an `Ack`.
 pub async fn connect_attach(
     socket_path: &Path,
     session_id: SessionId,
 ) -> Result<DaemonClient, TuiError> {
-    let mut client = connect(socket_path, ConnectIntent::Attach { session_id }).await?;
+    let client = connect(socket_path, ConnectIntent::Attach { session_id }).await?;
+    await_viewer_ack(client, session_id, "Attach").await
+}
+
+/// [`connect`] with [`ConnectIntent::Resume`]: attach to `session_id` and
+/// replay only the events after `after_seq`, typically a previous
+/// connection's [`DaemonClient::last_seq`] (Phase 8 Task 21). Waits for the
+/// daemon's `Ack` like [`connect_attach`] does.
+///
+/// # Errors
+/// Everything [`connect_attach`] returns, plus `TuiError::Io`
+/// (`ErrorKind::InvalidInput`) if the daemon answers
+/// `ClientEvent::ResyncRequired`: `after_seq` is past the session's head, so
+/// the caller must discard its state and replay from the start (e.g. with
+/// [`connect_attach`]).
+pub async fn connect_resume(
+    socket_path: &Path,
+    session_id: SessionId,
+    after_seq: u64,
+) -> Result<DaemonClient, TuiError> {
+    let client = connect(
+        socket_path,
+        ConnectIntent::Resume {
+            session_id,
+            after_seq,
+        },
+    )
+    .await?;
+    let mut client = await_viewer_ack(client, session_id, "Resume").await?;
+    client.last_seq = Some(after_seq);
+    Ok(client)
+}
+
+/// The shared tail of [`connect_attach`]/[`connect_resume`]: the first frame
+/// back must be the daemon's `Ack`.
+async fn await_viewer_ack(
+    mut client: DaemonClient,
+    session_id: SessionId,
+    request: &str,
+) -> Result<DaemonClient, TuiError> {
     match client.recv().await? {
         Some(ClientEvent::Ack { .. }) => {
             client.session_id = Some(session_id);
             Ok(client)
         }
+        Some(ClientEvent::ResyncRequired { head, .. }) => Err(TuiError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "the daemon requires a resync: the resume cursor is past this session's \
+                     head ({head:?}); replay from the start"
+            ),
+        ))),
         Some(_) => Err(TuiError::Io(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
-            "expected an Ack confirming Attach, got a different frame",
+            format!("expected an Ack confirming {request}, got a different frame"),
         ))),
         None => Err(TuiError::Io(std::io::Error::new(
             std::io::ErrorKind::UnexpectedEof,
-            "daemon closed the connection instead of acknowledging Attach \
-             (the session may not exist)",
+            format!(
+                "daemon closed the connection instead of acknowledging {request} \
+                 (the session may not exist)"
+            ),
         ))),
     }
 }
@@ -263,15 +326,25 @@ impl DaemonClient {
         )
     }
 
+    /// The `seq` of the last `ClientEvent::Committed` this client has
+    /// returned from [`Self::recv`] — or, for a client built by
+    /// [`connect_resume`] that has not received one yet, the cursor it
+    /// resumed from. `None` before either. Hand it to [`connect_resume`] to
+    /// pick up exactly where this connection left off.
+    pub fn last_seq(&self) -> Option<u64> {
+        self.last_seq
+    }
+
     /// Sends `ClientRequest::CloseSession` for this client's own session,
     /// then waits for the daemon's `Ack` confirming the durable close,
     /// skipping any other frame that arrives first — the same "wait for the
     /// specific reply, not just any frame" shape [`connect_attach`] already
     /// uses for its own `Ack`. `Some(_) => continue` below discards every
-    /// non-`Ack` frame while waiting, which will matter once a parallel lane
-    /// starts publishing real deltas over this same connection — a task
-    /// delta arriving while a close is in flight is silently dropped by
-    /// this call, not buffered for a later `recv`.
+    /// non-`Ack` frame while waiting: the daemon streams every committed
+    /// event, including the close's own `SessionClosed`, ahead of the `Ack`
+    /// (Phase 8 Task 21), and this call drops them rather than buffering
+    /// them for a later `recv` (though [`Self::last_seq`] still advances
+    /// past them).
     ///
     /// # No wire NAK exists
     ///
@@ -436,7 +509,10 @@ impl DaemonClient {
         let line = String::from_utf8(buf).map_err(|err| {
             TuiError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, err))
         })?;
-        let event = serde_json::from_str(line.trim_end())?;
+        let event: ClientEvent = serde_json::from_str(line.trim_end())?;
+        if let ClientEvent::Committed { seq, .. } = &event {
+            self.last_seq = Some(*seq);
+        }
         Ok(Some(event))
     }
 }

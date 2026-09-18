@@ -10,8 +10,10 @@
 //! real, versioned client↔daemon wire types.
 
 use futures::StreamExt;
-use roundhouse_core::EventPayload;
-use roundhouse_proto::{ApiVersion, ClientEvent, ClientRequest};
+use roundhouse_core::{EventPayload, SessionId};
+use roundhouse_proto::{ApiVersion, ClientEvent, ClientRequest, TurnOutcome};
+use roundhouse_store::{PageSource, SessionFollower, StoreError, StorePool};
+use std::collections::VecDeque;
 use std::io::ErrorKind;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::Path;
@@ -25,18 +27,24 @@ use tokio_util::codec::{FramedRead, LinesCodec, LinesCodecError};
 
 use crate::session_bootstrap::{self, DaemonResources};
 use crate::session_manager::{spawn_session_reaper, ReapAction};
-use crate::session_registry::SessionRegistry;
+use crate::session_registry::{SessionRegistry, Subscription};
 
 /// How many in-flight `ClientRequest`s one connection's driver will buffer
 /// before applying backpressure to that connection's read side. Generous
 /// relative to the handshake-only traffic Task 2 exercised, small enough
 /// that a truly stuck consumer still bounds memory per connection.
 const REQUEST_CHANNEL_CAPACITY: usize = 64;
-/// Matches [`crate::session_registry`]'s per-subscriber depth — the
-/// handshake-created channel a connection's driver forwards into its own
-/// socket via [`serve_connection`] has no reason to buffer more than a
-/// subscriber channel already does.
+/// How many outgoing `ClientEvent`s one connection's driver may have queued
+/// for [`serve_connection`] to write. The follower that feeds it reads from
+/// the store, so a slow client costs this one bounded queue plus its own
+/// cursor, never a growing backlog.
 const EVENT_CHANNEL_CAPACITY: usize = 64;
+
+/// How many `TurnFinished { outcome: Rejected }` replies one connection may
+/// have queued while its client is not reading. Past this, a further refused
+/// `SubmitTurn` is logged and gets no reply: a client that floods refused
+/// requests without reading cannot grow this queue without bound.
+const MAX_PENDING_REJECTIONS: usize = 64;
 
 /// Maximum length, in bytes, of a single NDJSON line this daemon will accept
 /// on either direction of the wire before closing that one connection
@@ -65,8 +73,9 @@ const EVENT_CHANNEL_CAPACITY: usize = 64;
 const MAX_FRAME_BYTES: usize = 1024 * 1024;
 
 /// Maximum length, in bytes, of `ClientRequest::CreateSession`'s
-/// `workspace_name` (CF-14). `drive_session` echoes it straight back inside
-/// `SessionCreated`'s `SessionSpec.name`, so an unbounded `workspace_name`
+/// `workspace_name` (CF-14). The session's durable `SessionCreated`, streamed
+/// back as the handshake's first frame, echoes it inside its
+/// `SessionSpec.name`, so an unbounded `workspace_name`
 /// approaching [`MAX_FRAME_BYTES`] would produce a reply *larger* than that
 /// same cap — which the client's own equal cap
 /// (`roundhouse_tui::client::MAX_FRAME_BYTES`) then rejects. Self-inflicted
@@ -408,9 +417,10 @@ pub async fn serve(
 /// into), and `drive_session` stops draining `requests_rx` (which this
 /// function needs to send into) — both parked forever, inside one
 /// `tokio::join!`, with 64 slots on each side. The connection wedges
-/// permanently and never observes peer EOF; see `drive_session`'s doc
-/// comment for the registry-level consequence (a subscription that is never
-/// `detach`ed because `publish` sees `Full`, not `Closed`).
+/// permanently and never observes peer EOF; see
+/// `drive_established_session`'s doc comment for the registry-level
+/// consequence this had under the registry's old channel fan-out (a
+/// subscription that was never `detach`ed).
 ///
 /// The fix holds a parsed request in a `pending_request: Option<..>` slot
 /// instead of sending it immediately, and only *reserves* capacity —
@@ -865,8 +875,9 @@ pub async fn accept_loop(
 /// fix it) and threads `limits.handshake_timeout` into [`drive_session`] to
 /// bound that first read. `SessionRegistry`'s own `max_sessions` and
 /// `max_subscribers_per_session` caps close the remaining two gaps the
-/// review named (unbounded sessions, and `publish`'s per-subscriber clone
-/// being an unbounded amplifier).
+/// review named (unbounded sessions, and an unbounded per-event amplifier:
+/// then the registry's per-subscriber clone, since Phase 8 Task 21 one store
+/// follower per subscriber).
 ///
 /// # Errors
 /// Returns immediately if `expected_uid` is `Err` — this process's own uid
@@ -1029,31 +1040,30 @@ async fn handle_connection(
 }
 
 /// Reads this connection's first `ClientRequest` to decide whether it is
-/// creating a new session or attaching to an existing one (§7's handshake),
-/// registers it with `registry` accordingly, then hands off to
-/// [`drive_established_session`] for everything after — forwarding this
-/// session's events out to `events_tx` and routing `requests_rx` — until
-/// either side ends.
+/// creating a new session, attaching to an existing one, or resuming one from
+/// a cursor (§7's handshake), registers it with `registry` accordingly, then
+/// hands off to [`drive_established_session`] for everything after —
+/// streaming this session's committed events out to `events_tx` and routing
+/// `requests_rx` — until either side ends.
 ///
-/// The "no branch body ever blocks on `events_tx`" invariant this function's
-/// own doc comment used to carry in full now lives on
+/// The "no branch body ever blocks on `events_tx`" invariant lives on
 /// [`drive_established_session`], which is where that loop actually runs —
 /// see that function's own doc comment for the full mechanism and why it
-/// matters. This function's own body, below, needs no such invariant of its
-/// own: its one send, `events_tx.send(created).await`, runs exactly once,
-/// before any loop, and its failure path simply ends this function rather
-/// than racing anything.
+/// matters. This function's own body needs no such invariant: its sends (an
+/// `Ack`, or a terminal `ResyncRequired`) each run at most once, before any
+/// loop, and a failed send simply ends this function rather than racing
+/// anything.
 ///
-/// # Handshake framing (ruling W1-R6)
+/// # Handshake framing (Phase 8 Task 21)
 ///
-/// `roundhouse-proto` has no `ClientEvent::SessionCreated` variant to answer
-/// a `CreateSession` request with (adding one would be an edit to a frozen
-/// Phase 0 crate outside this lane). Instead, on `CreateSession`, this
-/// function's first outgoing frame is a
-/// `ClientEvent::TaskEvent { session_id, task_id: None, payload:
-/// EventPayload::SessionCreated { spec } }` — a variant that already exists
-/// for exactly this purpose — and `roundhouse_tui::connect_create` reads the
-/// minted `session_id` off of it.
+/// `CreateSession` gets no made-up reply. `create_real_session` durably
+/// appends the session's `SessionCreated` as its seq 0
+/// (`SessionCreatedRecord::Append`), and the connection's follower streams it
+/// like any other event, as `ClientEvent::Committed { seq: 0, .. }`:
+/// `roundhouse_tui::connect_create` reads the minted `session_id` off that
+/// frame. `Attach` and `Resume` are answered with an `Ack` (or, for a `Resume`
+/// cursor past the session's head, a terminal `ResyncRequired`) — see
+/// [`establish_viewer`].
 ///
 /// # Handshake timeout (security review Important 3 / ruling W1-R33)
 ///
@@ -1107,11 +1117,12 @@ pub async fn drive_session(
     // its post-handshake requests honored — see the `Some(_request)` arm,
     // below, for the full rationale and the documented limitation this
     // implies for `Attach`.
-    let (session_id, subscription, session_events, is_creator) = match first_request {
+    let (session_id, link, follow_after, is_creator) = match first_request {
         ClientRequest::CreateSession { workspace_name } => {
             // CF-14: bound at the protocol boundary, not by making the
-            // client's own frame cap bigger. `SessionCreated`, below, echoes
-            // `workspace_name` straight back — an unbounded value here could
+            // client's own frame cap bigger. The session's durable
+            // `SessionCreated` (its seq 0, the first frame this connection
+            // streams) echoes `workspace_name` straight back — an unbounded value here could
             // produce a reply larger than [`MAX_FRAME_BYTES`], which the
             // client's OWN equal cap (`roundhouse_tui::client::MAX_FRAME_BYTES`)
             // would then reject. Self-inflicted and harmless at any
@@ -1244,12 +1255,11 @@ pub async fn drive_session(
                     return;
                 }
             };
-            let spec = real_session.actor.session_spec().clone();
             // Cloned BEFORE the actor/mcp_host move into `registry.create`
             // below, so both the "lost the `is_full` race" teardown path
             // AND the reaper spawned after a successful `create` have their
             // own independent copies of exactly what they each need,
-            // regardless of what `registry`/`session_events` do with theirs.
+            // regardless of what `registry` does with its own.
             let actor_for_reaper = real_session.actor.clone();
             let mcp_host_for_reaper = real_session.mcp_host.clone();
             // Ruling W1-R119: `SessionMcp` is `Clone` over one
@@ -1259,7 +1269,7 @@ pub async fn drive_session(
             let mcp_for_teardown = real_session.mcp.clone();
             let proxy_token_for_reaper = real_session.proxy_handle.token().to_string();
 
-            let Some((session_id, subscription, session_events)) =
+            let Some((session_id, subscription)) =
                 registry.create(real_session.actor, real_session.mcp_host, real_session.mcp)
             else {
                 // At `max_sessions` (security review Important 3 / ruling
@@ -1334,26 +1344,10 @@ pub async fn drive_session(
                 // comment, where a caller-held handle is a second route).
                 Arc::new(AtomicBool::new(false)),
             );
-            let created = ClientEvent::TaskEvent {
-                session_id,
-                task_id: None,
-                payload: Box::new(EventPayload::SessionCreated {
-                    spec: Box::new(spec),
-                }),
-            };
-            if events_tx.send(created).await.is_err() {
-                // `serve_connection` already gave up on this connection
-                // (e.g. the peer disconnected mid-handshake) — tear the
-                // just-created subscriber registration back down rather
-                // than leak it. The actor itself is NOT torn down (see the
-                // module doc comment, "Entry lifetime = actor lifetime") —
-                // it stays registered, attachable by session id, exactly as
-                // if this connection had detached normally after a
-                // successful handshake.
-                registry.detach(session_id, &subscription);
-                return;
-            }
-            (session_id, subscription, session_events, true)
+            // No reply frame here: the follower in
+            // `drive_established_session` streams this session's durable
+            // `SessionCreated` (seq 0) as its first frame.
+            (session_id, SessionLink::Live(subscription), None, true)
         }
         // # Attach is authenticated, not authorized (security review
         // Important 5 / ruling W1-R35 — escalated to the operator, not a
@@ -1363,42 +1357,40 @@ pub async fn drive_session(
         // `registry.attach(session_id)` is a bare, unauthenticated
         // map lookup: any local peer that learns a `SessionId` (a UUIDv4, so
         // not enumerable, but not secret either — `main.rs` logs it, and the
-        // unredacted event stream that follows is not access-controlled
-        // beyond that) can attach to it. That is bounded by `is_creator`
-        // below: an attached connection's post-handshake requests are
-        // always refused, so an attacker who merely learns a `SessionId`
-        // can watch, never act.
-        ClientRequest::Attach { session_id } => match registry.attach(session_id) {
-            Some((subscription, session_events)) => {
-                // `roundhouse_tui::connect_attach` waits for this `Ack`
-                // before returning to its caller, specifically so a test (or
-                // any other caller) that publishes an event immediately
-                // after `connect_attach` resolves cannot race
-                // `SessionRegistry::attach`'s own registration — without
-                // this, `publish` could run before this branch's
-                // `registry.attach` call above, and the event would be
-                // fanned out to nobody.
-                if events_tx
-                    .send(ClientEvent::Ack {
-                        api_version: ApiVersion::CURRENT,
-                    })
-                    .await
-                    .is_err()
-                {
-                    registry.detach(session_id, &subscription);
-                    return;
-                }
-                (session_id, subscription, session_events, false)
+        // event stream that follows is not access-controlled beyond that)
+        // can attach to it. Since Phase 8 Task 21 that includes a closed or
+        // reaped session's stored log, which `establish_viewer` replays from
+        // the store; the stream is the stored rows, already redacted by the
+        // session's writer, and the socket is still uid-checked
+        // (`accept_loop_with`). That is bounded by `is_creator` below: an
+        // attached connection's post-handshake requests are always refused,
+        // so an attacker who merely learns a `SessionId` can watch, never
+        // act.
+        ClientRequest::Attach { session_id } => {
+            match establish_viewer(session_id, None, &registry, &resources, &events_tx).await {
+                Some(link) => (session_id, link, None, false),
+                None => return,
             }
-            // Unknown/no-longer-live session, or already at
-            // `max_subscribers_per_session` (security review Important 3 /
-            // ruling W1-R33) — `ClientRequest` has no error-response variant
-            // to report either over the wire with; the most honest thing
-            // this connection can do is end, the same as `SessionRegistry::
-            // attach`'s doc comment already documents for the first two
-            // cases.
-            None => return,
-        },
+        }
+        // Phase 8 Task 21: the same read-only viewer as `Attach`, starting just
+        // after the client's cursor instead of at seq 0.
+        ClientRequest::Resume {
+            session_id,
+            after_seq,
+        } => {
+            match establish_viewer(
+                session_id,
+                Some(after_seq),
+                &registry,
+                &resources,
+                &events_tx,
+            )
+            .await
+            {
+                Some(link) => (session_id, link, Some(after_seq), false),
+                None => return,
+            }
+        }
         // `ClientRequest` is `#[non_exhaustive]`; any future variant is not a
         // valid *first* line for this handshake.
         _ => return,
@@ -1406,8 +1398,8 @@ pub async fn drive_session(
 
     drive_established_session(
         session_id,
-        subscription,
-        session_events,
+        link,
+        follow_after,
         is_creator,
         requests_rx,
         events_tx,
@@ -1417,10 +1409,149 @@ pub async fn drive_session(
     .await;
 }
 
-/// The post-handshake half of [`drive_session`]: forwards `session_events`
-/// out to `events_tx` and routes `requests_rx` — the real `SubmitTurn`/
+/// How one established connection is tied to its session (Phase 8 Task 21).
+///
+/// `pub` for the same reason [`drive_established_session`] is: this crate's
+/// integration tests call that function directly with a session they
+/// registered themselves.
+pub enum SessionLink {
+    /// The session has a live registry entry, and this connection holds one
+    /// of its subscriber slots, given back when the connection ends.
+    Live(Subscription),
+    /// No live registry entry: the session was closed and reaped, or predates
+    /// a daemon restart, but its log is still in the store. The connection is
+    /// a read-only replay that ends once it has delivered `SessionClosed` or
+    /// reached `head`, the session's head when the handshake read it.
+    Stored { head: u64 },
+}
+
+impl SessionLink {
+    /// Gives this connection's subscriber slot back, if it holds one.
+    fn release(&self, registry: &SessionRegistry, session_id: SessionId) {
+        if let SessionLink::Live(subscription) = self {
+            registry.detach(session_id, subscription);
+        }
+    }
+}
+
+/// The `Attach`/`Resume` handshake (Phase 8 Task 21): decides whether this
+/// viewer follows a live session or replays a stored one, checks a `Resume`
+/// cursor against the session's head, and answers with `Ack` or a terminal
+/// `ResyncRequired`. Returns `None` when the connection must end.
+///
+/// A live registry entry takes a subscriber slot. With no live entry, the
+/// store decides: a session that has committed events is replayed read-only
+/// (the controller's ruling for #40 — a client must be able to resume a
+/// session after it was closed and reaped); one with no events at all is
+/// unknown to both and closes the connection with no reply, as `Attach`
+/// always has. A live session already at `max_subscribers_per_session` also
+/// closes with no reply rather than falling back to the store.
+///
+/// A `Resume` whose `after_seq` is past the head (or names a session with no
+/// events yet) gets `ResyncRequired { head }` and ends: the client's cursor
+/// belongs to some other history, so it must discard its state and replay
+/// from the start. `SessionFollower` does not check this itself.
+async fn establish_viewer(
+    session_id: SessionId,
+    resume_after: Option<u64>,
+    registry: &SessionRegistry,
+    resources: &DaemonResources,
+    events_tx: &mpsc::Sender<ClientEvent>,
+) -> Option<SessionLink> {
+    let subscription = registry.attach(session_id);
+    if subscription.is_none() && registry.actor(session_id).is_some() {
+        tracing::warn!(
+            %session_id,
+            "closing connection: this session is at max_subscribers_per_session"
+        );
+        return None;
+    }
+    let head = match resources.store.head(session_id).await {
+        Ok(head) => head,
+        Err(err) => {
+            tracing::error!(
+                %session_id,
+                error = %err,
+                "closing connection: could not read this session's head from the store"
+            );
+            if let Some(subscription) = &subscription {
+                registry.detach(session_id, subscription);
+            }
+            return None;
+        }
+    };
+    let link = match (subscription, head) {
+        (Some(subscription), _) => SessionLink::Live(subscription),
+        (None, Some(head)) => SessionLink::Stored { head },
+        // Neither live nor stored: nothing to attach to.
+        (None, None) => return None,
+    };
+
+    if let Some(after_seq) = resume_after {
+        if head.is_none_or(|head| after_seq > head) {
+            let _ = events_tx
+                .send(ClientEvent::ResyncRequired { session_id, head })
+                .await;
+            link.release(registry, session_id);
+            return None;
+        }
+    }
+
+    // `roundhouse_tui::connect_attach`/`connect_resume` wait for this `Ack`
+    // before returning to their callers, so a caller knows the handshake
+    // succeeded before it reads any `Committed` frame.
+    if events_tx
+        .send(ClientEvent::Ack {
+            api_version: ApiVersion::CURRENT,
+        })
+        .await
+        .is_err()
+    {
+        link.release(registry, session_id);
+        return None;
+    }
+    Some(link)
+}
+
+/// What the task running one `SubmitTurn` reports back to its connection:
+/// the outcome, and the session's head read right after the outcome was
+/// decided — `TurnFinished::through_seq`.
+struct TurnReport {
+    outcome: TurnOutcome,
+    through_seq: Result<Option<u64>, StoreError>,
+}
+
+/// The post-handshake half of [`drive_session`]: streams this session's
+/// committed events out to `events_tx` from a store-backed
+/// [`SessionFollower`] and routes `requests_rx` — the real `SubmitTurn`/
 /// `CloseSession` handlers, once the handshake above has already decided
-/// `session_id`/`is_creator` — until either side ends, then detaches.
+/// `session_id`/`is_creator` — until either side ends, then releases `link`.
+///
+/// # Store-backed streaming (Phase 8 Task 21)
+///
+/// Every `Committed` frame this loop sends is a row the store already holds,
+/// read by this connection's own follower starting just after
+/// `follow_after` (`None` = from seq 0). Nothing is published from memory, so
+/// a frame is always the stored, redacted payload with its real `seq`, and a
+/// client that reconnects with `Resume` from the last seq it saw gets exactly
+/// the rest, with no gap and no duplicate. Each connection reads at its own
+/// pace: a client that stops reading stalls only its own follower.
+///
+/// A connection ends after it has delivered `SessionClosed` — for the
+/// creator, once its own turn's `TurnFinished` and its own `CloseSession`'s
+/// `Ack` have followed — and a [`SessionLink::Stored`] replay also ends once
+/// it reaches the head it was opened at. A follower error ends the connection
+/// with a `tracing::error!`.
+///
+/// # `TurnFinished` ordering
+///
+/// A turn's `TurnFinished` carries `through_seq`, the session's head read
+/// right after the turn's outcome was decided. It is held in
+/// `pending_turn_finished` and sent only once the follower's cursor has
+/// reached `through_seq` and no event is parked in `pending_event`, so every
+/// event the turn committed has already gone out on this connection. A
+/// refused `SubmitTurn` gets `TurnFinished { outcome: Rejected, through_seq:
+/// None }` straight away: it committed nothing.
 ///
 /// # No branch body ever blocks on `events_tx` (rulings W1-R31/W1-R32/W1-R38)
 ///
@@ -1446,10 +1577,11 @@ pub async fn drive_session(
 /// draining `requests_rx` (which `serve_connection` needs to send into), and
 /// `serve_connection` stops draining `events_in` (which this function needs
 /// to send into). The connection wedges permanently and never observes peer
-/// EOF — and the sharp registry-level consequence is that this
-/// subscription's `detach` (below) never runs, while `publish` sees the
-/// subscriber channel as `Full`, not `Closed`, so it is never pruned either:
-/// a zombie registry entry that `attach` keeps succeeding against.
+/// EOF — and the sharp registry-level consequence, under the per-subscriber
+/// channel fan-out this registry used before Phase 8 Task 21, was that this
+/// subscription's `detach` (below) never ran, while the registry's fan-out saw
+/// the subscriber channel as `Full`, not `Closed`, so it was never pruned
+/// either: a zombie registry entry that `attach` kept succeeding against.
 ///
 /// The fix (mirroring [`serve_connection`]'s own, symmetric fix) holds a
 /// received session event in a `pending_event: Option<..>` slot and only
@@ -1458,12 +1590,18 @@ pub async fn drive_session(
 /// than blocking on `send()` in a body. `requests_rx.recv()` stays a live,
 /// unconditional arm the entire time, so `serve_connection`'s
 /// `requests_out.send(..)` (a `reserve()`+permit pair, post-fix) can always
-/// make progress. The naive alternative — reserve, then `.await`
-/// `session_events.recv()` inside that same arm's body — merely relocates
+/// make progress. The naive alternative — reserve, then `.await` the next
+/// event (`follower.next()`) inside that same arm's body — merely relocates
 /// the bug: it starves `requests_rx` draining the moment the session goes
 /// idle with `events_tx` capacity available, since the permit is grabbed
 /// speculatively before there is anything to send (see this crate's
 /// `drive_session_keeps_draining_requests_while_the_session_is_idle` test).
+///
+/// The follower's `next()` is itself a `select!` arm, enabled only while
+/// `pending_event` is empty. That is sound only because
+/// `SessionFollower::next` is cancel-safe: whenever another arm wins, the
+/// dropped `next()` future has neither lost an event nor advanced the cursor
+/// past one it did not return.
 ///
 /// **This is a property of the loop's shape, not a one-time patch**
 /// (ruling W1-R38). `SubmitTurn` and `CloseSession`, below, are today's two
@@ -1492,28 +1630,47 @@ pub async fn drive_session(
 /// `CloseSession`'s) trusts it completely, so an in-crate caller besides
 /// that handshake must never pass `true` here as a convenience.
 pub async fn drive_established_session(
-    session_id: roundhouse_core::SessionId,
-    subscription: crate::session_registry::Subscription,
-    mut session_events: mpsc::Receiver<ClientEvent>,
+    session_id: SessionId,
+    link: SessionLink,
+    follow_after: Option<u64>,
     is_creator: bool,
     mut requests_rx: mpsc::Receiver<ClientRequest>,
     events_tx: mpsc::Sender<ClientEvent>,
     registry: Arc<SessionRegistry>,
     resources: Arc<DaemonResources>,
 ) {
+    let mut follower: SessionFollower<StorePool> = SessionFollower::new(
+        resources.store.clone(),
+        resources.store.commit_feed(),
+        session_id,
+        follow_after,
+    );
+    // `Some` only for a replay of a session with no live registry entry: the
+    // connection ends once the follower's cursor reaches it.
+    let replay_until = match &link {
+        SessionLink::Stored { head } => Some(*head),
+        SessionLink::Live(_) => None,
+    };
     let mut pending_event: Option<ClientEvent> = None;
+    // Set when the follower hands back this session's `SessionClosed`. Nothing
+    // can commit after it, so the follower arm is disabled from then on, and
+    // the connection ends once that frame and anything this connection still
+    // owes (a `TurnFinished`, a `CloseSession` `Ack`) are delivered.
+    let mut session_closed_seen = false;
     // Phase 7, Task 8 — the W1-R38-compliant shape for the `SubmitTurn`
     // handler below. At most ONE turn may be in flight per connection: the
     // handler `tokio::spawn`s the turn and returns immediately, and the
-    // spawned task signals completion on this 1-slot channel, which is
+    // spawned task reports its outcome on this 1-slot channel, which is
     // polled as its own `select!` ARM (never awaited in a branch body).
     //
     // This is the same "reserve capacity as an arm" shape `events_tx`
     // already uses, applied to the other direction. It is what keeps
-    // `session_events.recv()` and `requests_rx.recv()` continuously
-    // pollable while a turn — which awaits a real `SessionActor`, a real
-    // provider round-trip, and real tool execution, i.e. exactly the
-    // "can block indefinitely" the invariant names — is running.
+    // `follower.next()` and `requests_rx.recv()` continuously pollable while
+    // a turn — which awaits a real `SessionActor`, a real provider
+    // round-trip, and real tool execution, i.e. exactly the "can block
+    // indefinitely" the invariant names — is running. The report's
+    // `session_head` read also happens in the spawned task, for the same
+    // reason: a store read waits on a pool connection.
     //
     // The completion channel can never block the spawned task
     // indefinitely either: capacity 1, at most one in-flight turn, so its
@@ -1522,8 +1679,16 @@ pub async fn drive_established_session(
     // ignores, deliberately: the session outlives the connection
     // (ruling W1-R51), so a turn is never cancelled just because the
     // client that submitted it went away.
-    let (turn_done_tx, mut turn_done_rx) = mpsc::channel::<()>(1);
+    let (turn_done_tx, mut turn_done_rx) = mpsc::channel::<TurnReport>(1);
     let mut turn_in_flight = false;
+    // The finished turn's `TurnFinished` frame and its `through_seq`, held
+    // until the follower's cursor reaches `through_seq` — see this
+    // function's own doc comment, "`TurnFinished` ordering".
+    let mut pending_turn_finished: Option<(ClientEvent, Option<u64>)> = None;
+    // `TurnFinished { outcome: Rejected }` replies for refused `SubmitTurn`s,
+    // bounded by `MAX_PENDING_REJECTIONS`. Not ordered against `Committed`
+    // frames: a rejected turn committed nothing.
+    let mut pending_rejections: VecDeque<ClientEvent> = VecDeque::new();
     // Phase 8, T19a Task 8 — the identical shape, applied to `CloseSession`:
     // at most one close in flight per connection, run in its own spawned
     // task (never awaited inline — `SessionActor::close` awaits a real
@@ -1541,17 +1706,66 @@ pub async fn drive_established_session(
     // `close_ack_pending` is a second stage past that: once the spawned
     // close reports success, the `Ack` itself still has to wait for
     // `events_tx` capacity via the same `reserve()`-as-an-arm shape
-    // `pending_event` already uses below, rather than being sent inline.
+    // `pending_event` already uses below, rather than being sent inline —
+    // and, since Phase 8 Task 21, for this connection to have delivered the
+    // `SessionClosed` the close committed, so the `Ack` is the connection's
+    // last frame.
     let mut close_task: Option<tokio::task::JoinHandle<bool>> = None;
     let mut close_ack_pending = false;
     loop {
+        // Every guard below is computed up front, before `select!` borrows
+        // `follower` mutably for its `next()` arm.
+        let nothing_parked = pending_event.is_none();
+        let turn_settled = !turn_in_flight && pending_turn_finished.is_none();
+        if nothing_parked {
+            if replay_until.is_some_and(|head| follower.cursor() >= Some(head)) {
+                break;
+            }
+            if session_closed_seen && turn_settled && close_task.is_none() && !close_ack_pending {
+                break;
+            }
+        }
+        let turn_finished_ready = nothing_parked
+            && pending_turn_finished
+                .as_ref()
+                .is_some_and(|(_, through_seq)| follower.cursor() >= *through_seq);
+        let ack_ready = close_ack_pending && nothing_parked && session_closed_seen && turn_settled;
+        let follow = nothing_parked && !session_closed_seen;
+        let reject_ready = !pending_rejections.is_empty();
+
         tokio::select! {
-            _ = turn_done_rx.recv(), if turn_in_flight => {
+            report = turn_done_rx.recv(), if turn_in_flight => {
                 // `turn_done_tx` is held by this stack frame for the whole
-                // loop, so `recv()` only ever resolves here because a
-                // spawned turn actually finished — never because every
-                // sender was dropped.
+                // loop, so `recv()` only ever resolves `Some` here, because a
+                // spawned turn actually finished.
                 turn_in_flight = false;
+                let Some(TurnReport { outcome, through_seq }) = report else {
+                    continue;
+                };
+                match through_seq {
+                    Ok(through_seq) => {
+                        pending_turn_finished = Some((
+                            ClientEvent::TurnFinished {
+                                session_id,
+                                outcome,
+                                through_seq,
+                            },
+                            through_seq,
+                        ));
+                    }
+                    Err(err) => {
+                        // Without the head there is no honest `through_seq`
+                        // to promise, and sending `TurnFinished` early would
+                        // break its ordering guarantee.
+                        tracing::error!(
+                            %session_id,
+                            error = %err,
+                            "closing connection: could not read the session head after a \
+                             submitted turn finished"
+                        );
+                        break;
+                    }
+                }
             }
             // Wrapped in a lazy `async {}` block, NOT `close_task.as_mut()
             // .unwrap()` inlined directly as the branch expression: contrary
@@ -1599,20 +1813,18 @@ pub async fn drive_established_session(
                     }
                 }
             }
-            // `&& pending_event.is_none()`: both this arm and the
-            // ordinary-event permit arm below reserve capacity on the SAME
+            // `ack_ready` requires `pending_event.is_none()`: both this arm
+            // and the event permit arm below reserve capacity on the SAME
             // `events_tx`, and `tokio::select!` picks pseudo-randomly among
-            // whichever arms are ready — without this guard, an event
-            // already dequeued out of `session_events` into `pending_event`
-            // could lose that race to a ready `Ack`, and the `break` below
-            // would then drop it on the floor permanently, with the client
-            // seeing the `Ack` ahead of an event it was already due. The
-            // guard only protects an event that has ALREADY been taken out
-            // of `session_events` — anything still queued inside that
-            // channel when this arm's `break` fires is not, and cannot be,
-            // covered here; that queue belongs to whatever publishes into
-            // it, not to this connection's own ordering.
-            permit = events_tx.reserve(), if close_ack_pending && pending_event.is_none() => {
+            // whichever arms are ready — without that, an event already
+            // taken from the follower into `pending_event` could lose that
+            // race to a ready `Ack`, and the `break` below would then drop
+            // it on the floor permanently, with the client seeing the `Ack`
+            // ahead of an event it was already due. It also requires
+            // `session_closed_seen` (the close's own `SessionClosed` has been
+            // delivered, since nothing is parked) and a settled turn, so the
+            // `Ack` is the last frame this connection sends.
+            permit = events_tx.reserve(), if ack_ready => {
                 match permit {
                     Ok(permit) => {
                         permit.send(ClientEvent::Ack { api_version: ApiVersion::CURRENT });
@@ -1626,26 +1838,30 @@ pub async fn drive_established_session(
                     Err(_) => break,
                 }
             }
-            maybe_event = session_events.recv(), if pending_event.is_none() => {
-                match maybe_event {
-                    Some(event) => {
-                        pending_event = Some(event);
+            // Cancel-safe (see `SessionFollower::next`), which is what makes
+            // it sound as a `select!` arm: losing the race to another arm
+            // drops this future without losing or skipping an event.
+            stored = follower.next(), if follow => {
+                match stored {
+                    Ok(event) => {
+                        if matches!(event.payload, EventPayload::SessionClosed { .. }) {
+                            session_closed_seen = true;
+                        }
+                        pending_event = Some(ClientEvent::Committed {
+                            session_id,
+                            seq: event.seq,
+                            task_id: event.task_id,
+                            payload: Box::new(event.payload),
+                        });
                     }
-                    // Every `Sender` for this subscription is either the one
-                    // `registry` stores in this session's subscriber list
-                    // (removed only by *this* function's own `detach` call
-                    // below, which does not run until this loop returns) or
-                    // the one wrapped in `subscription`, held by this very
-                    // stack frame and not dropped until this function
-                    // returns. Nothing else ever touches either clone while
-                    // this loop runs, so `None` here is unreachable for the
-                    // loop's whole lifetime — not, as an earlier version of
-                    // this comment claimed, because `registry` would need to
-                    // be dropped entirely (`drive_session` holds an
-                    // `Arc<SessionRegistry>` for its whole lifetime, so that
-                    // can never happen either — true, but not the operative
-                    // reason).
-                    None => break,
+                    Err(err) => {
+                        tracing::error!(
+                            %session_id,
+                            error = %err,
+                            "closing connection: this session's store follower failed"
+                        );
+                        break;
+                    }
                 }
             }
             permit = events_tx.reserve(), if pending_event.is_some() => {
@@ -1657,6 +1873,28 @@ pub async fn drive_established_session(
                         permit.send(event);
                     }
                     // `serve_connection` already gave up on this connection.
+                    Err(_) => break,
+                }
+            }
+            permit = events_tx.reserve(), if turn_finished_ready => {
+                match permit {
+                    Ok(permit) => {
+                        let (event, _) = pending_turn_finished.take().expect(
+                            "select! arm guarded by pending_turn_finished.is_some()"
+                        );
+                        permit.send(event);
+                    }
+                    Err(_) => break,
+                }
+            }
+            permit = events_tx.reserve(), if reject_ready => {
+                match permit {
+                    Ok(permit) => {
+                        let event = pending_rejections.pop_front().expect(
+                            "select! arm guarded by !pending_rejections.is_empty()"
+                        );
+                        permit.send(event);
+                    }
                     Err(_) => break,
                 }
             }
@@ -1705,7 +1943,7 @@ pub async fn drive_established_session(
                     // capacity — never await it inside this arm's own body —
                     // for the identical reason `events_tx`/`requests_out`
                     // already aren't: doing so would stop this arm from
-                    // polling `session_events.recv()` for as long as the
+                    // polling `follower.next()` for as long as the
                     // await is pending, recreating the exact circular wait
                     // W1-R31 fixed. See this function's own doc comment
                     // ("No branch body ever blocks on `events_tx`") for the
@@ -1713,13 +1951,13 @@ pub async fn drive_established_session(
                     //
                     // Phase 7, Task 8 (ruling W1-R116): `SubmitTurn`, the
                     // first real handler here. Every refusal below is a
-                    // `warn!` + a dropped frame with the connection kept
-                    // alive: `ClientRequest`/`ClientEvent` still carry no
-                    // error-response variant (the same constraint ruling
-                    // W1-R6 already accepted for "unknown session" and a
-                    // failed construction), so there is nothing honest to
-                    // send back.
+                    // `warn!` with the connection kept alive, and — since
+                    // Phase 8 Task 21 — a `TurnFinished { outcome: Rejected
+                    // }` reply naming why, queued in `pending_rejections`.
+                    // The reason is a fixed code, never client- or
+                    // session-derived text.
                     Some(ClientRequest::SubmitTurn { session_id: named, text }) => {
+                        let mut rejected: Option<&'static str> = None;
                         if !is_creator {
                             // W1-R37, enforced here rather than assumed.
                             // An `Attach`ed connection is READ-ONLY: it may
@@ -1732,6 +1970,7 @@ pub async fn drive_established_session(
                                 "refusing SubmitTurn from an attached (non-creating) connection: \
                                  attached connections are read-only"
                             );
+                            rejected = Some("read_only_connection");
                         } else if named != session_id {
                             // This connection established exactly one
                             // session; a frame naming a different one is
@@ -1744,6 +1983,7 @@ pub async fn drive_established_session(
                                 "refusing SubmitTurn naming a session other than the one this \
                                  connection established"
                             );
+                            rejected = Some("wrong_session");
                         } else if text.len() > MAX_SUBMIT_TURN_TEXT_BYTES {
                             tracing::warn!(
                                 %session_id,
@@ -1751,6 +1991,7 @@ pub async fn drive_established_session(
                                 max = MAX_SUBMIT_TURN_TEXT_BYTES,
                                 "refusing SubmitTurn: text exceeds the maximum length"
                             );
+                            rejected = Some("text_too_long");
                         } else if turn_in_flight {
                             // One turn per connection at a time. Refusing
                             // (rather than queueing) keeps the spawn
@@ -1761,7 +2002,8 @@ pub async fn drive_established_session(
                                 "refusing SubmitTurn: a turn is already in flight on this \
                                  connection"
                             );
-                        } else if close_task.is_some() || close_ack_pending {
+                            rejected = Some("turn_in_flight");
+                        } else if close_task.is_some() || close_ack_pending || session_closed_seen {
                             // A `CloseSession` this connection already
                             // spawned samples its outcome
                             // (`Completed`/`Cancelled`) from `turn_in_flight`/
@@ -1780,12 +2022,15 @@ pub async fn drive_established_session(
                             // its Ack has actually been reserved and sent
                             // (`close_ack_pending`) — this connection is
                             // already committed to ending during that
-                            // window too.
+                            // window too. `session_closed_seen` covers a
+                            // session closed by anyone else: its terminator
+                            // is already durable, so nothing more can run.
                             tracing::warn!(
                                 %session_id,
                                 "refusing SubmitTurn: a CloseSession is already in flight on \
-                                 this connection"
+                                 this connection, or the session has closed"
                             );
+                            rejected = Some("session_closing");
                         } else {
                             match registry.actor(session_id) {
                                 Some(actor) => {
@@ -1806,11 +2051,23 @@ pub async fn drive_established_session(
                                     // this session configured no MCP servers.
                                     let mcp = registry.session_mcp(session_id);
                                     tokio::spawn(async move {
-                                        run_submitted_turn(actor, mcp, resources, text).await;
+                                        let outcome = run_submitted_turn(
+                                            actor,
+                                            mcp,
+                                            resources.clone(),
+                                            text,
+                                        )
+                                        .await;
+                                        // Read AFTER the outcome is decided:
+                                        // every event the turn committed is at
+                                        // or below this head.
+                                        let through_seq = resources.store.head(session_id).await;
                                         // Failure means this connection
                                         // already ended — see
                                         // `turn_done_tx`'s declaration.
-                                        let _ = done.send(()).await;
+                                        let _ = done
+                                            .send(TurnReport { outcome, through_seq })
+                                            .await;
                                     });
                                 }
                                 None => {
@@ -1821,8 +2078,12 @@ pub async fn drive_established_session(
                                         %session_id,
                                         "refusing SubmitTurn: this session is no longer live"
                                     );
+                                    rejected = Some("session_not_live");
                                 }
                             }
+                        }
+                        if let Some(reason) = rejected {
+                            queue_rejection(&mut pending_rejections, session_id, reason);
                         }
                     }
                     // Phase 8, T19a Task 8: `CloseSession` — a client-
@@ -2001,7 +2262,29 @@ pub async fn drive_established_session(
         }
     }
 
-    registry.detach(session_id, &subscription);
+    link.release(&registry, session_id);
+}
+
+/// Queues one `TurnFinished { outcome: Rejected }` reply, unless
+/// [`MAX_PENDING_REJECTIONS`] are already waiting on a client that is not
+/// reading — then the refusal is only logged.
+fn queue_rejection(pending: &mut VecDeque<ClientEvent>, session_id: SessionId, reason: &str) {
+    if pending.len() >= MAX_PENDING_REJECTIONS {
+        tracing::warn!(
+            %session_id,
+            reason,
+            "not replying to a refused SubmitTurn: too many rejections are already queued \
+             for a client that is not reading"
+        );
+        return;
+    }
+    pending.push_back(ClientEvent::TurnFinished {
+        session_id,
+        outcome: TurnOutcome::Rejected {
+            reason: reason.to_string(),
+        },
+        through_seq: None,
+    });
 }
 
 /// Runs one wire-submitted user turn through the real agent loop
@@ -2014,7 +2297,7 @@ pub async fn drive_established_session(
 /// `run_agent_loop` awaits a provider round-trip, `SessionActor::admit_task`
 /// takes the actor's own locks, and a dispatched `shell` call runs a real
 /// subprocess. Awaiting any of that inside the connection loop would stop it
-/// polling `session_events.recv()`, recreating the exact circular wait
+/// polling `follower.next()`, recreating the exact circular wait
 /// ruling W1-R31 fixed, one layer up.
 ///
 /// `mcp` is this session's real [`SessionMcp`], read from the registry
@@ -2024,23 +2307,19 @@ pub async fn drive_established_session(
 /// the model, so every MCP tool call a model made hit `run_agent_loop`'s
 /// honest "no MCP servers are configured for this session" refusal.
 ///
-/// # Known gaps this function does not close, stated rather than papered over
+/// # What reaches the client (Phase 8 Task 21)
 ///
-/// - **Nothing this turn produces reaches the client over the wire.**
-///   `SessionRegistry::publish` has no producer (documented in that
-///   function and in `roundhouse-web`'s own doc comments as of Task 9) —
-///   the turn's events are durably appended to the session's event log by
-///   the loop itself, which is where a caller must read them from today.
-/// - **The turn's outcome is logged, not reported to the client.**
-///   `ClientEvent` has no error variant (ruling W1-R6's constraint), so a
-///   failed turn is an operator-visible `tracing` event and a real
-///   `TaskFailed` in the append-only log, not a wire frame.
+/// The turn's events reach the client the way every event does: the loop
+/// appends them to the session's log, and the connection's follower streams
+/// the committed rows. This function's return value is the turn's outcome,
+/// which `drive_established_session` sends as `TurnFinished` once those
+/// events are out — see [`turn_outcome`] for how each error maps.
 async fn run_submitted_turn(
     actor: Arc<roundhouse_engine::SessionActor>,
     mcp: Option<roundhouse_engine::mcp_spawner::SessionMcp>,
     resources: Arc<DaemonResources>,
     text: String,
-) {
+) -> TurnOutcome {
     let session_id = actor.session_id();
     // §6.8: this is the one real "a human turn starts" point (as distinct
     // from `chat.rs`'s `run_chat_turn`, which mints its own `Origin::User`
@@ -2079,7 +2358,7 @@ async fn run_submitted_turn(
     )
     .await;
 
-    match result {
+    match &result {
         Ok(blocks) => {
             tracing::info!(
                 %session_id,
@@ -2087,12 +2366,52 @@ async fn run_submitted_turn(
                 "submitted turn completed"
             );
         }
-        // Never includes the error's `Display` in anything sent to a
-        // client — it can carry provider-side detail, and there is no wire
-        // variant to send it on regardless.
         Err(err) => {
             tracing::error!(%session_id, error = %err, "submitted turn failed");
         }
+    }
+    turn_outcome(result, actor.writer())
+}
+
+/// Maps one submitted turn's result to the `TurnOutcome` its client is sent.
+///
+/// A `Failed` outcome's `message` is the error's `Display` after the
+/// session's own writer redactor has run over it (`EventWriter::
+/// redact_outbound`, the same redactor every stored row passes through).
+/// `AgentLoopError`'s `Display` is not sanitized on its own: a provider
+/// `Transport`/`BadRequest` error carries upstream text, and a `StoreError`
+/// carries store detail, and unlike the `TaskFailed` row the turn already
+/// committed, this message never passes through the writer. So it is
+/// redacted here, never sent raw.
+fn turn_outcome(
+    result: Result<
+        Vec<roundhouse_provider::ContentBlock>,
+        roundhouse_engine::agent_loop::AgentLoopError,
+    >,
+    writer: &roundhouse_store::EventWriter,
+) -> TurnOutcome {
+    use roundhouse_engine::agent_loop::AgentLoopError;
+    use roundhouse_engine::AgentError;
+
+    let err = match result {
+        Ok(_) => return TurnOutcome::Completed,
+        Err(err) => err,
+    };
+    let category = match &err {
+        AgentLoopError::Cancelled(reason) => {
+            return TurnOutcome::Cancelled {
+                reason: reason.clone(),
+            }
+        }
+        AgentLoopError::Chat(AgentError::Provider(_)) => "provider",
+        AgentLoopError::Chat(AgentError::Store(_)) => "store",
+        AgentLoopError::TooManyToolCallsInOneTurn(..) => "too_many_tool_calls",
+        AgentLoopError::MaxTurnsExceeded(_) => "max_turns_exceeded",
+    };
+    let (message, _redactions) = writer.redact_outbound(&err.to_string());
+    TurnOutcome::Failed {
+        category: category.to_string(),
+        message,
     }
 }
 
@@ -2241,6 +2560,9 @@ async fn construct_real_session_bounded(
             workspace_root,
             workspace_device,
             workspace_inode,
+            // The socket path is the one caller with no other place to write
+            // `SessionCreated`: the client learns its session id from it.
+            session_bootstrap::SessionCreatedRecord::Append,
         )
         .await;
         match outcome {
@@ -2508,7 +2830,7 @@ mod session_reaper_tests {
         let registry = Arc::new(SessionRegistry::new());
         let actor = real_actor_with_state(dir.path(), roundhouse_core::SessionState::Closed).await;
         let actor_for_reaper = actor.clone();
-        let (session_id, _subscription, _events) = registry.create(actor, None, None).unwrap();
+        let (session_id, _subscription) = registry.create(actor, None, None).unwrap();
 
         let (proxy, token) = real_proxy_with_registered_token(dir.path()).await;
         assert!(
@@ -2557,7 +2879,7 @@ mod session_reaper_tests {
         let registry = Arc::new(SessionRegistry::new());
         let actor = real_actor_with_state(dir.path(), roundhouse_core::SessionState::Running).await;
         let actor_for_reaper = actor.clone();
-        let (session_id, _subscription, _events) = registry.create(actor, None, None).unwrap();
+        let (session_id, _subscription) = registry.create(actor, None, None).unwrap();
 
         let (proxy, token) = real_proxy_with_registered_token(dir.path()).await;
         spawn_session_reaper(

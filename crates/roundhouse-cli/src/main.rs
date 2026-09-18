@@ -242,17 +242,28 @@ where
         .await
         .map_err(|e| color_eyre::eyre::eyre!(e.to_string()))?
     {
-        // `ClientEvent` is `#[non_exhaustive]` (Phase 0) and today carries
-        // only `TaskEvent`/`Ack`; `Ack` — no protocol-version negotiation UI
-        // exists yet (Phase 5) — falls through untouched.
-        if let roundhouse_proto::ClientEvent::TaskEvent {
-            session_id,
-            payload,
-            ..
-        } = event
-        {
-            dashboard.apply(session_id, *payload);
-            dashboard.tick(terminal)?;
+        match event {
+            roundhouse_proto::ClientEvent::Committed {
+                session_id,
+                payload,
+                ..
+            } => {
+                dashboard.apply(session_id, *payload);
+                dashboard.tick(terminal)?;
+            }
+            // The daemon only sends this in answer to a `Resume` whose cursor
+            // is past the session's head; this loop never resumes, so it
+            // means the two sides disagree about the session's history.
+            roundhouse_proto::ClientEvent::ResyncRequired { session_id, head } => {
+                return Err(color_eyre::eyre::eyre!(
+                    "the daemon requires a resync for session {session_id} (head {head:?})"
+                ));
+            }
+            // `TurnFinished` (this loop submits no turns) and `Ack` (no
+            // protocol-version negotiation UI exists yet) carry nothing to
+            // render. `ClientEvent` is `#[non_exhaustive]` (Phase 0), so this
+            // arm also covers any later variant.
+            _ => {}
         }
     }
     Ok(())

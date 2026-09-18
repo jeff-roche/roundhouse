@@ -7,8 +7,9 @@
 //! function's read arm used to send into the *other* channel from inside its
 //! own branch body, which — once `tokio::select!` commits to a branch — is
 //! no longer racing the other arm. A full end-to-end reproduction would need
-//! to interleave three channels (the registry's own subscriber channel, the
-//! `events_tx`/`events_in` pair, and `requests_tx`/`requests_rx`) and would
+//! to interleave three sources (the session's store follower — before Phase 8
+//! Task 21, the registry's own subscriber channel — the `events_tx`/`events_in`
+//! pair, and `requests_tx`/`requests_rx`) and would
 //! only wedge *sometimes*, depending on scheduling — a flaky test here would
 //! be worse than none. Instead, each half is driven directly, alone, with
 //! its own test-owned channels of a deliberately small capacity, proving the
@@ -36,7 +37,6 @@ mod common;
 use std::sync::Arc;
 use std::time::Duration;
 
-use roundhouse_core::{EventPayload, NoteLevel};
 use roundhouse_daemon::session_registry::SessionRegistry;
 use roundhouse_daemon::socket_server::{
     drive_session, serve_connection, FailedConstructionLimiter,
@@ -88,26 +88,23 @@ async fn drive_session_keeps_draining_requests_while_events_tx_is_stuck_full() {
         .expect("handshake reply must not hang")
         .expect("handshake reply must arrive");
     let session_id = match created {
-        ClientEvent::TaskEvent { session_id, .. } => session_id,
+        ClientEvent::Committed { session_id, .. } => session_id,
         other => panic!("expected the SessionCreated handshake frame, got {other:?}"),
     };
 
     // From here on nothing ever reads `events_rx` again — standing in for a
     // `serve_connection` that is busy elsewhere, exactly the condition
-    // ruling W1-R31 identifies. Publish two events: the first fits in the
-    // now-empty capacity-1 channel; the second cannot be buffered, forcing
-    // `drive_session` to actually attempt (and, pre-fix, block on) a second
-    // send into an already-full channel.
-    let note = |text: &str| ClientEvent::TaskEvent {
-        session_id,
-        task_id: None,
-        payload: Box::new(EventPayload::Note {
-            level: NoteLevel::Info,
-            text: text.into(),
-        }),
-    };
-    registry.publish(session_id, note("one"));
-    registry.publish(session_id, note("two"));
+    // ruling W1-R31 identifies. Commit two events to the session's log: the
+    // first fits in the now-empty capacity-1 channel; the second cannot be
+    // buffered, forcing `drive_session` to actually attempt (and, pre-fix,
+    // block on) a second send into an already-full channel.
+    let writer = registry
+        .actor(session_id)
+        .expect("the session is live")
+        .writer()
+        .clone();
+    common::append_note(&writer, session_id, "one").await;
+    common::append_note(&writer, session_id, "two").await;
 
     tokio::time::sleep(SETTLE).await;
 
@@ -207,7 +204,7 @@ async fn serve_connection_keeps_draining_events_while_requests_out_is_stuck_full
 async fn drive_session_keeps_draining_requests_while_the_session_is_idle() {
     // Guards the "obvious `reserve()` fix" trap the brief calls out: naively
     // selecting on `events_tx.reserve()` and then `.await`ing
-    // `session_events.recv()` *inside that arm's body* would grab a permit
+    // `follower.next()` *inside that arm's body* would grab a permit
     // speculatively the moment the loop starts (since `events_tx` has spare
     // capacity below), then block forever with nothing to send — starving
     // `requests_rx` even though nothing about `events_tx` is actually full.
@@ -216,8 +213,7 @@ async fn drive_session_keeps_draining_requests_while_the_session_is_idle() {
     let dir = tempfile::tempdir().unwrap();
     let registry = Arc::new(SessionRegistry::new());
     let actor = common::real_actor(dir.path()).await;
-    let (session_id, _creator_subscription, _creator_events) =
-        registry.create(actor, None, None).unwrap();
+    let (session_id, _creator_subscription) = registry.create(actor, None, None).unwrap();
 
     let resources = common::real_resources(dir.path()).await;
     let (requests_tx, requests_rx) = tokio::sync::mpsc::channel::<ClientRequest>(1);

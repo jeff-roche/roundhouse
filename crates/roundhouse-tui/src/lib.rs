@@ -18,7 +18,9 @@ mod protocol;
 mod render;
 mod rope;
 
-pub use client::{connect, connect_attach, connect_create, ConnectIntent, DaemonClient};
+pub use client::{
+    connect, connect_attach, connect_create, connect_resume, ConnectIntent, DaemonClient,
+};
 pub use coalesce::{Coalescer, SessionSummary};
 pub use dashboard::Dashboard;
 pub use dirty::{DirtyFlags, Region};
