@@ -46,9 +46,10 @@ use roundhouse_daemon::workspace_registry::{WorkspaceRegistration, WorkspaceRegi
 use roundhouse_engine::EngineHandles;
 use roundhouse_net::proxy::LoopbackProxy;
 use roundhouse_provider::{
-    AnthropicMessagesProvider, BoxFut, Capabilities, ChatRequest, ChatStream, HttpRequest,
-    HttpResponseStream, HttpTransport, ModelId, ModelInfo, Plan, Provider, ProviderError,
-    RequestCtx, ReqwestTransport, TokenCount, TransportError,
+    parse_anthropic_base_url, AnthropicBaseUrlTransport, AnthropicMessagesProvider, BaseUrlError,
+    BoxFut, Capabilities, ChatRequest, ChatStream, HttpRequest, HttpResponseStream, HttpTransport,
+    ModelId, ModelInfo, Plan, Provider, ProviderError, RequestCtx, ReqwestTransport, TokenCount,
+    TransportError,
 };
 use roundhouse_sandbox::isolate::BwrapLandlockIsolate;
 use roundhouse_sandbox::Isolate;
@@ -166,77 +167,17 @@ fn parse_workspace_registration(raw: &str) -> Result<WorkspaceRegistration, Stri
     Ok(registration)
 }
 
-/// Rejection reason for an operator-supplied `ROUNDHOUSE_ANTHROPIC_BASE_URL`.
-/// Never includes `ANTHROPIC_API_KEY` — the value it carries is always a
-/// piece of the URL itself (its scheme or its host), never the credential.
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-enum BaseUrlError {
-    #[error(
-        "ROUNDHOUSE_ANTHROPIC_BASE_URL must start with \"https://\", or \"http://\" only for \
-         a loopback host (127.0.0.0/8, ::1, localhost); got scheme {0:?}"
-    )]
-    UnsupportedScheme(String),
-    #[error(
-        "ROUNDHOUSE_ANTHROPIC_BASE_URL uses \"http://\" but {0:?} is not a loopback host \
-         (127.0.0.0/8, ::1, localhost)"
-    )]
-    NonLoopbackHttp(String),
-}
-
-/// Parses an operator-supplied `ROUNDHOUSE_ANTHROPIC_BASE_URL`. `https://` is
-/// always allowed. `http://` is allowed only for a loopback host
-/// (127.0.0.0/8, `::1` written as `[::1]`, or `localhost`) — anything else is
-/// a startup error. A trailing `/` is trimmed, because
-/// `AnthropicMessagesProvider::stream_chat` appends `/v1/messages`. Called
-/// only from `main`, and only once `ANTHROPIC_API_KEY` is confirmed set and
-/// non-empty; an empty `ROUNDHOUSE_ANTHROPIC_BASE_URL` is handled by that
-/// caller as "unset" and never reaches this function.
-///
-/// Parses by hand rather than through `url::Url`/`reqwest::Url`: neither
-/// crate is a direct dependency of `roundhouse-daemon` today (both are only
-/// reachable transitively, through `roundhouse-provider`), and this one
-/// startup check does not justify adding that Cargo edge.
-fn parse_anthropic_base_url(raw: &str) -> Result<String, BaseUrlError> {
-    let trimmed = raw.trim_end_matches('/');
-    let (scheme, after_scheme) = trimmed
-        .split_once("://")
-        .ok_or_else(|| BaseUrlError::UnsupportedScheme(trimmed.to_string()))?;
-
-    // The authority ends at the first `/`, `?`, or `#`; strip a `user:pass@`
-    // prefix if present, then isolate the host from an optional port. IPv6
-    // literals are bracketed (`[::1]`, `[::1]:8080`), so they are checked
-    // first: a bare `:` split would otherwise cut `::1` itself apart.
-    let authority = after_scheme.split(['/', '?', '#']).next().unwrap_or("");
-    let host_port = authority.rsplit('@').next().unwrap_or(authority);
-    let host = if let Some(after_bracket) = host_port.strip_prefix('[') {
-        after_bracket.split(']').next().unwrap_or(after_bracket)
-    } else {
-        host_port.split(':').next().unwrap_or(host_port)
-    };
-
-    match scheme {
-        "https" => Ok(trimmed.to_string()),
-        "http" if is_loopback_host(host) => Ok(trimmed.to_string()),
-        "http" => Err(BaseUrlError::NonLoopbackHttp(host.to_string())),
-        other => Err(BaseUrlError::UnsupportedScheme(other.to_string())),
-    }
-}
-
-/// `127.0.0.0/8`, `::1`, or `localhost` (case-insensitive) — the loopback
-/// hosts `http://` is allowed to reach.
-fn is_loopback_host(host: &str) -> bool {
-    host.eq_ignore_ascii_case("localhost")
-        || host == "::1"
-        || host
-            .parse::<std::net::Ipv4Addr>()
-            .is_ok_and(|ip| ip.octets()[0] == 127)
-}
-
 /// Resolves `main`'s reading of `ROUNDHOUSE_ANTHROPIC_BASE_URL`: an unset (or
 /// empty — same "unset" treatment `ANTHROPIC_API_KEY` itself gets above)
 /// variable resolves to `Ok(None)`, meaning "use `AnthropicMessagesProvider`'s
-/// own default"; anything else is validated by [`parse_anthropic_base_url`].
-fn resolve_anthropic_base_url(raw: Option<String>) -> Result<Option<String>, BaseUrlError> {
+/// own default"; anything else is validated by
+/// [`roundhouse_provider::parse_anthropic_base_url`] (fix round 1: moved
+/// there from a hand-rolled parser in this crate — see that function's own
+/// doc comment for why hand-rolled authority splitting was a real security
+/// bypass, not just a style preference).
+fn resolve_anthropic_base_url(
+    raw: Option<String>,
+) -> Result<Option<(String, AnthropicBaseUrlTransport)>, BaseUrlError> {
     match raw.filter(|value| !value.is_empty()) {
         Some(value) => parse_anthropic_base_url(&value).map(Some),
         None => Ok(None),
@@ -311,29 +252,49 @@ async fn main() -> color_eyre::Result<()> {
                 // never do anything on a daemon that has no live provider
                 // anyway. `resolve_anthropic_base_url`/`parse_anthropic_base_url`
                 // never see `api_key`, so this cannot leak it either way.
-                match resolve_anthropic_base_url(
+                //
+                // The transport is chosen here, visibly, from the SAME
+                // validated result that set `base_url` — never independently
+                // of it. `AnthropicBaseUrlTransport::HttpLoopback` is a
+                // promise `parse_anthropic_base_url` only ever makes about a
+                // URL it has itself already confirmed is `http://` against a
+                // loopback host; picking `allowing_plaintext_http()` any
+                // other way (e.g. from a bare scheme check re-done here)
+                // would reopen exactly the gap fix round 1 closed.
+                let transport: Arc<dyn HttpTransport> = match resolve_anthropic_base_url(
                     std::env::var("ROUNDHOUSE_ANTHROPIC_BASE_URL").ok(),
                 ) {
-                    Ok(Some(base_url)) => {
+                    Ok(Some((base_url, AnthropicBaseUrlTransport::Https))) => {
                         tracing::info!(
                             target: "roundhouse_daemon::boot",
                             base_url = %base_url,
                             "using operator-configured ROUNDHOUSE_ANTHROPIC_BASE_URL"
                         );
                         anthropic_provider.base_url = base_url;
+                        Arc::new(ReqwestTransport::new())
                     }
-                    Ok(None) => {}
+                    Ok(Some((base_url, AnthropicBaseUrlTransport::HttpLoopback))) => {
+                        tracing::info!(
+                            target: "roundhouse_daemon::boot",
+                            base_url = %base_url,
+                            "using operator-configured ROUNDHOUSE_ANTHROPIC_BASE_URL \
+                             (plaintext http, loopback only)"
+                        );
+                        anthropic_provider.base_url = base_url;
+                        Arc::new(ReqwestTransport::allowing_plaintext_http())
+                    }
+                    Ok(None) => Arc::new(ReqwestTransport::new()),
                     Err(err) => {
                         return Err(color_eyre::eyre::eyre!(
                             "invalid ROUNDHOUSE_ANTHROPIC_BASE_URL: {err}"
                         ));
                     }
-                }
+                };
                 (
                     Arc::new(anthropic_provider) as Arc<dyn Provider>,
                     RequestCtx {
                         trace_id: None,
-                        transport: Arc::new(ReqwestTransport::new()),
+                        transport,
                         api_key,
                         credentials: None,
                     },
@@ -1204,46 +1165,13 @@ mod tests {
         assert_eq!(error.kind(), ErrorKind::PermissionDenied);
     }
 
-    #[test]
-    fn parse_anthropic_base_url_table() {
-        let cases: &[(&str, Result<&str, BaseUrlError>)] = &[
-            ("https://api.anthropic.com", Ok("https://api.anthropic.com")),
-            ("http://127.0.0.1:4317", Ok("http://127.0.0.1:4317")),
-            (
-                "http://example.com",
-                Err(BaseUrlError::NonLoopbackHttp("example.com".to_string())),
-            ),
-            (
-                "ftp://example.com",
-                Err(BaseUrlError::UnsupportedScheme("ftp".to_string())),
-            ),
-            // A trailing `/` is trimmed, because `stream_chat` appends
-            // `/v1/messages` itself.
-            (
-                "https://api.anthropic.com/",
-                Ok("https://api.anthropic.com"),
-            ),
-            ("http://localhost:9999/", Ok("http://localhost:9999")),
-            ("http://[::1]:9999", Ok("http://[::1]:9999")),
-        ];
-
-        for (input, expected) in cases {
-            let actual = parse_anthropic_base_url(input);
-            assert_eq!(
-                actual,
-                expected.clone().map(|s| s.to_string()),
-                "input: {input:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn parse_anthropic_base_url_rejects_127_range_beyond_dot_one() {
-        assert_eq!(
-            parse_anthropic_base_url("http://127.255.0.1:8080"),
-            Ok("http://127.255.0.1:8080".to_string())
-        );
-    }
+    // The scheme/host/userinfo/query/fragment adversarial table lives in
+    // `roundhouse-provider`'s `anthropic_provider::base_url_tests` now (fix
+    // round 1 moved `parse_anthropic_base_url` there, parsing with
+    // `reqwest::Url` instead of this crate's retired hand-rolled splitter).
+    // These tests cover only the thin wrapper this crate still owns: the
+    // "empty/unset" env-var treatment, and that a present value really does
+    // delegate to the real validator rather than, say, silently no-opping.
 
     #[test]
     fn resolve_anthropic_base_url_treats_unset_and_empty_as_unset() {
@@ -1252,10 +1180,20 @@ mod tests {
     }
 
     #[test]
-    fn resolve_anthropic_base_url_validates_a_present_value() {
+    fn resolve_anthropic_base_url_delegates_a_present_value_to_the_real_validator() {
         assert_eq!(
             resolve_anthropic_base_url(Some("https://api.anthropic.com/".to_string())),
-            Ok(Some("https://api.anthropic.com".to_string()))
+            Ok(Some((
+                "https://api.anthropic.com".to_string(),
+                AnthropicBaseUrlTransport::Https
+            )))
+        );
+        assert_eq!(
+            resolve_anthropic_base_url(Some("http://127.0.0.1:4317".to_string())),
+            Ok(Some((
+                "http://127.0.0.1:4317".to_string(),
+                AnthropicBaseUrlTransport::HttpLoopback
+            )))
         );
         assert_eq!(
             resolve_anthropic_base_url(Some("http://example.com".to_string())),

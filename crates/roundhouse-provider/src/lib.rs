@@ -37,7 +37,9 @@ pub mod retry;
 mod stream_event;
 mod transport;
 
-pub use anthropic_provider::AnthropicMessagesProvider;
+pub use anthropic_provider::{
+    parse_anthropic_base_url, AnthropicBaseUrlTransport, AnthropicMessagesProvider, BaseUrlError,
+};
 pub use cassette::{CassetteTransport, ChunkStrategy};
 pub use ir::MessageRole as Role; // temporary compat alias: rest of this plan's Track B/C/G task text says Role::User/Role::Assistant; a later phase should update those call sites to MessageRole directly and drop this alias
 pub use ir::{
