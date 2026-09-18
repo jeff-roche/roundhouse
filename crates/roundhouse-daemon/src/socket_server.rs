@@ -1992,11 +1992,19 @@ pub async fn drive_established_session(
                                 "refusing SubmitTurn: text exceeds the maximum length"
                             );
                             rejected = Some("text_too_long");
-                        } else if turn_in_flight {
+                        } else if turn_in_flight || pending_turn_finished.is_some() {
                             // One turn per connection at a time. Refusing
                             // (rather than queueing) keeps the spawn
                             // fan-out one client can force to exactly one
                             // task, and keeps this arm's own work O(1).
+                            //
+                            // A turn counts as in flight until its
+                            // `TurnFinished` has actually been sent, not
+                            // just until it reported: `pending_turn_finished`
+                            // holds one frame, and a second turn admitted
+                            // while the first's frame waits for the follower
+                            // to catch up would overwrite it, so the first
+                            // `SubmitTurn` would never get its reply.
                             tracing::warn!(
                                 %session_id,
                                 "refusing SubmitTurn: a turn is already in flight on this \

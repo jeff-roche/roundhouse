@@ -835,3 +835,85 @@ async fn resume_of_an_unknown_session_closes_without_a_reply() {
     .await;
     assert!(conn.recv().await.is_none());
 }
+
+/// A `SubmitTurn` pipelined while the previous turn's `TurnFinished` is still unsent (its
+/// turn has finished, but this connection's stalled follower has not caught up to its
+/// `through_seq`) must not cost the first turn its reply. The second is refused
+/// (`turn_in_flight`), so the connection delivers exactly two `TurnFinished` frames: the
+/// first turn's `Completed`, and a `Rejected` for the second.
+///
+/// The creator reads nothing while the bulk turn runs; a viewer reads it through to its
+/// root task's completion, so the turn has finished before the second `SubmitTurn` is sent,
+/// while the creator's follower is still far behind.
+#[tokio::test]
+async fn a_submit_turn_pipelined_behind_an_unsent_turn_finished_does_not_replace_it() {
+    let (provider, mut gate) = gated_provider(Script::Bulk, false);
+    let daemon = start_daemon(provider).await;
+
+    let (mut creator, session_id, created) = create(&daemon).await;
+    let mut viewer = Conn::open(&daemon.socket_path, &ClientRequest::Attach { session_id }).await;
+    assert!(matches!(viewer.recv().await, Some(ClientEvent::Ack { .. })));
+
+    creator.send(&submit(session_id, "first")).await;
+    gate.entered().await;
+    // Open the gate for every later call too, so a wrongly admitted second turn runs
+    // to completion and reports.
+    gate.permits.add_permits(1024);
+
+    let mut root_task = None;
+    loop {
+        let event = viewer.recv().await.expect("the viewer is open");
+        let frame = committed(event.clone(), session_id)
+            .unwrap_or_else(|| panic!("expected a Committed frame, got {event:?}"));
+        if root_task.is_none() && matches!(frame.payload, EventPayload::TaskCreated { .. }) {
+            root_task = frame.task_id;
+        }
+        if root_task.is_some()
+            && frame.task_id == root_task
+            && matches!(frame.payload, EventPayload::TaskCompleted { .. })
+        {
+            break;
+        }
+    }
+
+    creator.send(&submit(session_id, "second")).await;
+
+    let mut frames = vec![created];
+    let mut finished = Vec::new();
+    while finished.len() < 2 {
+        let event = creator
+            .recv()
+            .await
+            .expect("the connection must stay open until both TurnFinished frames");
+        match event {
+            ClientEvent::TurnFinished {
+                outcome,
+                through_seq,
+                ..
+            } => finished.push((outcome, through_seq)),
+            other => frames.extend(committed(other, session_id)),
+        }
+    }
+
+    let completed: Vec<_> = finished
+        .iter()
+        .filter(|(o, _)| matches!(o, TurnOutcome::Completed))
+        .collect();
+    let rejected: Vec<_> = finished
+        .iter()
+        .filter(|(o, t)| {
+            matches!(o, TurnOutcome::Rejected { reason } if reason == "turn_in_flight")
+                && t.is_none()
+        })
+        .collect();
+    assert_eq!(
+        (completed.len(), rejected.len()),
+        (1, 1),
+        "expected the first turn's Completed and a Rejected for the second: {finished:?}"
+    );
+    let first_through = completed[0].1.expect("a completed turn has a through_seq");
+    assert!(
+        frames.iter().any(|f| f.seq == first_through),
+        "the first turn's TurnFinished must follow every event it committed"
+    );
+}
