@@ -39,16 +39,18 @@
 //!
 //! The sub-agent half is different (Phase 8, T19a Task 6):
 //! `SubAgentSessions::retire_child` is now a real, wired production path —
-//! `scheduler_driver::DeliveryExecutor::drive_workflow_agent_child`,
-//! `DaemonSubAgentHost::close_children`, and `spawn_session_reaper`'s
-//! `RetireSubAgent` reap action all call it — and it durably closes the
-//! retired child with a terminal `SessionClosed`
+//! `scheduler_driver::DeliveryExecutor::drive_workflow_agent_child` and
+//! `DaemonSubAgentHost::close_children` both call it — and it durably closes
+//! the retired child with a terminal `SessionClosed`
 //! (`HeadlessSession::close_and_teardown` → `SessionActor::close` →
-//! `EventWriter::close_session`), not merely an in-memory teardown. This
-//! test calls `retire_child` directly rather than through one of those
-//! production callers only because none of them fits a synthetic sub-agent
-//! assembled by hand for a limits test; the method itself is exactly the one
-//! production code calls.
+//! `EventWriter::close_session`), not merely an in-memory teardown. (A
+//! tracked child whose own actor reaches `Closed` some other way is retired
+//! by a separate path, `spawn_session_reaper`'s `RetireSubAgent` reap
+//! action, which never calls `retire_child` — see that method's own doc
+//! comment for why it cannot.) This test calls `retire_child` directly
+//! rather than through one of its two production callers only because
+//! neither fits a synthetic sub-agent assembled by hand for a limits test;
+//! the method itself is exactly the one production code calls.
 
 mod common;
 

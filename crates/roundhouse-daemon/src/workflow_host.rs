@@ -236,14 +236,20 @@ const SESSION_STATE_CHANGED_PAYLOAD_PREFIX: &str = r#"{"SessionStateChanged":"#;
 /// the child it retires — via `HeadlessSession::close_and_teardown` and,
 /// underneath that, `SessionActor::close`, which appends the real
 /// `SessionClosed` this function's filter looks for — before tearing its
-/// real resources down. Three production paths reach it:
+/// real resources down. Two production paths reach it:
 /// `scheduler_driver::DeliveryExecutor::drive_workflow_agent_child` (a
-/// workflow `agent:` step's child, on every path driving it can finish),
+/// workflow `agent:` step's child, on every path driving it can finish) and
 /// `DaemonSubAgentHost::close_children` (a closing session's own tracked
-/// children, as one step of `SessionActor::close`'s own cascade), and
-/// `spawn_session_reaper`'s `RetireSubAgent` reap action (a tracked child
-/// whose own actor reaches `Closed` through neither of those two). Pinned
-/// end to end by `sub_agent_host`'s own restart test,
+/// children, as one step of `SessionActor::close`'s own cascade). A tracked
+/// child whose own actor reaches `Closed` through neither of those two is
+/// retired by a separate path that never calls `retire_child` at all —
+/// `spawn_session_reaper`'s `RetireSubAgent` reap action runs
+/// `SubAgentSessions::take_for_reap` → `SpawnTree::remove_child` →
+/// `HeadlessSession::teardown_from_reaper` directly, because `retire_child`
+/// goes through `close_and_teardown`, which aborts the reaper to prevent a
+/// double teardown — the reaper task cannot safely call back into the
+/// method that would abort it. Pinned end to end by `sub_agent_host`'s own
+/// restart test,
 /// `a_retired_sub_agent_child_does_not_reappear_after_a_restart`, which
 /// spawns a real child, retires it through the real `retire_child`, and
 /// restarts for real — and, at the daemon scope, by

@@ -283,17 +283,24 @@ impl SubAgentSessions {
     /// tearing its real resources down. This is the terminal
     /// `SessionClosed` `workflow_host::reconcile_spawn_tree`'s own boot-time
     /// filter was already looking for and, before this task, nothing ever
-    /// wrote. Three production paths reach it: `scheduler_driver::
-    /// drive_workflow_agent_child`, which retires a workflow `agent:` step's
-    /// child on every path driving it can finish — success, loop error,
-    /// timeout, or a vanished session — mapping which one onto the
-    /// terminator's own outcome (Phase 8, T19a Task 7) rather than passing
-    /// the same value unconditionally; `DaemonSubAgentHost::
+    /// wrote. Two production paths reach it: `scheduler_driver::
+    /// DeliveryExecutor::drive_workflow_agent_child`, which retires a
+    /// workflow `agent:` step's child on every path driving it can finish —
+    /// success, loop error, timeout, or a vanished session — mapping which
+    /// one onto the terminator's own outcome (Phase 8, T19a Task 7) rather
+    /// than passing the same value unconditionally; and `DaemonSubAgentHost::
     /// close_children`, which retires a closing session's own tracked
-    /// children as one step of that session's own close; and
-    /// `spawn_session_reaper`'s `RetireSubAgent` reap action, for a tracked
-    /// child whose own actor reaches `Closed` through neither of those two
-    /// (see `create_child_session`'s reaper wiring).
+    /// children as one step of that session's own close. A tracked child
+    /// whose own actor reaches `Closed` through neither of those two is
+    /// retired by a separate path that does **not** call this method:
+    /// `spawn_session_reaper`'s `RetireSubAgent` reap action (see
+    /// `create_child_session`'s reaper wiring) runs `SubAgentSessions::
+    /// take_for_reap` → `SpawnTree::remove_child` →
+    /// `HeadlessSession::teardown_from_reaper` directly, never `retire_child`
+    /// — this method goes through `HeadlessSession::close_and_teardown`,
+    /// which aborts the reaper precisely to avoid a double teardown, so the
+    /// reaper task cannot safely call back into the method that would abort
+    /// it.
     pub async fn retire_child(
         &self,
         child: SessionId,
