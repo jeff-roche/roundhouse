@@ -22,8 +22,8 @@
 //! (currently unwired) integration status.
 
 use roundhouse_core::{
-    Delta, EventPayload, NoteLevel, Progress, SessionId, TaskError, TaskId, TaskInput, TaskOutput,
-    TaskRunner, Timestamp,
+    Delta, EventPayload, NoteLevel, Progress, SessionId, SessionOutcome, TaskError, TaskId,
+    TaskInput, TaskOutput, TaskRunner, Timestamp,
 };
 
 use crate::pool::StorePool;
@@ -338,6 +338,14 @@ impl Redactor {
     /// task in this lane) is what makes `record_task_progress`'s production caller live.
     /// `Progress.fraction` is a plain `Option<f32>`, never free text, and is left
     /// untouched.
+    ///
+    /// **Closed by this method (Phase 8, T19a):** `SessionClosed.outcome`'s
+    /// `SessionOutcome::Failed { reason }` goes through [`Self::redact`] too. It is the
+    /// same free-text string this method already redacts as `TaskFailed.error.message`,
+    /// and it had been reaching the log unredacted purely because the terminator was a
+    /// newer payload than this method's last expansion. `SessionOutcome::Completed` and
+    /// `SessionOutcome::Cancelled` are unit variants with no text to scan. See that arm's
+    /// own comment for why a gap here is worse than a gap elsewhere in this method.
     pub fn redact_event_payload(&self, payload: EventPayload) -> (EventPayload, u32) {
         match payload {
             EventPayload::TaskDelta {
@@ -509,6 +517,33 @@ impl Redactor {
                         output,
                         usage,
                         trust,
+                    },
+                    n,
+                )
+            }
+            // Phase 8, T19a: `SessionOutcome::Failed.reason` is free text, and the same
+            // string is already redacted when it travels as `TaskFailed.error.message`
+            // above — a session's terminator must not be the one place it gets through.
+            // `Completed`/`Cancelled` carry no text at all and pass through untouched.
+            //
+            // This matters more than an ordinary missing arm: the terminator is the LAST
+            // event a session can ever have, and `events` physically rejects
+            // `UPDATE`/`DELETE`, so a secret that reaches this field is unrepairable —
+            // there is no later append that can supersede it and no statement that can
+            // remove it. `roundhouse_daemon`'s `drive_workflow_agent_child` already
+            // formats a machine-stable tag rather than an `AgentLoopError`'s `Display`
+            // (which could carry a provider 400 body snippet) for exactly this reason;
+            // that narrows what reaches this field, this arm is what makes it safe
+            // regardless of what a future caller puts there.
+            EventPayload::SessionClosed {
+                outcome: SessionOutcome::Failed { reason },
+            } => {
+                let (redacted_reason, n) = self.redact(&reason);
+                (
+                    EventPayload::SessionClosed {
+                        outcome: SessionOutcome::Failed {
+                            reason: redacted_reason,
+                        },
                     },
                     n,
                 )
