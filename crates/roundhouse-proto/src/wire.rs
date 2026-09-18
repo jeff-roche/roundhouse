@@ -1,4 +1,4 @@
-use roundhouse_core::{EventPayload, SessionId, TaskId};
+use roundhouse_core::{CancelReason, EventPayload, SessionId, TaskId};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
@@ -73,6 +73,18 @@ pub enum ClientRequest {
     CloseSession {
         session_id: SessionId,
     },
+    /// Phase 8 Task 21: attach and replay from just after `after_seq` (the
+    /// `(session_id, seq)` cursor a client last saw in a
+    /// [`ClientEvent::Committed`]). A plain `Attach` replays from the start.
+    ///
+    /// Handshake-only, like `Attach`: valid only as a connection's first
+    /// frame, and read-only for the same reason `Attach` is. If `after_seq`
+    /// is past the session's head the daemon answers
+    /// [`ClientEvent::ResyncRequired`] instead of `Ack`.
+    Resume {
+        session_id: SessionId,
+        after_seq: u64,
+    },
 }
 
 /// Daemon-to-client events over the NDJSON/SSE transport — a thin,
@@ -81,6 +93,11 @@ pub enum ClientRequest {
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[non_exhaustive]
 pub enum ClientEvent {
+    /// One log event without its `seq`. `roundhouse-web`'s SSE transport
+    /// still sends this as its `data:` payload, since the cursor already
+    /// travels in the SSE `id:` field. The UDS transport no longer emits it
+    /// (Phase 8 Task 21): it sends [`ClientEvent::Committed`] instead, since
+    /// NDJSON has no `id:` field to carry the cursor.
     TaskEvent {
         session_id: SessionId,
         task_id: Option<TaskId>,
@@ -88,5 +105,53 @@ pub enum ClientEvent {
     },
     Ack {
         api_version: ApiVersion,
+    },
+    /// One committed log event, with the seq that serves as the client's
+    /// cursor. Sent in `seq` order with no gaps; `payload` is the stored,
+    /// already-redacted row.
+    Committed {
+        session_id: SessionId,
+        seq: u64,
+        task_id: Option<TaskId>,
+        payload: Box<EventPayload>,
+    },
+    /// The outcome of this connection's own `SubmitTurn`. It is sent only
+    /// after every event the turn committed (`seq <= through_seq`) has
+    /// already been sent on this connection. `through_seq` is `None` for a
+    /// [`TurnOutcome::Rejected`] turn, which committed nothing.
+    TurnFinished {
+        session_id: SessionId,
+        outcome: TurnOutcome,
+        through_seq: Option<u64>,
+    },
+    /// The resume cursor is ahead of this session's head. The client must
+    /// discard its state and replay from the start. Terminal: the
+    /// connection closes after it.
+    ResyncRequired {
+        session_id: SessionId,
+        head: Option<u64>,
+    },
+}
+
+/// How one `SubmitTurn` ended, reported in [`ClientEvent::TurnFinished`].
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[non_exhaustive]
+pub enum TurnOutcome {
+    Completed,
+    /// The turn ran and failed. `category` names the failure class
+    /// (`provider`, `store`, `too_many_tool_calls`, `max_turns_exceeded`);
+    /// `message` is the error text after the session's own redactor has run
+    /// over it.
+    Failed {
+        category: String,
+        message: String,
+    },
+    Cancelled {
+        reason: CancelReason,
+    },
+    /// The daemon refused the SubmitTurn (not the creator, wrong session, too long,
+    /// a turn already in flight, closing, or actor gone). No task was created.
+    Rejected {
+        reason: String,
     },
 }
