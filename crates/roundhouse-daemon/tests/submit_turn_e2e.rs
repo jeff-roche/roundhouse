@@ -30,20 +30,25 @@
 
 mod common;
 
+use std::path::Path;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use roundhouse_core::{EventPayload, SessionId, TaskKind};
+use futures::future::BoxFuture;
+use roundhouse_core::{Delta, EventPayload, SessionId, TaskId, TaskKind};
 use roundhouse_daemon::session_bootstrap::{
     no_policy_rules, policy_rules_from_files, PolicyRuleSource,
 };
 use roundhouse_policy::config::compile_policy_layers;
 use roundhouse_policy::trust::{record_explicit_trust, TrustStore};
+use roundhouse_policy::{ArgMatcher, CompiledRule, Outcome, Predicate, Scope};
 use roundhouse_proto::ClientRequest;
 use roundhouse_provider::{
-    BlockDelta, BlockKind, BoxFut, Capabilities, ChatRequest, ChatStream, ContentBlock, ModelId,
-    ModelInfo, Plan, Provider, ProviderError, RequestCtx, StreamEvent, TokenCount,
+    AnthropicMessagesProvider, BlockDelta, BlockKind, BoxFut, Capabilities, CassetteTransport,
+    ChatRequest, ChatStream, ContentBlock, HttpRequest, HttpResponseStream, HttpTransport,
+    MessageRole, ModelId, ModelInfo, Plan, Provider, ProviderError, RequestCtx, StreamEvent,
+    TokenCount, TransportError,
 };
 
 /// A scripted `Provider`: the first call returns one `ToolUse` block for the
@@ -1384,5 +1389,914 @@ mod human_join_guard {
                 "expected HumanCannotJoinTeam for the socket-created human session, got {other:?}"
             ),
         }
+    }
+}
+
+/// Phase 8 Task 19 lane B, Task 10 (plan 18e, plus the delta half of 18a):
+/// end-to-end proof, over a **real** UDS client and a **real** daemon, that
+/// infer text deltas and shell stdout/stderr deltas (Tasks 7-9's wiring)
+/// actually land in the stored log in the right place, and actually replay
+/// correctly into the next provider turn — not merely that the final,
+/// folded `blocks`/`ShellOutput` are right, which the earlier `SubmitTurn`
+/// tests in this file already cover without ever reading a `TaskDelta`
+/// event back.
+///
+/// (a-deltas): [`DeltaStreamingProvider`], a scripted provider, over the
+/// real socket/daemon.
+/// (e): the real [`AnthropicMessagesProvider`] over a [`SequencedCassetteTransport`]
+/// (a test-only, two-exchange extension of `roundhouse-provider`'s
+/// single-body `CassetteTransport` — see that struct's own doc comment for
+/// why plain `CassetteTransport` can't drive this scenario by itself).
+///
+/// Both share [`assert_shell_deltas_land_correctly`], the one place every
+/// assertion the brief requires is written — seq strictly increasing, every
+/// task's own deltas/progress sitting strictly between its `TaskStarted`
+/// and terminal event, the first turn's text replaying into the second
+/// request's transcript, and the shell task's stdout/stderr replaying into
+/// that same request's folded tool result.
+mod delta_streaming_e2e {
+    use super::*;
+
+    /// Turn 1's scripted/cassette assistant text, split into several
+    /// fragments across multiple `BlockDelta`s (the brief's "several text
+    /// fragments") so the coalescer actually has more than one push to
+    /// coalesce before the shell tool call — concatenated, these fragments
+    /// must equal this constant exactly, which the streaming test below
+    /// pins.
+    const TURN1_TEXT: &str = "Let me check the script output.";
+    /// Turn 2's final, text-only assistant reply once the shell result has
+    /// been folded back in.
+    const TURN2_TEXT: &str = "shell output received";
+
+    const SHELL_SCRIPT: &str =
+        "#!/bin/sh\necho stdout-line-one\necho stdout-line-two\necho stderr-line-one 1>&2\n";
+
+    /// Writes an executable `stream.sh` under `root` that emits a fixed,
+    /// non-secret-shaped marker to both stdout and stderr — non-secret-shaped
+    /// so this fixture's output matches no pattern any real session
+    /// `Redactor` would hold (see [`assert_shell_deltas_land_correctly`]'s
+    /// own comment on that).
+    fn write_streaming_shell_script(root: &Path) -> std::path::PathBuf {
+        let script = root.join("stream.sh");
+        std::fs::write(&script, SHELL_SCRIPT).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&script).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&script, perms).unwrap();
+        }
+        script
+    }
+
+    /// The model-issued `shell` tool input that runs [`write_streaming_shell_script`]'s
+    /// script — a relative program resolved against `cwd` (mirrors
+    /// `tool_dispatch::task_params_for_shell_resolves_a_bare_program_via_path_and_returns_the_canonical_cwd`'s
+    /// own shape), so `resolve_shell_program` canonicalizes the directory and
+    /// preserves `stream.sh` verbatim as the final component.
+    fn shell_tool_input(fixture_root: &Path) -> serde_json::Value {
+        serde_json::json!({
+            "program": "./stream.sh",
+            "argv": [],
+            "cwd": fixture_root.to_string_lossy(),
+        })
+    }
+
+    /// A `Scope::Builtin` `Allow` for exactly `script` — the daemon's
+    /// `PolicyRuleSource` closure this test injects directly (never a
+    /// project policy file/trust dance, unlike this file's `read`-based
+    /// tests): mirrors `roundhouse-engine`'s own
+    /// `a_model_issued_shell_tool_use_is_admitted_dispatched_through_the_real_gate`.
+    fn shell_allow_rule(script: &Path) -> PolicyRuleSource {
+        let program = script.to_string_lossy().to_string();
+        Arc::new(move || {
+            vec![CompiledRule::test_new(
+                Scope::Builtin,
+                Outcome::Allow,
+                Predicate::Shell {
+                    program: program.clone(),
+                    matcher: ArgMatcher::ArgvPrefix(vec![]),
+                    allow_interpreter: false,
+                },
+            )]
+        })
+    }
+
+    /// A real-process-spawning `Isolate`, with no real sandbox.
+    ///
+    /// `common::available_isolate` (`BwrapLandlockIsolate::test_with_probe`)
+    /// is right for every OTHER daemon-crate `SubmitTurn` test in this file,
+    /// none of which actually spawns a process through it — its `spawn`
+    /// execs a hardcoded, production-only `bwrap_path`
+    /// (`/usr/libexec/roundhouse/bwrap`), which this project's CI does not
+    /// have installed (see `real_boot_smoke.rs`'s own comment on that), so it
+    /// cannot be used here: this test's whole point is a real dispatched
+    /// shell process's real stdout/stderr actually streaming as deltas.
+    /// Copies `roundhouse-engine`'s own `tests/workflow_tool_dispatch.rs`
+    /// `TestIsolate` (and this crate's own, structurally identical
+    /// `scheduled_trigger_end_to_end.rs`) — a real subprocess with no real
+    /// sandbox, portable to any CI regardless of whether `bwrap` is
+    /// installed anywhere on it.
+    struct RealSpawnTestIsolate;
+
+    #[async_trait::async_trait]
+    impl roundhouse_sandbox::Isolate for RealSpawnTestIsolate {
+        fn declared(&self) -> roundhouse_sandbox::Tier {
+            roundhouse_sandbox::Tier::Sandbox
+        }
+        async fn probe(&self) -> roundhouse_sandbox::ProbeResult {
+            roundhouse_sandbox::ProbeResult {
+                achieved: roundhouse_sandbox::Tier::Sandbox,
+                degradations: vec![],
+            }
+        }
+        async fn prepare(
+            &self,
+            _spec: &roundhouse_core::SessionSpec,
+        ) -> Result<roundhouse_sandbox::Handle, roundhouse_sandbox::IsolationError> {
+            Ok(roundhouse_sandbox::Handle {
+                id: "real-spawn-test-isolate".into(),
+            })
+        }
+        async fn spawn(
+            &self,
+            _handle: &roundhouse_sandbox::Handle,
+            command: roundhouse_sandbox::CommandSpec,
+        ) -> Result<roundhouse_sandbox::Child, roundhouse_sandbox::IsolationError> {
+            let mut process = tokio::process::Command::new(&command.program);
+            process
+                .args(&command.argv)
+                .current_dir(command.cwd.as_deref().unwrap_or("."))
+                .env_clear()
+                .envs(command.env)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped());
+            #[cfg(unix)]
+            process.process_group(0);
+            let child = process
+                .spawn()
+                .map_err(|err| roundhouse_sandbox::IsolationError::Unsupported(err.to_string()))?;
+            let pid = child.id().ok_or_else(|| {
+                roundhouse_sandbox::IsolationError::Unsupported("test child has no pid".into())
+            })?;
+            Ok(roundhouse_sandbox::Child::from_process(pid, child))
+        }
+        fn attest(&self, _handle: &roundhouse_sandbox::Handle) -> roundhouse_sandbox::Attestation {
+            // Must equal the session's requested tier (`Tier::Sandbox`,
+            // `SessionSpec::test_requesting` in `session_bootstrap`'s
+            // `create_session_with_egress`) — `sealed_tier_shortfall`
+            // (`roundhouse-policy`'s `sealed`) denies every task when the
+            // attested tier is below the requested one.
+            roundhouse_sandbox::Attestation {
+                tier: roundhouse_sandbox::Tier::Sandbox,
+                digest: "test".into(),
+                net_enforced: false,
+            }
+        }
+        async fn teardown(
+            &self,
+            _handle: roundhouse_sandbox::Handle,
+        ) -> Result<(), roundhouse_sandbox::IsolationError> {
+            Ok(())
+        }
+    }
+
+    /// [`start_daemon_with_rules_at_root`], but also over a caller-supplied
+    /// [`RequestCtx`] (`common::resources_with_ctx`, Task 10's own addition)
+    /// — needed for (e), which must hand the real `AnthropicMessagesProvider`
+    /// a [`SequencedCassetteTransport`] rather than `NoopTransport` — and
+    /// over [`RealSpawnTestIsolate`] rather than `common::available_isolate`,
+    /// since both (a-deltas) and (e) need a real spawned shell process.
+    async fn start_daemon_with_ctx_and_rules_at_root(
+        provider: Arc<dyn Provider>,
+        policy_rules: PolicyRuleSource,
+        ctx: RequestCtx,
+        workspace_name: &str,
+        workspace_root: &Path,
+    ) -> Daemon {
+        let dir = tempfile::tempdir().unwrap();
+        let socket_path = dir.path().join("round.sock");
+        let db_path = dir.path().join("events.db");
+        let registry = Arc::new(roundhouse_daemon::session_registry::SessionRegistry::new());
+        let listener = roundhouse_daemon::socket_server::bind_socket(&socket_path).unwrap();
+        let resources = common::resources_with_ctx(
+            dir.path(),
+            Arc::new(RealSpawnTestIsolate),
+            provider,
+            policy_rules,
+            ctx,
+        )
+        .await;
+        resources
+            .workspace_registry
+            .as_ref()
+            .unwrap()
+            .register(
+                roundhouse_daemon::workspace_registry::WorkspaceRegistration::new(
+                    workspace_name,
+                    workspace_root.to_path_buf(),
+                ),
+            )
+            .await
+            .unwrap();
+        tokio::spawn(roundhouse_daemon::socket_server::accept_loop(
+            listener,
+            Arc::clone(&registry),
+            Arc::clone(&resources),
+        ));
+        Daemon {
+            _dir: dir,
+            socket_path,
+            db_path,
+            resources,
+            registry,
+        }
+    }
+
+    /// (a-deltas)'s scripted provider: turn 1 streams [`TURN1_TEXT`] as
+    /// several `BlockDelta::Text` fragments, then one `shell` `ToolUse`;
+    /// turn 2 (once the tool result is folded back in) streams
+    /// [`TURN2_TEXT`] and stops. Records every request it's handed, exactly
+    /// like this file's `ScriptedToolCallProvider`, so the test can inspect
+    /// what actually reached the "model" on each call.
+    struct DeltaStreamingProvider {
+        shell_input: serde_json::Value,
+        calls: AtomicU32,
+        requests: Mutex<Vec<ChatRequest>>,
+    }
+
+    impl DeltaStreamingProvider {
+        fn new(shell_input: serde_json::Value) -> Self {
+            DeltaStreamingProvider {
+                shell_input,
+                calls: AtomicU32::new(0),
+                requests: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn requests(&self) -> Vec<ChatRequest> {
+            self.requests.lock().unwrap().clone()
+        }
+    }
+
+    impl Provider for DeltaStreamingProvider {
+        fn capabilities(&self, _model: &ModelId) -> Capabilities {
+            Capabilities::default()
+        }
+        fn resolve(&self, _req: &ChatRequest) -> Result<Plan, ProviderError> {
+            Ok(Plan {
+                endpoint: "fake".into(),
+            })
+        }
+        fn stream_chat<'a>(
+            &'a self,
+            req: &'a ChatRequest,
+            _ctx: &'a RequestCtx,
+        ) -> BoxFut<'a, Result<ChatStream, ProviderError>> {
+            self.requests.lock().unwrap().push(req.clone());
+            let call = self.calls.fetch_add(1, Ordering::SeqCst);
+            let shell_args = self.shell_input.to_string();
+            Box::pin(async move {
+                let events = if call == 0 {
+                    vec![
+                        StreamEvent::BlockStart {
+                            index: 0,
+                            kind: BlockKind::Text,
+                        },
+                        StreamEvent::BlockDelta {
+                            index: 0,
+                            delta: BlockDelta::Text("Let me ".to_string()),
+                        },
+                        StreamEvent::BlockDelta {
+                            index: 0,
+                            delta: BlockDelta::Text("check the ".to_string()),
+                        },
+                        StreamEvent::BlockDelta {
+                            index: 0,
+                            delta: BlockDelta::Text("script output.".to_string()),
+                        },
+                        StreamEvent::BlockStop { index: 0 },
+                        StreamEvent::BlockStart {
+                            index: 1,
+                            kind: BlockKind::ToolUse {
+                                name: "shell".to_string(),
+                                provider_id: Some("call_0".to_string()),
+                            },
+                        },
+                        StreamEvent::BlockDelta {
+                            index: 1,
+                            delta: BlockDelta::ToolArgsFragment(shell_args),
+                        },
+                        // Deliberately no `BlockStop { index: 1 }` before
+                        // `MessageStop`: `DeltaCoalescer::block_stop` is what
+                        // flushes a block's buffer at an explicit stop, so a
+                        // stream that goes straight to `MessageStop` (which
+                        // `run_chat_turn_with_clock`'s own loop does nothing
+                        // with) leaves this fragment sitting in the coalescer
+                        // until the post-loop `coalescer.finish()` flush —
+                        // exactly the pre-terminal flush the break-it check
+                        // must prove is load-bearing.
+                        StreamEvent::MessageStop,
+                    ]
+                } else {
+                    vec![
+                        StreamEvent::BlockStart {
+                            index: 0,
+                            kind: BlockKind::Text,
+                        },
+                        StreamEvent::BlockDelta {
+                            index: 0,
+                            delta: BlockDelta::Text(TURN2_TEXT.to_string()),
+                        },
+                        // Same reasoning as turn 1's tool-call block above.
+                        StreamEvent::MessageStop,
+                    ]
+                };
+                Ok(ChatStream::from_events(events))
+            })
+        }
+        fn count_tokens<'a>(
+            &'a self,
+            _req: &'a ChatRequest,
+            _ctx: &'a RequestCtx,
+        ) -> BoxFut<'a, Result<TokenCount, ProviderError>> {
+            Box::pin(async { Ok(TokenCount::default()) })
+        }
+        fn list_models<'a>(
+            &'a self,
+            _ctx: &'a RequestCtx,
+        ) -> BoxFut<'a, Result<Vec<ModelInfo>, ProviderError>> {
+            Box::pin(async { Ok(Vec::new()) })
+        }
+    }
+
+    /// (e)'s decorator: delegates every `Provider` method to a real
+    /// `inner` (the real [`AnthropicMessagesProvider`]) unchanged, only
+    /// additionally recording each `ChatRequest` it's handed — the same
+    /// "what did the model actually see" introspection
+    /// [`DeltaStreamingProvider`] gets for free from being scripted, needed
+    /// here because [`AnthropicMessagesProvider`] itself keeps no history.
+    /// Every real encode/decode/HTTP call still runs; nothing about the
+    /// provider under test is faked.
+    struct RecordingProvider<P> {
+        inner: P,
+        requests: Mutex<Vec<ChatRequest>>,
+    }
+
+    impl<P: Provider> RecordingProvider<P> {
+        fn new(inner: P) -> Self {
+            RecordingProvider {
+                inner,
+                requests: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn requests(&self) -> Vec<ChatRequest> {
+            self.requests.lock().unwrap().clone()
+        }
+    }
+
+    impl<P: Provider> Provider for RecordingProvider<P> {
+        fn capabilities(&self, model: &ModelId) -> Capabilities {
+            self.inner.capabilities(model)
+        }
+        fn resolve(&self, req: &ChatRequest) -> Result<Plan, ProviderError> {
+            self.inner.resolve(req)
+        }
+        fn stream_chat<'a>(
+            &'a self,
+            req: &'a ChatRequest,
+            ctx: &'a RequestCtx,
+        ) -> BoxFut<'a, Result<ChatStream, ProviderError>> {
+            self.requests.lock().unwrap().push(req.clone());
+            self.inner.stream_chat(req, ctx)
+        }
+        fn count_tokens<'a>(
+            &'a self,
+            req: &'a ChatRequest,
+            ctx: &'a RequestCtx,
+        ) -> BoxFut<'a, Result<TokenCount, ProviderError>> {
+            self.inner.count_tokens(req, ctx)
+        }
+        fn list_models<'a>(
+            &'a self,
+            ctx: &'a RequestCtx,
+        ) -> BoxFut<'a, Result<Vec<ModelInfo>, ProviderError>> {
+            self.inner.list_models(ctx)
+        }
+    }
+
+    /// A test-only, **two-exchange** extension of `roundhouse-provider`'s
+    /// `CassetteTransport`: that struct replays one fixed body regardless of
+    /// how many times `send` is called (confirmed by reading its `send`
+    /// impl, which ignores `_req` and always replays `self.body`), so it
+    /// cannot by itself drive a scenario needing a *different* recorded
+    /// response on the second HTTP call. This wraps a `Vec<CassetteTransport>`
+    /// and advances through it by call count (saturating at the last entry),
+    /// while delegating every actual `send` to the real, unmodified
+    /// `CassetteTransport::send`. No `roundhouse-provider` production code is
+    /// touched.
+    struct SequencedCassetteTransport {
+        cassettes: Vec<CassetteTransport>,
+        calls: AtomicU32,
+    }
+
+    impl SequencedCassetteTransport {
+        fn new(bodies: Vec<Vec<u8>>) -> Self {
+            assert!(
+                !bodies.is_empty(),
+                "a SequencedCassetteTransport needs at least one recorded exchange"
+            );
+            SequencedCassetteTransport {
+                cassettes: bodies
+                    .into_iter()
+                    .map(|body| CassetteTransport {
+                        status: 200,
+                        headers: vec![],
+                        body,
+                        chunk_size: 0,
+                    })
+                    .collect(),
+                calls: AtomicU32::new(0),
+            }
+        }
+    }
+
+    impl HttpTransport for SequencedCassetteTransport {
+        fn send<'a>(
+            &'a self,
+            req: HttpRequest,
+        ) -> BoxFuture<'a, Result<HttpResponseStream, TransportError>> {
+            let call = self.calls.fetch_add(1, Ordering::SeqCst) as usize;
+            let idx = call.min(self.cassettes.len() - 1);
+            self.cassettes[idx].send(req)
+        }
+    }
+
+    /// One `event: <event>\ndata: <json>\n\n` SSE frame, in the exact shape
+    /// `roundhouse-provider`'s own `anthropic_hello.sse` fixture uses.
+    fn sse_frame(event: &str, data: serde_json::Value) -> String {
+        format!(
+            "event: {event}\ndata: {}\n\n",
+            serde_json::to_string(&data).unwrap()
+        )
+    }
+
+    /// A real Anthropic Messages SSE body: assistant text (in fragments,
+    /// matching [`TURN1_TEXT`] once concatenated) followed by one `tool_use`
+    /// block carrying `tool_input`'s JSON as its `input_json_delta`.
+    fn tool_call_cassette(tool_name: &str, tool_input: &serde_json::Value) -> Vec<u8> {
+        let mut body = String::new();
+        body += &sse_frame(
+            "message_start",
+            serde_json::json!({
+                "type": "message_start",
+                "message": {"id": "msg_1", "usage": {"input_tokens": 10, "cache_read_input_tokens": 0}},
+            }),
+        );
+        body += &sse_frame(
+            "content_block_start",
+            serde_json::json!({
+                "type": "content_block_start", "index": 0,
+                "content_block": {"type": "text", "text": ""},
+            }),
+        );
+        for fragment in ["Let me ", "check the ", "script output."] {
+            body += &sse_frame(
+                "content_block_delta",
+                serde_json::json!({
+                    "type": "content_block_delta", "index": 0,
+                    "delta": {"type": "text_delta", "text": fragment},
+                }),
+            );
+        }
+        body += &sse_frame(
+            "content_block_stop",
+            serde_json::json!({"type": "content_block_stop", "index": 0}),
+        );
+        body += &sse_frame(
+            "content_block_start",
+            serde_json::json!({
+                "type": "content_block_start", "index": 1,
+                "content_block": {"type": "tool_use", "id": "call_0", "name": tool_name},
+            }),
+        );
+        body += &sse_frame(
+            "content_block_delta",
+            serde_json::json!({
+                "type": "content_block_delta", "index": 1,
+                "delta": {"type": "input_json_delta", "partial_json": tool_input.to_string()},
+            }),
+        );
+        // Deliberately no `content_block_stop` for index 1 before
+        // `message_delta`/`message_stop` — see `DeltaStreamingProvider`'s
+        // identical omission for why: it's what makes the post-loop
+        // `coalescer.finish()` flush load-bearing for this block's content
+        // rather than `DeltaCoalescer::block_stop`.
+        body += &sse_frame(
+            "message_delta",
+            serde_json::json!({
+                "type": "message_delta", "delta": {"stop_reason": "tool_use"}, "usage": {"output_tokens": 5},
+            }),
+        );
+        body += &sse_frame("message_stop", serde_json::json!({"type": "message_stop"}));
+        body.into_bytes()
+    }
+
+    /// A real Anthropic Messages SSE body carrying one final, text-only
+    /// assistant turn — the reply once the tool result has been folded back
+    /// in.
+    fn final_text_cassette(text: &str) -> Vec<u8> {
+        let mut body = String::new();
+        body += &sse_frame(
+            "message_start",
+            serde_json::json!({
+                "type": "message_start",
+                "message": {"id": "msg_2", "usage": {"input_tokens": 10, "cache_read_input_tokens": 0}},
+            }),
+        );
+        body += &sse_frame(
+            "content_block_start",
+            serde_json::json!({
+                "type": "content_block_start", "index": 0,
+                "content_block": {"type": "text", "text": ""},
+            }),
+        );
+        body += &sse_frame(
+            "content_block_delta",
+            serde_json::json!({
+                "type": "content_block_delta", "index": 0,
+                "delta": {"type": "text_delta", "text": text},
+            }),
+        );
+        // Same reasoning as `tool_call_cassette`'s missing `content_block_stop`.
+        body += &sse_frame(
+            "message_delta",
+            serde_json::json!({
+                "type": "message_delta", "delta": {"stop_reason": "end_turn"}, "usage": {"output_tokens": 5},
+            }),
+        );
+        body += &sse_frame("message_stop", serde_json::json!({"type": "message_stop"}));
+        body.into_bytes()
+    }
+
+    /// Every `TaskId` this session created of `kind`, in stored (creation)
+    /// order.
+    fn task_ids_of_kind(events: &[roundhouse_store::StoredEvent], kind: TaskKind) -> Vec<TaskId> {
+        events
+            .iter()
+            .filter_map(|e| match &e.payload {
+                EventPayload::TaskCreated { kind: k, .. } if *k == kind => e.task_id,
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn has_terminal(events: &[roundhouse_store::StoredEvent], task_id: TaskId) -> bool {
+        events.iter().any(|e| {
+            e.task_id == Some(task_id)
+                && matches!(
+                    e.payload,
+                    EventPayload::TaskCompleted { .. } | EventPayload::TaskFailed { .. }
+                )
+        })
+    }
+
+    /// Asserts every `TaskDelta`/`TaskProgress` event recorded for
+    /// `task_id` sits strictly between that task's own `TaskStarted` and
+    /// its terminal event's `seq` — and that at least one such event
+    /// exists, so a task that (by a regression) streamed nothing at all
+    /// cannot pass this vacuously.
+    fn assert_deltas_sit_between_started_and_terminal(
+        events: &[roundhouse_store::StoredEvent],
+        task_id: TaskId,
+    ) {
+        let started_seq = events
+            .iter()
+            .find(|e| {
+                e.task_id == Some(task_id) && matches!(e.payload, EventPayload::TaskStarted { .. })
+            })
+            .map(|e| e.seq)
+            .unwrap_or_else(|| panic!("task {task_id} has no TaskStarted event"));
+        let terminal_seq = events
+            .iter()
+            .find(|e| {
+                e.task_id == Some(task_id)
+                    && matches!(
+                        e.payload,
+                        EventPayload::TaskCompleted { .. } | EventPayload::TaskFailed { .. }
+                    )
+            })
+            .map(|e| e.seq)
+            .unwrap_or_else(|| panic!("task {task_id} has no terminal event"));
+
+        let mut delta_count = 0usize;
+        for e in events.iter().filter(|e| e.task_id == Some(task_id)) {
+            let is_delta_or_progress = matches!(
+                e.payload,
+                EventPayload::TaskDelta { .. } | EventPayload::TaskProgress { .. }
+            );
+            if is_delta_or_progress {
+                delta_count += 1;
+                assert!(
+                    e.seq > started_seq && e.seq < terminal_seq,
+                    "task {task_id}'s delta/progress at seq {} must sit strictly between \
+                     TaskStarted (seq {started_seq}) and its terminal event (seq {terminal_seq})",
+                    e.seq
+                );
+            }
+        }
+        assert!(
+            delta_count > 0,
+            "task {task_id} produced no TaskDelta/TaskProgress events at all — this check \
+             would otherwise hold vacuously"
+        );
+    }
+
+    fn concat_text_deltas(events: &[roundhouse_store::StoredEvent], task_id: TaskId) -> String {
+        events
+            .iter()
+            .filter(|e| e.task_id == Some(task_id))
+            .filter_map(|e| match &e.payload {
+                EventPayload::TaskDelta {
+                    delta: Delta::Text { text },
+                } => Some(text.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn concatenated_blob_bytes(
+        events: &[roundhouse_store::StoredEvent],
+        task_id: TaskId,
+        state_dir: &Path,
+        mime: &str,
+    ) -> Vec<u8> {
+        events
+            .iter()
+            .filter(|e| e.task_id == Some(task_id))
+            .filter_map(|e| match &e.payload {
+                EventPayload::TaskDelta {
+                    delta: Delta::Blob(blob_ref),
+                } if blob_ref.mime.as_deref() == Some(mime) => Some(blob_ref.clone()),
+                _ => None,
+            })
+            .flat_map(|blob_ref| {
+                roundhouse_store::blobs::read_verified_blob(state_dir, &blob_ref).unwrap()
+            })
+            .collect()
+    }
+
+    /// The one place every assertion Task 10's brief (a-deltas)/(e) require
+    /// is written — shared by both tests below so a real production
+    /// regression fails BOTH the scripted and the real-provider path, not
+    /// just one.
+    async fn assert_shell_deltas_land_correctly(
+        daemon: &Daemon,
+        session_id: SessionId,
+        requests: impl Fn() -> Vec<ChatRequest>,
+    ) {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        let events = loop {
+            let store = roundhouse_store::open(&daemon.db_path).await.unwrap();
+            let events = roundhouse_store::session_events(&store, session_id)
+                .await
+                .unwrap();
+            let infer_tasks = task_ids_of_kind(&events, TaskKind::Infer);
+            let shell_tasks = task_ids_of_kind(&events, TaskKind::Shell);
+            let ready = infer_tasks.len() >= 2
+                && shell_tasks.len() == 1
+                && has_terminal(&events, infer_tasks[1])
+                && has_terminal(&events, shell_tasks[0]);
+            if ready {
+                break events;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for both turns and the shell task to complete; saw {} events",
+                events.len()
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        };
+
+        for w in events.windows(2) {
+            assert!(
+                w[0].seq < w[1].seq,
+                "seq must increase strictly across the whole session log: {} then {}",
+                w[0].seq,
+                w[1].seq
+            );
+        }
+
+        let infer_tasks = task_ids_of_kind(&events, TaskKind::Infer);
+        let shell_tasks = task_ids_of_kind(&events, TaskKind::Shell);
+        let infer1 = infer_tasks[0];
+        let infer2 = infer_tasks[1];
+        let shell_task = shell_tasks[0];
+
+        assert!(
+            events.iter().any(|e| e.task_id == Some(shell_task)
+                && matches!(e.payload, EventPayload::TaskCompleted { .. })),
+            "the allowed shell task must complete, not fail: {:#?}",
+            events
+                .iter()
+                .filter(|e| e.task_id == Some(shell_task))
+                .collect::<Vec<_>>()
+        );
+
+        assert_deltas_sit_between_started_and_terminal(&events, infer1);
+        assert_deltas_sit_between_started_and_terminal(&events, infer2);
+        assert_deltas_sit_between_started_and_terminal(&events, shell_task);
+
+        let infer1_text = concat_text_deltas(&events, infer1);
+        assert_eq!(
+            infer1_text, TURN1_TEXT,
+            "the first turn's own TaskDelta events must replay to reconstruct its assistant \
+             text exactly"
+        );
+
+        let reqs = requests();
+        assert!(
+            reqs.len() >= 2,
+            "the model must have been re-invoked with the tool result folded in"
+        );
+        let second = &reqs[1];
+
+        let assistant_text_seen = second.messages.iter().any(|m| {
+            matches!(m.role, MessageRole::Assistant)
+                && m.content
+                    .iter()
+                    .any(|b| matches!(b, ContentBlock::Text { text, .. } if text == &infer1_text))
+        });
+        assert!(
+            assistant_text_seen,
+            "the first turn's replayed text deltas ({infer1_text:?}) must reach the assistant \
+             text of the SECOND provider request's transcript verbatim"
+        );
+
+        // Shell blob bytes are redacted before they're written
+        // (`flush_stream`'s `EventWriter::redaction_split_and_redact`) —
+        // `ShellOutput` itself is not. This fixture's plain marker text
+        // matches no pattern any real session `Redactor` holds (it isn't
+        // shaped like a credential, and nothing here registers it as a
+        // secret), so the redacted blob bytes equal the shell process's raw
+        // stdout/stderr verbatim. A fixture whose output DID match a
+        // registered secret would need to compare against that same
+        // redacted form instead of `ShellOutput`'s raw text.
+        let stdout_bytes = concatenated_blob_bytes(
+            &events,
+            shell_task,
+            &daemon.resources.state_dir,
+            "application/vnd.roundhouse.stdout",
+        );
+        let stderr_bytes = concatenated_blob_bytes(
+            &events,
+            shell_task,
+            &daemon.resources.state_dir,
+            "application/vnd.roundhouse.stderr",
+        );
+        let stdout_text = String::from_utf8(stdout_bytes).unwrap();
+        let stderr_text = String::from_utf8(stderr_bytes).unwrap();
+        assert!(
+            stdout_text.contains("stdout-line-one") && stdout_text.contains("stdout-line-two"),
+            "the shell task's replayed stdout blob deltas must reconstruct its real stdout, \
+             got {stdout_text:?}"
+        );
+        assert!(
+            stderr_text.contains("stderr-line-one"),
+            "the shell task's replayed stderr blob deltas must reconstruct its real stderr, \
+             got {stderr_text:?}"
+        );
+
+        let tool_result_text: String = second
+            .messages
+            .iter()
+            .flat_map(|m| m.content.iter())
+            .filter_map(|b| match b {
+                ContentBlock::ToolResult {
+                    content, is_error, ..
+                } => {
+                    assert!(
+                        !*is_error,
+                        "the allowed, successful shell call must not fold back as an error \
+                         result"
+                    );
+                    Some(
+                        content
+                            .iter()
+                            .map(|p| p.text.clone())
+                            .collect::<Vec<_>>()
+                            .join(""),
+                    )
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("");
+        assert!(
+            tool_result_text.contains(&stdout_text),
+            "the shell task's replayed stdout blob deltas must be folded into turn 2's tool \
+             result, got {tool_result_text:?}"
+        );
+        assert!(
+            tool_result_text.contains(&stderr_text),
+            "the shell task's replayed stderr blob deltas must be folded into turn 2's tool \
+             result, got {tool_result_text:?}"
+        );
+    }
+
+    /// (a-deltas): a scripted provider over the real socket/daemon.
+    #[tokio::test]
+    async fn a_real_clients_shell_and_infer_deltas_land_correctly_in_the_stored_log() {
+        let fixture_dir = tempfile::tempdir().unwrap();
+        let fixture_root = fixture_dir.path().canonicalize().unwrap();
+        let script = write_streaming_shell_script(&fixture_root);
+
+        let provider = Arc::new(DeltaStreamingProvider::new(shell_tool_input(&fixture_root)));
+        let ctx = RequestCtx {
+            trace_id: None,
+            transport: Arc::new(common::NoopTransport),
+            api_key: "test-key-not-a-real-secret".into(),
+            credentials: None,
+        };
+        let daemon = start_daemon_with_ctx_and_rules_at_root(
+            provider.clone(),
+            shell_allow_rule(&script),
+            ctx,
+            "fixture",
+            &fixture_root,
+        )
+        .await;
+
+        let mut creator = tokio::time::timeout(
+            Duration::from_secs(5),
+            roundhouse_tui::connect_create(&daemon.socket_path, "fixture"),
+        )
+        .await
+        .expect("connect_create must not hang")
+        .unwrap();
+        let session_id = creator.session_id();
+
+        creator
+            .send(&ClientRequest::SubmitTurn {
+                session_id,
+                text: "please run the script".to_string(),
+            })
+            .await
+            .unwrap();
+
+        assert_shell_deltas_land_correctly(&daemon, session_id, || provider.requests()).await;
+    }
+
+    /// (e): the real `AnthropicMessagesProvider` over a
+    /// `SequencedCassetteTransport` — identical scenario, driven through the
+    /// real encode/decode/SSE-framing stack instead of hand-built
+    /// `StreamEvent`s.
+    #[tokio::test]
+    async fn the_real_anthropic_provider_over_a_cassette_transport_streams_deltas_correctly() {
+        let fixture_dir = tempfile::tempdir().unwrap();
+        let fixture_root = fixture_dir.path().canonicalize().unwrap();
+        let script = write_streaming_shell_script(&fixture_root);
+
+        let cassette_transport = Arc::new(SequencedCassetteTransport::new(vec![
+            tool_call_cassette("shell", &shell_tool_input(&fixture_root)),
+            final_text_cassette(TURN2_TEXT),
+        ]));
+        let provider = Arc::new(RecordingProvider::new(AnthropicMessagesProvider::new()));
+        let ctx = RequestCtx {
+            trace_id: None,
+            transport: cassette_transport,
+            api_key: "test-key-not-a-real-secret".into(),
+            credentials: None,
+        };
+
+        let daemon = start_daemon_with_ctx_and_rules_at_root(
+            provider.clone(),
+            shell_allow_rule(&script),
+            ctx,
+            "fixture",
+            &fixture_root,
+        )
+        .await;
+
+        let mut creator = tokio::time::timeout(
+            Duration::from_secs(5),
+            roundhouse_tui::connect_create(&daemon.socket_path, "fixture"),
+        )
+        .await
+        .expect("connect_create must not hang")
+        .unwrap();
+        let session_id = creator.session_id();
+
+        creator
+            .send(&ClientRequest::SubmitTurn {
+                session_id,
+                text: "please run the script".to_string(),
+            })
+            .await
+            .unwrap();
+
+        assert_shell_deltas_land_correctly(&daemon, session_id, || provider.requests()).await;
     }
 }
