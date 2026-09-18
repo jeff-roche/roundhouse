@@ -1472,8 +1472,9 @@ async fn flush_stream(
 /// `EventWriter` every other append does. Dropping that silently would make
 /// a genuinely lost discontinuity marker indistinguishable from one that
 /// committed, so the error is logged at `warn` here rather than thrown away
-/// — the same disposition `flush_stream` gives its own failed append. It is
-/// still not propagated: the caller is the shell output pump, which must
+/// — the same `warn` disposition `flush_stream` gives its own failed append
+/// (which also counts the bytes as lag and returns `Err`; this call does
+/// neither). It is still not propagated: the caller is the shell output pump, which must
 /// never let a store failure stall a child process's pipes.
 async fn emit_gap_progress(
     writer: &EventWriter,

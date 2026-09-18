@@ -207,10 +207,11 @@ Three known failure modes of a literal "everything is a task" model, and the ans
   { swept }`, the count of tasks it cancelled. A tail guard enforces the terminator at
   the store boundary too: any later `append`/`append_batch`/`append_batch_with_blobs`
   for that session is rejected with `StoreError::SessionClosed` rather than silently
-  accepted after the log has already ended. That last one is the streaming-delta flush
-  path described in the amendment to §4.3's streaming bullet above; it is covered
-  because every append path assigns sequence numbers through the same guarded
-  `append_event_in_transaction`, not because each one carries a check of its own.
+  accepted after the log has already ended. That last one is the streaming shell-output
+  flush path described in §4.5's amendments below ("Shell output's mime convention" and
+  the gap-marker paragraph beside it); it is covered because every append path assigns
+  sequence numbers through the same guarded `next_seq_or_reject_closed`, not because
+  each one carries a check of its own.
 
 ### 4.4 Identity and provenance
 

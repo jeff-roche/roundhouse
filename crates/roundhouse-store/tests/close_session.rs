@@ -362,8 +362,9 @@ async fn append_batch_after_close_is_rejected_and_commits_nothing() {
 ///
 /// It does so structurally rather than by a check of its own:
 /// `append_batch_with_blobs_attempt` assigns every member's seq through
-/// `append_event_in_transaction`, the same function `next_seq_or_reject_closed` guards for
-/// every other path. This test exists because that is an easy property to lose — the two
+/// `append_event_in_transaction`, which itself calls `next_seq_or_reject_closed` — the
+/// same function `append_one`/`append_batch` call directly for every other path. This
+/// test exists because that is an easy property to lose — the two
 /// functions were written against the same base by different lanes and neither one's tests
 /// covered the other's path — and because the failure mode is unrepairable: `events`
 /// physically rejects `UPDATE`/`DELETE`, so a delta that slipped past the terminator would

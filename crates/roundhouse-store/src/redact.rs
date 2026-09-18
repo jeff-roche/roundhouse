@@ -535,6 +535,20 @@ impl Redactor {
             // (which could carry a provider 400 body snippet) for exactly this reason;
             // that narrows what reaches this field, this arm is what makes it safe
             // regardless of what a future caller puts there.
+            //
+            // One honest gap this arm does NOT close: `record_session_closed` mints this
+            // terminator with `task_id: None`, like every other session-level event, so
+            // `append_event_in_transaction`'s `if let Some(task_id)` skips the
+            // `tasks.redactions` bump for it entirely — the same skip `append_one`'s doc
+            // comment notes for session-level events generally ("Session-level events
+            // (`task_id: None`) have no `tasks` row to touch"). There is no
+            // `sessions.redactions` column to attribute a terminator's count to instead,
+            // so a non-zero `n` this arm returns for a redacted `SessionClosed` is
+            // computed correctly but has nowhere to be durably recorded today. This is
+            // not the fail-closed violation `append_one`/`append_batch` guard against
+            // elsewhere (a count silently dropped by a bug) — it is a real, structural
+            // gap with no code fix available without a schema change, and none is added
+            // here.
             EventPayload::SessionClosed {
                 outcome: SessionOutcome::Failed { reason },
             } => {

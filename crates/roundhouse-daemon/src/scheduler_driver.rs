@@ -179,9 +179,14 @@ const WORKFLOW_AGENT_MAX_TOOL_CALLS_PER_TURN: u32 = 16;
 /// Named once rather than spelled twice because the two uses have different
 /// safety properties and must not drift: the `TaskFailed` message beside it
 /// carries the error's full `Display` and passes through
-/// `roundhouse_store`'s `Redactor` on its way to the log, while
-/// `SessionClosed` has no redactor arm at all — so the terminator records
-/// this category and nothing else. See that method's own comment above the
+/// `roundhouse_store`'s `Redactor` on its way to the log, and — as of T19a —
+/// so does `SessionClosed`'s own `reason` field. Recording the category here
+/// rather than the loop error's `Display` is belt-and-braces defence in
+/// depth on top of that, not a workaround for a missing redactor arm:
+/// `Redactor` matches only registered live secret values, with no
+/// pattern-based/heuristic detection, so redaction alone does not make
+/// arbitrary sensitive free text safe in a column the `events` table can
+/// never `UPDATE` or `DELETE`. See that method's own comment above the
 /// `child_session_outcome` mapping.
 const AGENT_LOOP_ERROR_CATEGORY: &str = "agent_loop_error";
 
@@ -3325,12 +3330,16 @@ impl DeliveryExecutor {
         // That `Display` can carry a provider's `ProviderError::BadRequest`
         // `body_snippet`, which routinely quotes the offending request back,
         // so a prompt-injected model could steer a secret into it. This
-        // string goes straight into a `SessionClosed` payload, and
-        // `roundhouse_store`'s `Redactor::redact_event_payload` has no
-        // `SessionClosed` arm — while the very same text IS redacted on its
-        // way to `TaskFailed.error.message` through
-        // `record_workflow_task_failed` below. The `events` table rejects
-        // `UPDATE`/`DELETE`, so a leak here would be unrepairable. The
+        // string goes straight into a `SessionClosed` payload, and — as of
+        // T19a — `roundhouse_store`'s `Redactor::redact_event_payload` DOES
+        // have a `SessionClosed` arm, redacting this field the same as it
+        // already redacts this text on its way to `TaskFailed.error.message`
+        // through `record_workflow_task_failed` below. Recording the
+        // category here anyway is belt-and-braces, not a workaround for a
+        // missing arm: `Redactor` matches only registered live secret
+        // values — it has no pattern-based/heuristic detection — so
+        // redaction does not make arbitrary sensitive free text safe in a
+        // column the `events` table can never `UPDATE` or `DELETE`. The
         // operator-facing detail is not lost: it is exactly what that
         // `record_workflow_task_failed` call records, through the redactor.
         let child_session_outcome = match &outcome {
@@ -8122,10 +8131,14 @@ mod child_run_tests {
     ///
     /// An `AgentLoopError` reaching `drive_workflow_agent_child` can wrap a
     /// provider `BadRequest` whose `body_snippet` quotes the request back,
-    /// so its `Display` is model-steerable text. `SessionClosed` has no
-    /// `Redactor::redact_event_payload` arm, and the `events` table rejects
-    /// `UPDATE`/`DELETE`, so anything that reaches a terminator is
-    /// unredacted and permanent.
+    /// so its `Display` is model-steerable text. `Redactor::redact_event_payload`
+    /// does have a `SessionClosed` arm as of T19a, but it matches only
+    /// registered live secret values — no pattern-based/heuristic detection —
+    /// so it cannot be trusted to catch arbitrary sensitive free text, and the
+    /// `events` table rejects `UPDATE`/`DELETE`, making anything that reaches
+    /// a terminator permanent. Recording the category instead of the raw
+    /// `Display` is belt-and-braces defence in depth, not reliance on
+    /// redaction alone.
     #[tokio::test]
     async fn a_loop_errors_terminator_records_the_category_not_the_providers_echoed_body() {
         let harness = harness_with_overlap_and_rules_and_provider(
