@@ -1,6 +1,6 @@
 //! Store-side commit notification (Phase 8 Task 21, Task 1): the primitive a follower
 //! (SSE or UDS) uses to learn "a new event committed for this session" without polling
-//! the database. This is deliberately NOT a broadcast of the event itself — §the
+//! the database. This is deliberately NOT a broadcast of the event itself — the
 //! architecture's own rule that "the published payload is the stored row" means a
 //! follower always re-reads the committed row through `events_after`/`session_events`
 //! rather than being handed anything out of memory. `CommitFeed`/`CommitWatch` only ever

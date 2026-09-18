@@ -1,6 +1,6 @@
 //! The server→client SSE stream and the `Last-Event-ID` cursor it round-trips.
 //!
-//! §11.3 (`docs/architecture/08-ui-design.md:112-119`) mandates four things:
+//! §11.3 (`docs/architecture/08-ui-design.md`) mandates four things:
 //! SSE server→client rather than WebSocket; SSE's `Last-Event-ID` carrying the
 //! `(session_id, seq)` cursor already required for crash recovery; a replay of
 //! history on reconnect; and `resync_required` when a client's cursor cannot

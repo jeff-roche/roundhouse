@@ -107,17 +107,10 @@ impl TurnTasks {
     /// Its own append failures are logged (`tracing::error!`) and swallowed, never
     /// propagated — this function is already the best-effort fallback path, and must never
     /// become a second, unhandled point of failure for the turn.
-    ///
-    /// `_clock` has nothing to read for this: `record_task_failed`'s `Timestamp` is real
-    /// wall-clock time (`now_ts`), never this monotonic clock's `Instant`. It's threaded
-    /// through only because `append_or_settle` (this function's only caller) already holds
-    /// it for every other append site in the turn, and passes it straight through rather
-    /// than special-casing this one call.
     async fn settle_after_append_failure(
         &self,
         writer: &EventWriter,
         runner: &TaskRunner,
-        _clock: &dyn MonotonicClock,
         session_id: SessionId,
         cause: &StoreError,
     ) {
@@ -157,14 +150,13 @@ impl TurnTasks {
 async fn append_or_settle<T>(
     writer: &EventWriter,
     runner: &TaskRunner,
-    clock: &dyn MonotonicClock,
     session_id: SessionId,
     tasks: &TurnTasks,
     result: Result<T, StoreError>,
 ) -> Result<T, StoreError> {
     if let Err(cause) = &result {
         tasks
-            .settle_after_append_failure(writer, runner, clock, session_id, cause)
+            .settle_after_append_failure(writer, runner, session_id, cause)
             .await;
     }
     result
@@ -276,7 +268,6 @@ pub async fn run_chat_turn_with_clock(
     append_or_settle(
         writer,
         runner,
-        clock,
         session_id,
         &tasks,
         append_created(
@@ -295,7 +286,6 @@ pub async fn run_chat_turn_with_clock(
     append_or_settle(
         writer,
         runner,
-        clock,
         session_id,
         &tasks,
         append_started(writer, runner, session_id, chat_task_id).await,
@@ -309,7 +299,6 @@ pub async fn run_chat_turn_with_clock(
     append_or_settle(
         writer,
         runner,
-        clock,
         session_id,
         &tasks,
         append_created(
@@ -328,7 +317,6 @@ pub async fn run_chat_turn_with_clock(
     append_or_settle(
         writer,
         runner,
-        clock,
         session_id,
         &tasks,
         append_started(writer, runner, session_id, infer_task_id).await,
@@ -346,7 +334,6 @@ pub async fn run_chat_turn_with_clock(
                 chat_task_id,
                 provider_err,
                 &mut tasks,
-                clock,
             )
             .await
         }
@@ -386,7 +373,7 @@ pub async fn run_chat_turn_with_clock(
                         "chat turn: provider error superseded by a failed delta append (#89)"
                     );
                 }
-                append_or_settle(writer, runner, clock, session_id, &tasks, append_result).await?;
+                append_or_settle(writer, runner, session_id, &tasks, append_result).await?;
                 return fail_turn_on_provider_error(
                     writer,
                     runner,
@@ -395,7 +382,6 @@ pub async fn run_chat_turn_with_clock(
                     chat_task_id,
                     provider_err,
                     &mut tasks,
-                    clock,
                 )
                 .await;
             }
@@ -408,7 +394,6 @@ pub async fn run_chat_turn_with_clock(
                 append_or_settle(
                     writer,
                     runner,
-                    clock,
                     session_id,
                     &tasks,
                     append_deltas(writer, runner, session_id, infer_task_id, deltas).await,
@@ -420,7 +405,6 @@ pub async fn run_chat_turn_with_clock(
                 append_or_settle(
                     writer,
                     runner,
-                    clock,
                     session_id,
                     &tasks,
                     append_deltas(writer, runner, session_id, infer_task_id, deltas).await,
@@ -457,7 +441,6 @@ pub async fn run_chat_turn_with_clock(
     append_or_settle(
         writer,
         runner,
-        clock,
         session_id,
         &tasks,
         append_deltas(writer, runner, session_id, infer_task_id, final_deltas).await,
@@ -470,7 +453,6 @@ pub async fn run_chat_turn_with_clock(
     append_or_settle(
         writer,
         runner,
-        clock,
         session_id,
         &tasks,
         append_completed(writer, runner, session_id, infer_task_id, usage).await,
@@ -480,7 +462,6 @@ pub async fn run_chat_turn_with_clock(
     append_or_settle(
         writer,
         runner,
-        clock,
         session_id,
         &tasks,
         append_completed(writer, runner, session_id, chat_task_id, Usage::default()).await,
@@ -552,7 +533,6 @@ async fn fail_turn_on_provider_error(
     chat_task_id: TaskId,
     provider_err: ProviderError,
     tasks: &mut TurnTasks,
-    clock: &dyn MonotonicClock,
 ) -> Result<(TaskId, Vec<ContentBlock>), AgentError> {
     let error = TaskError {
         message: provider_err.to_string(),
@@ -562,7 +542,6 @@ async fn fail_turn_on_provider_error(
     append_or_settle(
         writer,
         runner,
-        clock,
         session_id,
         &*tasks,
         append_failed(
@@ -580,7 +559,6 @@ async fn fail_turn_on_provider_error(
     append_or_settle(
         writer,
         runner,
-        clock,
         session_id,
         &*tasks,
         append_failed(writer, runner, session_id, chat_task_id, error, false).await,

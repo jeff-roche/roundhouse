@@ -295,11 +295,13 @@ impl SessionRegistry {
 
     /// A clone of the live `SessionActor` bound to `session_id`, or `None`
     /// if this registry has no entry for it (never created, or already
-    /// [`remove`](Self::remove)d). Exists for a future post-handshake
-    /// request-routing consumer (W1-R37/52: only the connection that ran
-    /// [`Self::create`] may ever route a request to this actor) — nothing
-    /// in this crate calls this yet (see `socket_server::drive_session`'s
-    /// module doc comment for why there is currently nothing to route).
+    /// [`remove`](Self::remove)d). The post-handshake request-routing
+    /// consumer this was written for (W1-R37/52: only the connection that
+    /// ran [`Self::create`] may ever route a request to this actor) now
+    /// calls it: `socket_server::establish_viewer` (deciding whether a
+    /// `None` subscription still names a live session), and its
+    /// `SubmitTurn`/`CloseSession` arms (deciding whether the named
+    /// session is still live before dispatching to it).
     pub fn actor(&self, session_id: SessionId) -> Option<Arc<SessionActor>> {
         let sessions = self.sessions.lock().unwrap();
         sessions.get(&session_id).map(|entry| entry.actor.clone())

@@ -878,7 +878,7 @@ pub async fn accept_loop(
 /// review named: unbounded sessions, and an unbounded per-event amplifier.
 /// That amplifier used to be `SessionRegistry::publish`'s per-subscriber
 /// clone; since Phase 8 Task 21 each subscriber instead owns one
-/// store-backed `SessionFollower` (`roundhouse_store::follow`), so
+/// store-backed `SessionFollower` (`roundhouse_store::SessionFollower`), so
 /// `max_subscribers_per_session` now bounds the follower count directly.
 ///
 /// # Errors
@@ -1938,10 +1938,10 @@ pub async fn drive_established_session(
                     // unreachable," a `let _ = is_creator;` that no longer
                     // appears anywhere in this arm's body — corrected here
                     // rather than left to mislead the next reader.)
-                    // `ClientRequest` carries four variants as of this lane
-                    // (`CreateSession`,
-                    // `Attach`, `SubmitTurn`, `CloseSession`); the first two
-                    // are handshake-only (matched above, as this
+                    // `ClientRequest` carries five variants as of this lane
+                    // (`CreateSession`, `Attach`, `SubmitTurn`,
+                    // `CloseSession`, `Resume`); the first two (and
+                    // `Resume`) are handshake-only (matched above, as this
                     // connection's FIRST frame), and `is_creator` — decided
                     // once, there — is what every check below actually
                     // gates: `docs/architecture/03-security-and-sandboxing.md`
@@ -2281,9 +2281,9 @@ pub async fn drive_established_session(
                             }
                         }
                     }
-                    // `CreateSession`/`Attach` are handshake-only (matched
-                    // above as the connection's FIRST frame); any other
-                    // variant is one this daemon does not implement.
+                    // `CreateSession`/`Attach`/`Resume` are handshake-only
+                    // (matched above as the connection's FIRST frame); any
+                    // other variant is one this daemon does not implement.
                     // `ClientRequest` is `#[non_exhaustive]`, so this arm
                     // is also the required catch-all.
                     Some(_request) => {

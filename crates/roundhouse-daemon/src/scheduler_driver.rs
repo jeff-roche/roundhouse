@@ -2555,6 +2555,16 @@ impl DeliveryExecutor {
         // `close`, so holding the guard across that call — or across a park, which
         // leaves the run suspended indefinitely rather than driving to completion —
         // would deadlock it against itself.
+        //
+        // `dispatch_one_pending`'s `PendingKind::ChildRun` arm drives a `call:` child's
+        // own run to completion by awaiting this same function again, inline, so this
+        // guard — the parent's, not the child's own separate one — stays held for the
+        // child's entire run, however long that takes. Closing the parent session while
+        // that child run is still in flight therefore blocks on `SessionActor::close`'s
+        // own `wait_idle` (which runs before `close_children`) until the child finishes,
+        // bounded only by whatever close timeout the caller applies — a known,
+        // follow-up-tracked cost of driving children inline rather than as their own
+        // independently cancellable tasks.
         let _work = session.actor().begin_work();
 
         let runner = self.resources.runner;
