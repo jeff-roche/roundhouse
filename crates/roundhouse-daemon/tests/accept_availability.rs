@@ -203,14 +203,13 @@ async fn session_registry_refuses_attach_once_at_max_subscribers_per_session() {
     let dir = tempfile::tempdir().unwrap();
     let registry = SessionRegistry::with_limits(64, 1);
     let actor = common::real_actor(dir.path()).await;
-    let (session_id, _creator_subscription, _creator_events) =
-        registry.create(actor, None, None).unwrap();
+    let (session_id, _creator_subscription) = registry.create(actor, None, None).unwrap();
     // The creator itself already counts as the one subscriber this
     // registry allows for this session.
     assert!(
         registry.attach(session_id).is_none(),
         "an attach past max_subscribers_per_session must be refused, not \
-         silently registered — publish clones the event per subscriber, so \
-         this bounds a real per-event memory/CPU amplifier"
+         silently registered — every subscriber runs its own store follower, \
+         so this bounds a real per-commit read amplifier"
     );
 }

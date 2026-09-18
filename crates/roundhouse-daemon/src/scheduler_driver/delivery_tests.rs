@@ -2430,6 +2430,299 @@ async fn a_crash_recovery_park_is_answered_and_the_write_step_really_re_dispatch
     );
 }
 
+/// Builds the fixture both #93 tests below share: a real, registered
+/// one-step `tool: read` workflow run, ready to hand straight to
+/// [`DeliveryExecutor::drive_run_to_completion`]. `rules` is left empty
+/// (`daemon_resources`'s fail-closed default) deliberately — neither test
+/// cares whether the read step itself succeeds or is denied, only that
+/// the run reaches *some* terminal outcome once the segment gate below
+/// releases it, so there is nothing here for a permissive rule to buy
+/// either test.
+async fn drivable_read_run(
+    workspace_root: &std::path::Path,
+) -> (
+    DeliveryExecutor,
+    HeadlessSession,
+    RunId,
+    SessionSpec,
+    RunContext,
+    Timestamp,
+) {
+    let source = workspace_root.join("workflow.yaml");
+    std::fs::write(&source, reading_workflow()).unwrap();
+
+    let (executor, session) = executor_and_session(workspace_root, vec![]).await;
+    let session_id = session.session_id();
+
+    let job_id = {
+        let conn = executor.store.pool.get().await.unwrap();
+        let root = workspace_root.to_path_buf();
+        let source = source.clone();
+        conn.interact(move |connection| {
+            register_workflow_file(connection, &root, &source, template())
+                .unwrap()
+                .job
+                .id()
+        })
+        .await
+        .unwrap()
+    };
+
+    let run_id = RunId::new();
+    let now = executor.now();
+    {
+        let conn = executor.store.pool.get().await.unwrap();
+        let root = workspace_root.to_path_buf();
+        conn.interact(move |connection| {
+            let resolved = resolve_latest_by_job_id(connection, &root, job_id)
+                .unwrap()
+                .expect("the job just registered above must resolve");
+            let version = resolved.job.latest();
+            insert_workflow_run(
+                connection,
+                &WorkflowRun {
+                    id: run_id,
+                    job_id,
+                    job_version: version.version(),
+                    content_hash: content_hash(version),
+                    session_id,
+                    binding_id: None,
+                    trigger_event_id: None,
+                    state: RunState::Running,
+                    parent_run_id: None,
+                    forked_from_run_id: None,
+                    awaiting_until: None,
+                    checkpoint_ref: None,
+                    checkpoint_blob_ref: None,
+                    started_at: now,
+                    ended_at: None,
+                    session_depth: Some(0),
+                    caps: Some(ResourceCaps::default()),
+                },
+            )
+            .unwrap();
+        })
+        .await
+        .unwrap();
+    }
+
+    let spec = SessionSpec {
+        workspace: WorkspaceId::new(),
+        name: None,
+        requested_tier: Tier::Sandbox,
+        on_degrade: OnDegrade::Refuse,
+        parent: None,
+    };
+    let run_ctx = RunContext {
+        inputs: serde_json::Value::Null,
+        inputs_secret_derived: false,
+        vars: serde_json::Value::Null,
+        secrets: HashMap::new(),
+        run_id,
+        previous_report: None,
+        env_allowlist: EnvAllowlist::deny_all(),
+        worktree_provider: Some(Arc::new(SandboxWorktreeProvider::new(
+            workspace_root.to_path_buf(),
+        ))),
+    };
+
+    (executor, session, run_id, spec, run_ctx, now)
+}
+
+/// Issue #93: `SessionActor::close` waits on `wait_idle()`, which only
+/// resolves once every held [`roundhouse_engine::session_actor::WorkGuard`]
+/// has dropped — but before this task, the only production caller of
+/// `begin_work()` was `run_agent_loop`. A workflow-driven session held no
+/// `WorkGuard` of its own, so `wait_idle()` (and so `close()`) would
+/// resolve immediately even while `drive_run_to_completion` was still
+/// actively driving that session's run.
+///
+/// Pins the fix directly, using the same `segment_gap_gate` mechanism
+/// `multiple_deliveries_wait_for_async_work_concurrently_without_holding_
+/// store_connections` already relies on to pause a run at the async gap
+/// right before it dispatches its one step: while paused there, the
+/// session's own `live_work()` must already read 1 — proving
+/// `drive_run_to_completion` took its guard as soon as the run definition
+/// resolved, well before any step ever dispatched. Releasing the gate and
+/// letting the run reach a terminal outcome must drop it back to 0.
+#[tokio::test]
+async fn workflow_run_holds_work_while_driving() {
+    let dir = tempfile::tempdir().unwrap();
+    let workspace_root = dir.path().canonicalize().unwrap();
+    let (mut executor, session, run_id, spec, run_ctx, now) =
+        drivable_read_run(&workspace_root).await;
+    let session_id = session.session_id();
+    let actor = Arc::clone(session.actor());
+
+    assert_eq!(
+        actor.live_work(),
+        0,
+        "nothing has begun driving this session yet"
+    );
+
+    let gate = Arc::new(SegmentGapGate::new());
+    executor.segment_gap_gate = Some(Arc::clone(&gate));
+
+    let drive_executor = executor.clone();
+    let drive = tokio::spawn(async move {
+        drive_executor
+            .drive_run_to_completion(
+                run_id,
+                session_id,
+                &session,
+                spec,
+                workspace_root,
+                run_ctx,
+                now,
+                None,
+            )
+            .await
+    });
+
+    for _ in 0..100_000 {
+        if gate.entrants() == 1 {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(
+        gate.entrants(),
+        1,
+        "the run must reach the segment gap before dispatching its one step"
+    );
+    assert_eq!(
+        actor.live_work(),
+        1,
+        "drive_run_to_completion must hold a WorkGuard for the whole body of a workflow run, \
+         not just for run_agent_loop calls — this is exactly what SessionActor::close's own \
+         wait_idle would otherwise sail straight past"
+    );
+
+    gate.release(1);
+    let outcome = tokio::time::timeout(Duration::from_secs(10), drive)
+        .await
+        .expect("the run must not hang past its own segment gap")
+        .expect("the drive task must not panic")
+        .expect("drive_run_to_completion's own DeliveryError path must not be reached")
+        .expect("run_workflow must not return a RunLoopError for this fixture");
+    assert!(
+        matches!(outcome, DrivenRun::Outcome(RunOutcome::Terminal { .. })),
+        "the run's own outcome (allowed or denied) is irrelevant to this test — only that it \
+             reached a terminal state — got {outcome:?}"
+    );
+
+    assert_eq!(
+        actor.live_work(),
+        0,
+        "the WorkGuard must have dropped once drive_run_to_completion returned its terminal \
+         outcome"
+    );
+}
+
+/// The other half of #93: a `close()` racing a still-driving workflow run
+/// must genuinely wait for it, not just for whatever `run_agent_loop`
+/// happens to be doing — and once it does resolve, the `SessionClosed`
+/// terminator it appends must be the log's last event, never interleaved
+/// with the run's own in-flight task events. Before this task, `close()`
+/// would sail through `wait_idle()` immediately (no `WorkGuard` held),
+/// racing its own `SessionClosed` append against whatever `flush_task_
+/// events` the still-driving run was about to commit.
+#[tokio::test]
+async fn close_during_a_workflow_run_waits_for_the_run_to_unwind() {
+    use futures::FutureExt;
+
+    let dir = tempfile::tempdir().unwrap();
+    let workspace_root = dir.path().canonicalize().unwrap();
+    let (mut executor, session, run_id, spec, run_ctx, now) =
+        drivable_read_run(&workspace_root).await;
+    let session_id = session.session_id();
+    let actor = Arc::clone(session.actor());
+    let store = executor.store.clone();
+
+    let gate = Arc::new(SegmentGapGate::new());
+    executor.segment_gap_gate = Some(Arc::clone(&gate));
+
+    let drive_executor = executor.clone();
+    let drive = tokio::spawn(async move {
+        drive_executor
+            .drive_run_to_completion(
+                run_id,
+                session_id,
+                &session,
+                spec,
+                workspace_root,
+                run_ctx,
+                now,
+                None,
+            )
+            .await
+    });
+
+    for _ in 0..100_000 {
+        if gate.entrants() == 1 {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(
+        gate.entrants(),
+        1,
+        "the run must reach the segment gap before dispatching its one step"
+    );
+
+    let mut close_fut = Box::pin(actor.close(SessionOutcome::Cancelled));
+    // A single `now_or_never()` poll only proves `close()` has not
+    // finished on its very first `.await` (still inside `cancel()`'s own
+    // durable append) — true regardless of this fix, since that append
+    // has to cross a real `spawn_blocking` boundary either way. What
+    // actually pins the fix is that `close()` must stay unresolved for as
+    // long as the gate stays shut: repolling it, yielding to the runtime
+    // between each attempt so `cancel()`'s append (and anything else not
+    // gated by the `WorkGuard`) gets every chance to finish, is what
+    // proves `wait_idle()` — not some slower step upstream of it — is
+    // what is actually holding `close()` back.
+    for _ in 0..10_000 {
+        assert!(
+            close_fut.as_mut().now_or_never().is_none(),
+            "close must not resolve while drive_run_to_completion still holds this run's \
+                 WorkGuard — the gate is still shut"
+        );
+        tokio::task::yield_now().await;
+    }
+
+    gate.release(1);
+    tokio::time::timeout(Duration::from_secs(10), drive)
+        .await
+        .expect("the run must not hang past its own segment gap")
+        .expect("the drive task must not panic")
+        .expect("drive_run_to_completion's own DeliveryError path must not be reached")
+        .expect("run_workflow must not return a RunLoopError for this fixture");
+
+    tokio::time::timeout(Duration::from_secs(10), close_fut)
+        .await
+        .expect("close must resolve once the run has genuinely unwound its own WorkGuard")
+        .expect("close must succeed");
+
+    let events = roundhouse_store::session_events(&store, session_id)
+        .await
+        .expect("reading back this session's own event log must succeed");
+    let max_seq = events
+        .iter()
+        .map(|e| e.seq)
+        .max()
+        .expect("a driven, closed session's log must be non-empty");
+    let closed = events
+        .iter()
+        .find(|e| matches!(e.payload, EventPayload::SessionClosed { .. }))
+        .expect("close() must have appended a SessionClosed terminator");
+    assert_eq!(
+        closed.seq, max_seq,
+        "SessionClosed must be the log's last event — it may only be appended once the run's \
+             own WorkGuard has genuinely dropped, never interleaved with its still-in-flight \
+             task events"
+    );
+}
+
 /// Task 7's boot-time restart-recovery pass, exercised against the same
 /// [`Harness`] scaffolding — but always through a **fresh**
 /// [`DeliveryExecutor`]/[`InMemoryRunRegistry`]/[`SessionRegistry`]

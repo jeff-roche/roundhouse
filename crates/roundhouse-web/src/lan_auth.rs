@@ -92,13 +92,14 @@
 //! check is always on rather than gated behind this module's `Some(gate)`. See
 //! that module for the attack and for why CORS cannot answer it (ruling P93 §A).
 //!
-//! **The cost, stated rather than assumed away:** Task 32 gave
-//! [`crate::sse::SseHub`] a replay ring, so an unauthenticated *local* reader of
-//! `/api/sessions/{id}/events` now gets up to the ring's retained **history**
-//! (see [`crate::sse::Retention`] for the configured bound), not merely events
-//! published after it connected. If anyone later decides §6.4's stricter
-//! reading wins, that is a deliberate reversal of a stated cost, not a
-//! discovery.
+//! **The cost, stated rather than assumed away:** `/api/sessions/{id}/events`
+//! replays a session's committed history out of the store (Phase 8 Task 21;
+//! Task 32 gave it an in-memory ring first, since retired), so an
+//! unauthenticated *local* reader gets everything from its `Last-Event-ID`
+//! cursor onward — every event the store has ever kept for that session, with
+//! nothing evicted — not merely events published after it connected. If
+//! anyone later decides §6.4's stricter reading wins, that is a deliberate
+//! reversal of a stated cost, not a discovery.
 //!
 //! # 3. "Bound to the LAN with no gate" is unconstructable, not merely wrong
 //!

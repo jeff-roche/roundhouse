@@ -288,3 +288,46 @@ pub async fn resources_with(
     )
     .await
 }
+
+/// [`real_actor`], but writing through `resources.store` (Phase 8 Task 21): a
+/// connection driven with these `resources` follows the session from that same
+/// pool's `CommitFeed`, so an actor writing through a pool opened separately
+/// (even over the same file) would never wake it.
+pub async fn real_actor_on(dir: &Path, resources: &DaemonResources) -> Arc<SessionActor> {
+    let writer = roundhouse_store::spawn_writer(resources.store.clone()).await;
+    real_actor_with_writer(dir, writer).await
+}
+
+/// Appends one `Note` carrying `text` to `session_id`'s log through `writer`,
+/// the way a live session's own events are committed. Returns its seq.
+pub async fn append_note(
+    writer: &roundhouse_store::EventWriter,
+    session_id: SessionId,
+    text: &str,
+) -> u64 {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos() as i64;
+    let event = runner().record_note(
+        session_id,
+        0, // ignored — EventWriter::append assigns the real per-session seq
+        roundhouse_core::Timestamp::from_unix_nanos(nanos),
+        None,
+        roundhouse_core::NoteLevel::Info,
+        text.to_string(),
+        1,
+    );
+    writer.append(event).await.unwrap()
+}
+
+/// The `Note` text a `ClientEvent::Committed` frame carries, if it is one.
+pub fn committed_note(event: &roundhouse_proto::ClientEvent) -> Option<&str> {
+    match event {
+        roundhouse_proto::ClientEvent::Committed { payload, .. } => match payload.as_ref() {
+            roundhouse_core::EventPayload::Note { text, .. } => Some(text.as_str()),
+            _ => None,
+        },
+        _ => None,
+    }
+}

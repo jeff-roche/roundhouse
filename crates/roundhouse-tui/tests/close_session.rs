@@ -29,12 +29,14 @@ async fn close_session_sends_the_request_and_skips_other_frames_until_the_ack() 
         let (read_half, mut write_half) = stream.into_split();
         let mut reader = BufReader::new(read_half);
 
-        // Handshake: reply with SessionCreated so connect_create resolves.
+        // Handshake: reply with the session's durable SessionCreated (seq 0)
+        // so connect_create resolves.
         let mut line = String::new();
         reader.read_line(&mut line).await.unwrap();
         let _: ClientRequest = serde_json::from_str(line.trim_end()).unwrap();
-        let created = ClientEvent::TaskEvent {
+        let created = ClientEvent::Committed {
             session_id: minted_session_id,
+            seq: 0,
             task_id: None,
             payload: Box::new(EventPayload::SessionCreated {
                 spec: Box::new(roundhouse_core::SessionSpec::test_requesting(
@@ -58,8 +60,9 @@ async fn close_session_sends_the_request_and_skips_other_frames_until_the_ack() 
 
         // An unrelated frame first — close_session must not mistake it for
         // its own reply.
-        let unrelated = ClientEvent::TaskEvent {
+        let unrelated = ClientEvent::Committed {
             session_id: minted_session_id,
+            seq: 1,
             task_id: None,
             payload: Box::new(EventPayload::TaskDelta {
                 delta: Delta::Text {
@@ -83,8 +86,14 @@ async fn close_session_sends_the_request_and_skips_other_frames_until_the_ack() 
         .await
         .unwrap();
     assert_eq!(client.session_id(), minted_session_id);
+    assert_eq!(client.last_seq(), Some(0), "SessionCreated is seq 0");
 
     client.close_session().await.unwrap();
+    assert_eq!(
+        client.last_seq(),
+        Some(1),
+        "a Committed frame skipped while waiting for the Ack still advances the cursor"
+    );
 
     // The fake server sent exactly two lines after the handshake: the
     // unrelated frame, then the `Ack`. If `close_session` returned as soon
@@ -129,8 +138,9 @@ async fn close_session_times_out_if_the_daemon_never_acknowledges_it() {
         let mut line = String::new();
         reader.read_line(&mut line).await.unwrap();
         let _: ClientRequest = serde_json::from_str(line.trim_end()).unwrap();
-        let created = ClientEvent::TaskEvent {
+        let created = ClientEvent::Committed {
             session_id: minted_session_id,
+            seq: 0,
             task_id: None,
             payload: Box::new(EventPayload::SessionCreated {
                 spec: Box::new(roundhouse_core::SessionSpec::test_requesting(

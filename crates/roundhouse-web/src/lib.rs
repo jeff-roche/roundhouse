@@ -46,9 +46,17 @@
 //! remains what you get with no configuration") — the posture inherited from
 //! the frozen design, not decided here, and a different one from the Unix
 //! socket's: a peercred-checked `0700` directory admits only this uid, where a
-//! loopback TCP port admits every local uid. See [`sse`]'s residual 1, which
-//! this task closes only its own half of (a listener exists; nothing calls
-//! [`sse::SseHub::publish`] in production yet — see that module for why).
+//! loopback TCP port admits every local uid. This task closed only half of
+//! [`sse`]'s former residual 1 — a listener existed, but nothing forwarded an
+//! appended event to it. **Phase 8 Task 21 closed the rest**, and changed the
+//! mechanism while doing it: `SseHub` and its per-session ring are retired,
+//! and `/api/sessions/{id}/events` now reads straight from
+//! `roundhouse-store`'s `SessionFollower`, which catches up from the store
+//! itself and then follows its `CommitFeed`. There is no separate hub to
+//! publish into any more — the store already holds every committed event, so
+//! serving one is a read, not a forwarded copy. `resync_required` now fires
+//! for exactly one condition: a client's cursor names a seq ahead of the
+//! session's head. See [`sse`] for the current design.
 //!
 //! Per ruling P10 the assets ship in the **daemon** binary: `roundhouse-web`
 //! links into `roundhouse-daemon`, and `round daemon` (in `roundhouse-cli`)
@@ -78,7 +86,7 @@ pub use assets::{asset_router, WebAssets};
 /// person to add one. `tests/bounded_reach.rs` is what actually holds the line;
 /// this is the signpost pointing at it.
 pub use bounded::{ApiPoolPermits, BoundedStore};
-pub(crate) use bounded::{ConnectionRefusal, StoreConnection};
+pub(crate) use bounded::{BoundedPageSource, ConnectionRefusal, StoreConnection};
 
 /// The wire-protocol version this crate's API speaks, shared with every other
 /// client of `roundhouse-proto`.
@@ -87,8 +95,9 @@ pub(crate) use bounded::{ConnectionRefusal, StoreConnection};
 /// only use of `roundhouse_proto` in the crate and `xtask/tests/
 /// exit_criterion.rs` asserts a required `roundhouse-web -> roundhouse-proto`
 /// Cargo edge. **That prediction is now fulfilled and the note is relaxed:**
-/// `sse::SessionUpdate` carries a `roundhouse_proto::ClientEvent` as the
-/// payload of every SSE frame, so the dependency is load-bearing on its own.
+/// `sse::encode` wraps every `roundhouse_store::StoredEvent` it streams in a
+/// `roundhouse_proto::ClientEvent::TaskEvent` before serialising it as an SSE
+/// frame's `data:` field, so the dependency is load-bearing on its own.
 /// This function stays because clients need to negotiate a wire version, not
 /// because deleting it would break a test.
 pub fn api_version() -> roundhouse_proto::ApiVersion {
@@ -98,18 +107,19 @@ pub fn api_version() -> roundhouse_proto::ApiVersion {
 /// Shared state handed to every route in [`build_router`].
 ///
 /// D1 created this empty, as the seam later Subsystem D tasks add their fields
-/// to; D2 added the first one. `Clone + Debug + Default` is load-bearing, not
-/// incidental: `axum` clones the state per request, and
+/// to; D2 added the first one (`sse::SseHub`, retired by Phase 8 Task 21 —
+/// see below and [`sse`]'s module docs for what replaced it). `Clone + Debug +
+/// Default` is load-bearing, not incidental: `axum` clones the state per
+/// request, and
 /// `tests/assets.rs::a_handler_taking_app_state_composes_with_the_asset_router`
 /// formats it with `{state:?}` and compares against a separately constructed
-/// `AppState::default()` — which holds because [`sse::SseHub`]'s `Debug` is its
-/// [`sse::Retention`] plus its per-session map, and that map is **empty until
-/// something subscribes**. Two default hubs therefore format identically
-/// without either one carrying per-instance identity. It is also why D3's ring
-/// lives behind the hub's own interior mutability rather than being a `&mut`
-/// field here: this type is cloned per request and can hold no exclusive state.
+/// `AppState::default()` — which holds because every field below derives all
+/// three itself and carries no per-instance identity in its `Default` value
+/// (an absent [`store`](Self::store), and an [`ApiPoolPermits`] whose only
+/// state is a count of what is still free, the same for any two freshly
+/// constructed semaphores of equal size).
 ///
-/// D5 added the second field under the same three constraints, which is what
+/// D5 added the store field under the same three constraints, which is what
 /// makes it an `Option` and what makes it a [`roundhouse_store::StorePool`]
 /// rather than a connection. (D6 wrapped that pool in [`BoundedStore`], which
 /// is a newtype and derives all three from it, so every reason below is
@@ -134,11 +144,6 @@ pub fn api_version() -> roundhouse_proto::ApiVersion {
 /// both constructors were routed through one hook.
 #[derive(Clone, Debug, Default)]
 pub struct AppState {
-    /// Per-session fan-out of appended events to open SSE connections, and the
-    /// §11.3 ring each one replays from. **Nothing in this workspace publishes
-    /// into it yet** — see [`sse`]'s module docs, which also record that it
-    /// performs no redaction.
-    pub sse: sse::SseHub,
     /// The daemon's store, when there is one. `None` is a router with no
     /// database behind it — every router in this crate's own test suite, and
     /// whatever a caller builds before it has opened one.

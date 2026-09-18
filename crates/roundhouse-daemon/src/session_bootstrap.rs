@@ -509,6 +509,10 @@ pub enum CreateRealSessionError {
     Policy(#[from] PolicyRulesLoadError),
     #[error(transparent)]
     ProxySecretsPoisoned(#[from] ProxySecretsPoisonedError),
+    /// The durable `SessionCreated` append ([`SessionCreatedRecord::Append`])
+    /// failed.
+    #[error("appending this session's SessionCreated event failed: {0}")]
+    SessionCreatedAppend(#[source] roundhouse_store::StoreError),
 }
 
 impl CreateRealSessionError {
@@ -524,6 +528,7 @@ impl CreateRealSessionError {
             Self::Policy(PolicyRulesLoadError::Config(_)) => "policy_config_error",
             Self::Policy(PolicyRulesLoadError::Compile(_)) => "policy_compile_error",
             Self::ProxySecretsPoisoned(_) => "proxy_secrets_poisoned",
+            Self::SessionCreatedAppend(_) => "session_created_append_failed",
         }
     }
 }
@@ -632,6 +637,17 @@ pub async fn teardown_real_session(proxy: &LoopbackProxy, real_session: RealSess
 /// `AllowDownTo(Tier::None)`) that used to live in this function's body —
 /// it is a property of what the socket path decides to pass in, not of this
 /// function, so it moved with the code that makes the decision.
+///
+/// # `record`: who writes the durable `SessionCreated` (Phase 8 Task 21)
+///
+/// A socket-created session has no other place its `SessionCreated` could be
+/// written, and a UDS client learns its session id from that very row
+/// (streamed to it as `ClientEvent::Committed { seq: 0, .. }`), so the socket
+/// path passes [`SessionCreatedRecord::Append`]. Every other caller already
+/// writes its own `SessionCreated`, in a transaction of its own choosing (the
+/// scheduler's delivery path writes it together with the workflow run row; a
+/// sub-agent child and a workflow child write it carrying their parent), and
+/// passes [`SessionCreatedRecord::ByCaller`] so the log never holds two.
 pub async fn create_real_session(
     resources: &DaemonResources,
     session_id: SessionId,
@@ -639,6 +655,7 @@ pub async fn create_real_session(
     workspace_root: PathBuf,
     workspace_device: Option<i64>,
     workspace_inode: Option<i64>,
+    record: SessionCreatedRecord,
 ) -> Result<RealSession, CreateRealSessionError> {
     let writer = spawn_writer(resources.store.clone()).await;
     let (mcp_configs, network_config, policy_rules) = if resources.load_workspace_config {
@@ -654,6 +671,23 @@ pub async fn create_real_session(
             (resources.policy_rules)(),
         )
     };
+
+    // Appended before anything else this function writes (a `Degradation`
+    // note from `create_session_with_egress`, below), so it is this session's
+    // seq 0.
+    if let SessionCreatedRecord::Append = record {
+        let created = resources.runner.record_session_created(
+            session_id,
+            0, // ignored — EventWriter::append assigns the real per-session seq
+            now_ts(),
+            Box::new(spec.clone()),
+            1,
+        );
+        writer
+            .append(created)
+            .await
+            .map_err(CreateRealSessionError::SessionCreatedAppend)?;
+    }
 
     let egress_policy = egress_policy_for(&network_config);
     let request_ctx = resources.clone_request_ctx();
@@ -781,6 +815,26 @@ pub async fn create_real_session(
         mcp,
         proxy_handle,
     })
+}
+
+/// Whether [`create_real_session`] appends the session's durable
+/// `SessionCreated` itself. See that function's doc comment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionCreatedRecord {
+    /// Append it through the session's own writer, as its first event.
+    Append,
+    /// The caller writes it (or already has); append nothing.
+    ByCaller,
+}
+
+/// `Timestamp` has no `now()`. Mirrors the identical helper in
+/// `sub_agent_host.rs` and `roundhouse-engine`'s `chat.rs`/`agent_loop.rs`.
+fn now_ts() -> roundhouse_core::Timestamp {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system clock before UNIX epoch")
+        .as_nanos() as i64;
+    roundhouse_core::Timestamp::from_unix_nanos(nanos)
 }
 
 /// Ruling W1-R85 — the ONLY writer of `mcp_resolved`; skipping this call
@@ -1234,6 +1288,7 @@ mod tests {
             dir.path().to_path_buf(),
             None,
             None,
+            SessionCreatedRecord::Append,
         )
         .await
         .unwrap();
@@ -1275,6 +1330,7 @@ mod tests {
             dir.path().to_path_buf(),
             None,
             None,
+            SessionCreatedRecord::Append,
         )
         .await
         .unwrap();
@@ -1376,6 +1432,7 @@ mod tests {
             dir.path().to_path_buf(),
             None,
             None,
+            SessionCreatedRecord::Append,
         )
         .await
         {
@@ -1481,6 +1538,7 @@ mod tests {
                 dir.path().to_path_buf(),
                 None,
                 None,
+                SessionCreatedRecord::Append,
             )
             .await
             .expect("a real, working configured MCP server must not fail session creation");

@@ -176,6 +176,7 @@ async fn agent_and_call_children_share_one_parents_fan_out_ceiling() {
         Arc::clone(&resources.spawn_tree),
         common::runner(),
         SessionSpec::test_default(),
+        resources.store.commit_feed().clone(),
     );
 
     let spawn_sub_agent = |args: serde_json::Value| {

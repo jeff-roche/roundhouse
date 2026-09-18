@@ -14,8 +14,10 @@
 
 pub mod attention;
 pub mod blobs;
+mod commit_feed;
 pub mod cost;
 mod fold;
+mod follow;
 mod migrations;
 mod pool;
 mod recovery;
@@ -74,6 +76,20 @@ pub use attention::{blocked_anywhere, BlockedTask};
 // Task 18 (Phase 2) exports: session-scoped event reads (used by
 // roundhouse-secrets' keyring-fallback Degradation visibility test).
 pub use session_events::session_events;
+
+// Phase 8 Task 21, Task 1 exports: the store-side commit feed a follower watches
+// (`CommitFeed`/`CommitWatch`), and the sync, paged reads it re-reads with
+// (`events_after`/`session_head`). Task 2 adds `AppendedEvent`, the receipt a caller that
+// appends through its own transaction (bypassing `spawn_writer`) hands to
+// `CommitFeed::notify_appended`.
+pub use commit_feed::{AppendedEvent, CommitFeed, CommitWatch};
+pub use session_events::{events_after, session_head};
+
+// Phase 8 Task 21, Task 3 exports: the cancel-safe catch-up-then-follow reader
+// (`SessionFollower`) and the seam it reads pages through (`PageSource`), so
+// `roundhouse-web` can implement the same catch-up-then-follow logic over its own
+// permit-bounded store.
+pub use follow::{PageSource, SessionFollower, FOLLOW_PAGE};
 
 // CQRS read-model exports (storage replay / fold)
 pub use replay::StoredEvent;

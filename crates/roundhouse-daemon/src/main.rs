@@ -46,9 +46,10 @@ use roundhouse_daemon::workspace_registry::{WorkspaceRegistration, WorkspaceRegi
 use roundhouse_engine::EngineHandles;
 use roundhouse_net::proxy::LoopbackProxy;
 use roundhouse_provider::{
-    AnthropicMessagesProvider, BoxFut, Capabilities, ChatRequest, ChatStream, HttpRequest,
-    HttpResponseStream, HttpTransport, ModelId, ModelInfo, Plan, Provider, ProviderError,
-    RequestCtx, ReqwestTransport, TokenCount, TransportError,
+    parse_anthropic_base_url, AnthropicBaseUrlTransport, AnthropicMessagesProvider, BaseUrlError,
+    BoxFut, Capabilities, ChatRequest, ChatStream, HttpRequest, HttpResponseStream, HttpTransport,
+    ModelId, ModelInfo, Plan, Provider, ProviderError, RequestCtx, ReqwestTransport, TokenCount,
+    TransportError,
 };
 use roundhouse_sandbox::isolate::BwrapLandlockIsolate;
 use roundhouse_sandbox::Isolate;
@@ -166,6 +167,23 @@ fn parse_workspace_registration(raw: &str) -> Result<WorkspaceRegistration, Stri
     Ok(registration)
 }
 
+/// Resolves `main`'s reading of `ROUNDHOUSE_ANTHROPIC_BASE_URL`: an unset (or
+/// empty — same "unset" treatment `ANTHROPIC_API_KEY` itself gets above)
+/// variable resolves to `Ok(None)`, meaning "use `AnthropicMessagesProvider`'s
+/// own default"; anything else is validated by
+/// [`roundhouse_provider::parse_anthropic_base_url`] (fix round 1: moved
+/// there from a hand-rolled parser in this crate — see that function's own
+/// doc comment for why hand-rolled authority splitting was a real security
+/// bypass, not just a style preference).
+fn resolve_anthropic_base_url(
+    raw: Option<String>,
+) -> Result<Option<(String, AnthropicBaseUrlTransport)>, BaseUrlError> {
+    match raw.filter(|value| !value.is_empty()) {
+        Some(value) => parse_anthropic_base_url(&value).map(Some),
+        None => Ok(None),
+    }
+}
+
 /// The one process-wide `TaskRunner`, obtained exactly once via
 /// `EngineHandles::bootstrap` (which panics on a second call — see
 /// `roundhouse_core::TaskRunner::bootstrap`'s own doc comment) and exposed
@@ -227,15 +245,61 @@ async fn main() -> color_eyre::Result<()> {
             .ok()
             .filter(|key| !key.is_empty())
         {
-            Some(api_key) => (
-                Arc::new(AnthropicMessagesProvider::new()),
-                RequestCtx {
-                    trace_id: None,
-                    transport: Arc::new(ReqwestTransport::new()),
-                    api_key,
-                    credentials: None,
-                },
-            ),
+            Some(api_key) => {
+                let mut anthropic_provider = AnthropicMessagesProvider::new();
+                // `ROUNDHOUSE_ANTHROPIC_BASE_URL` is read only here, gated on
+                // a real key being present, so a mock/gateway base URL can
+                // never do anything on a daemon that has no live provider
+                // anyway. `resolve_anthropic_base_url`/`parse_anthropic_base_url`
+                // never see `api_key`, so this cannot leak it either way.
+                //
+                // The transport is chosen here, visibly, from the SAME
+                // validated result that set `base_url` — never independently
+                // of it. `AnthropicBaseUrlTransport::HttpLoopback` is a
+                // promise `parse_anthropic_base_url` only ever makes about a
+                // URL it has itself already confirmed is `http://` against a
+                // loopback host; picking `allowing_plaintext_http()` any
+                // other way (e.g. from a bare scheme check re-done here)
+                // would reopen exactly the gap fix round 1 closed.
+                let transport: Arc<dyn HttpTransport> = match resolve_anthropic_base_url(
+                    std::env::var("ROUNDHOUSE_ANTHROPIC_BASE_URL").ok(),
+                ) {
+                    Ok(Some((base_url, AnthropicBaseUrlTransport::Https))) => {
+                        tracing::info!(
+                            target: "roundhouse_daemon::boot",
+                            base_url = %base_url,
+                            "using operator-configured ROUNDHOUSE_ANTHROPIC_BASE_URL"
+                        );
+                        anthropic_provider.base_url = base_url;
+                        Arc::new(ReqwestTransport::new())
+                    }
+                    Ok(Some((base_url, AnthropicBaseUrlTransport::HttpLoopback))) => {
+                        tracing::info!(
+                            target: "roundhouse_daemon::boot",
+                            base_url = %base_url,
+                            "using operator-configured ROUNDHOUSE_ANTHROPIC_BASE_URL \
+                             (plaintext http, loopback only)"
+                        );
+                        anthropic_provider.base_url = base_url;
+                        Arc::new(ReqwestTransport::allowing_plaintext_http())
+                    }
+                    Ok(None) => Arc::new(ReqwestTransport::new()),
+                    Err(err) => {
+                        return Err(color_eyre::eyre::eyre!(
+                            "invalid ROUNDHOUSE_ANTHROPIC_BASE_URL: {err}"
+                        ));
+                    }
+                };
+                (
+                    Arc::new(anthropic_provider) as Arc<dyn Provider>,
+                    RequestCtx {
+                        trace_id: None,
+                        transport,
+                        api_key,
+                        credentials: None,
+                    },
+                )
+            }
             None => (
                 Arc::new(NoProviderConfigured) as Arc<dyn Provider>,
                 RequestCtx {
@@ -436,7 +500,15 @@ async fn main() -> color_eyre::Result<()> {
     let daemon_binary = std::fs::canonicalize(std::env::current_exe()?)?;
 
     let store_path = runtime_dir.join("events.db");
-    let session_store = roundhouse_store::open(&store_path).await?;
+    // Phase 8 Task 21, Task 2: one `CommitFeed` for the whole daemon process, shared across
+    // every `StorePool` opened over `store_path` below (`with_commit_feed`) — `open` builds
+    // a fresh, empty feed per call, and a `notify()`/`notify_appended()` on one pool's own
+    // feed would never wake a `watch()` taken from a different pool's, even though both
+    // point at the same file on disk. Built once, here, before any of them.
+    let commit_feed = roundhouse_store::CommitFeed::default();
+    let session_store = roundhouse_store::open(&store_path)
+        .await?
+        .with_commit_feed(commit_feed.clone());
     let workspace_registry = Arc::new(
         WorkspaceRegistry::open_with_protected_paths(
             session_store.clone(),
@@ -465,9 +537,13 @@ async fn main() -> color_eyre::Result<()> {
     // were always correctly sitting in the database. Runs once, here, between
     // opening the store and starting the accept loop — on a fresh
     // `store_path` this is a cheap no-op scan over an empty `tasks` table.
-    let recovery_store = roundhouse_store::open(&store_path).await?;
+    let recovery_store = roundhouse_store::open(&store_path)
+        .await?
+        .with_commit_feed(commit_feed.clone());
     let recovery_writer = roundhouse_store::spawn_writer(recovery_store).await;
-    let recovery_pool_for_scan = roundhouse_store::open(&store_path).await?;
+    let recovery_pool_for_scan = roundhouse_store::open(&store_path)
+        .await?
+        .with_commit_feed(commit_feed.clone());
     let approval_registry = roundhouse_policy::registry::ApprovalRegistry::new();
     let boot_report = roundhouse_daemon::boot::run_boot_sequence(
         &recovery_pool_for_scan,
@@ -511,7 +587,9 @@ async fn main() -> color_eyre::Result<()> {
     // `session_bootstrap::create_real_session`) exists, per
     // `create_session_with_egress`'s own doc comment.
     let proxy = Arc::new(LoopbackProxy::new());
-    let proxy_store = roundhouse_store::open(&store_path).await?;
+    let proxy_store = roundhouse_store::open(&store_path)
+        .await?
+        .with_commit_feed(commit_feed.clone());
     let proxy_writer = roundhouse_store::spawn_writer(proxy_store).await;
     proxy.clone().serve(runner, proxy_writer.clone()).await?;
 
@@ -1085,5 +1163,41 @@ mod tests {
 
         let error = validate_socket_path(&socket).unwrap_err();
         assert_eq!(error.kind(), ErrorKind::PermissionDenied);
+    }
+
+    // The scheme/host/userinfo/query/fragment adversarial table lives in
+    // `roundhouse-provider`'s `anthropic_provider::base_url_tests` now (fix
+    // round 1 moved `parse_anthropic_base_url` there, parsing with
+    // `reqwest::Url` instead of this crate's retired hand-rolled splitter).
+    // These tests cover only the thin wrapper this crate still owns: the
+    // "empty/unset" env-var treatment, and that a present value really does
+    // delegate to the real validator rather than, say, silently no-opping.
+
+    #[test]
+    fn resolve_anthropic_base_url_treats_unset_and_empty_as_unset() {
+        assert_eq!(resolve_anthropic_base_url(None), Ok(None));
+        assert_eq!(resolve_anthropic_base_url(Some(String::new())), Ok(None));
+    }
+
+    #[test]
+    fn resolve_anthropic_base_url_delegates_a_present_value_to_the_real_validator() {
+        assert_eq!(
+            resolve_anthropic_base_url(Some("https://api.anthropic.com/".to_string())),
+            Ok(Some((
+                "https://api.anthropic.com".to_string(),
+                AnthropicBaseUrlTransport::Https
+            )))
+        );
+        assert_eq!(
+            resolve_anthropic_base_url(Some("http://127.0.0.1:4317".to_string())),
+            Ok(Some((
+                "http://127.0.0.1:4317".to_string(),
+                AnthropicBaseUrlTransport::HttpLoopback
+            )))
+        );
+        assert_eq!(
+            resolve_anthropic_base_url(Some("http://example.com".to_string())),
+            Err(BaseUrlError::NonLoopbackHttp("example.com".to_string()))
+        );
     }
 }

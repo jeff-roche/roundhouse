@@ -32,7 +32,9 @@ fn transaction_scoped_append_rolls_back_with_its_owner_write() {
 
     {
         let txn = begin_immediate(&mut conn).unwrap();
-        roundhouse_store::append_event_in_transaction(&txn, &event, &redactor).unwrap();
+        // A rollback test, not a commit path — the receipt has no `CommitFeed` to be
+        // handed to, since this transaction is dropped without ever committing.
+        let _ = roundhouse_store::append_event_in_transaction(&txn, &event, &redactor).unwrap();
         txn.execute(
             "INSERT INTO trigger_event
              (binding_id, idempotency_key, scheduled_for, fired_at, is_catch_up)

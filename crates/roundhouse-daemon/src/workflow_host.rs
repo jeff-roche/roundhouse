@@ -20,6 +20,18 @@ pub struct WorkflowSessionTree {
     tree: Arc<SpawnTree>,
     runner: &'static TaskRunner,
     session_spec: SessionSpec,
+    commit_feed: roundhouse_store::CommitFeed,
+    /// Receipts from this transaction's own `persist_child_session`/`persist_parent_call_task`
+    /// calls, stashed rather than notified immediately (Phase 8 Task 21, Task 2): both run
+    /// *inside* `roundhouse-flow`'s `SqliteWorkflowHost::create_child_run` transaction, which
+    /// that crate — not this one — commits or rolls back. `register_child` (called only
+    /// after `create_child_run`'s own `txn.commit()` succeeds) drains this into
+    /// `CommitFeed::notify_appended`; `release_child` (its failure path, reached on any
+    /// error before or at that commit) clears it instead, since nothing in the transaction
+    /// that produced these receipts actually landed. See `SessionTree`'s trait doc comment
+    /// and `SqliteWorkflowHost::create_child_run` (`roundhouse-flow`) for the exact call
+    /// ordering this hand-off relies on.
+    pending_notify: Vec<roundhouse_store::AppendedEvent>,
 }
 
 impl WorkflowSessionTree {
@@ -27,11 +39,14 @@ impl WorkflowSessionTree {
         tree: Arc<SpawnTree>,
         runner: &'static TaskRunner,
         session_spec: SessionSpec,
+        commit_feed: roundhouse_store::CommitFeed,
     ) -> Self {
         Self {
             tree,
             runner,
             session_spec,
+            commit_feed,
+            pending_notify: Vec::new(),
         }
     }
 
@@ -55,6 +70,15 @@ impl SessionTree for WorkflowSessionTree {
 
     fn release_child(&mut self, parent: SessionId, child: SessionId) {
         self.tree.release_child_reservation(parent, child);
+        // `create_child_run`'s failure path (`roundhouse-flow`'s `production.rs`) calls this
+        // after any error before or at `txn.commit()` — including one after
+        // `persist_child_session`/`persist_parent_call_task` already stashed a receipt here.
+        // That transaction never committed, so nothing in `pending_notify` actually landed;
+        // clearing it (rather than notifying) is what keeps a rolled-back append from
+        // waking a follower. A no-op when nothing was stashed, which is every OTHER caller
+        // of `release_child` (an ordinary reservation release with no transaction behind it
+        // at all).
+        self.pending_notify.clear();
     }
 
     fn persist_child_session(
@@ -76,11 +100,14 @@ impl SessionTree for WorkflowSessionTree {
             Box::new(spec),
             1,
         );
-        roundhouse_store::append_event_in_transaction(
+        let appended = roundhouse_store::append_event_in_transaction(
             txn,
             &event,
             &roundhouse_store::redact::Redactor::build(&[]),
         )?;
+        // Stashed, not notified — see `pending_notify`'s own doc comment on this struct for
+        // why: `txn` is `create_child_run`'s transaction, not this method's to commit.
+        self.pending_notify.push(appended);
         Ok(())
     }
 
@@ -103,11 +130,13 @@ impl SessionTree for WorkflowSessionTree {
             input,
             1,
         );
-        roundhouse_store::append_event_in_transaction(
+        let appended = roundhouse_store::append_event_in_transaction(
             txn,
             &event,
             &roundhouse_store::redact::Redactor::build(&[]),
         )?;
+        // Same hand-off as `persist_child_session` above.
+        self.pending_notify.push(appended);
         Ok(())
     }
 
@@ -118,6 +147,13 @@ impl SessionTree for WorkflowSessionTree {
         _job_id: JobId,
     ) -> Result<(), WorkflowHostError> {
         self.tree.commit_child_reservation(parent, child);
+        // `create_child_run` calls this only after its own `txn.commit()` returned `Ok`
+        // (see `SessionTree::register_child`'s trait doc comment), so every receipt
+        // `persist_child_session`/`persist_parent_call_task` stashed for THIS transaction
+        // really did land — safe to notify now, and this is the only point that ever
+        // drains `pending_notify` into a real wake.
+        self.commit_feed
+            .notify_appended(&std::mem::take(&mut self.pending_notify));
         Ok(())
     }
 
@@ -487,6 +523,7 @@ fn parse_session_id(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use futures::FutureExt;
     use roundhouse_core::{JobId, SessionSpec, Timestamp};
     use roundhouse_flow::caps::ResourceCaps;
     use roundhouse_flow::durability::{insert_workflow_run, open_test_db, RunState, WorkflowRun};
@@ -542,7 +579,10 @@ mod tests {
 
     fn append(conn: &mut rusqlite::Connection, event: &roundhouse_core::Event) {
         let txn = roundhouse_store::begin_immediate(conn).unwrap();
-        roundhouse_store::append_event_in_transaction(
+        // No `CommitFeed` in play in this seeding helper — these tests read the appended
+        // rows straight back off `conn`, never through a watcher, so the receipt has
+        // nothing to be handed to.
+        let _ = roundhouse_store::append_event_in_transaction(
             &txn,
             event,
             &roundhouse_store::redact::Redactor::build(&[]),
@@ -982,6 +1022,7 @@ mod tests {
             Arc::clone(&tree),
             crate::test_support::runner(),
             SessionSpec::test_default(),
+            roundhouse_store::CommitFeed::default(),
         );
         assert_eq!(
             host.reserve_child(parent_session, child.session_id)
@@ -1034,6 +1075,7 @@ mod tests {
             Arc::clone(&tree),
             crate::test_support::runner(),
             SessionSpec::test_default(),
+            roundhouse_store::CommitFeed::default(),
         );
 
         let children: Vec<SessionId> = (0..MAX_DIRECT_CHILD_CALLS)
@@ -1113,6 +1155,7 @@ mod tests {
             Arc::clone(&tree),
             crate::test_support::runner(),
             template_spec,
+            roundhouse_store::CommitFeed::default(),
         );
         host.reserve_child(parent_session, child.session_id)
             .unwrap();
@@ -1138,5 +1181,117 @@ mod tests {
             }
             other => panic!("expected SessionCreated, got {other:?}"),
         }
+    }
+
+    /// Phase 8 Task 21, Task 2's `pending_notify` hand-off, rollback half:
+    /// `persist_parent_call_task`'s receipt is stashed, not notified — and `release_child`
+    /// (`create_child_run`'s own failure path, in `roundhouse-flow`'s `production.rs`)
+    /// clears it rather than draining it into `CommitFeed::notify_appended`, because the
+    /// transaction that produced it was never committed. Both the parent's own session
+    /// (`persist_parent_call_task`'s target) and the child's (unused here, but watched for
+    /// symmetry with the companion test below) must see no wake.
+    #[test]
+    fn persist_parent_call_task_then_release_child_notifies_nothing() {
+        let mut conn = open_test_db();
+        let parent_session = SessionId::new();
+        let parent_run = RunId::new();
+        let mut parent = child_run(RunId::new(), parent_session);
+        parent.id = parent_run;
+        parent.parent_run_id = None;
+        parent.session_depth = Some(0);
+        insert_workflow_run(&mut conn, &parent).unwrap();
+
+        let child_session = SessionId::new();
+        let commit_feed = roundhouse_store::CommitFeed::default();
+        let mut parent_watch = commit_feed.watch(parent_session);
+        let mut child_watch = commit_feed.watch(child_session);
+        parent_watch.mark_seen();
+        child_watch.mark_seen();
+
+        let mut host = WorkflowSessionTree::new(
+            Arc::new(SpawnTree::new()),
+            crate::test_support::runner(),
+            SessionSpec::test_default(),
+            commit_feed,
+        );
+
+        let txn = roundhouse_store::begin_immediate(&mut conn).unwrap();
+        host.persist_parent_call_task(
+            &txn,
+            parent_session,
+            Timestamp::from_unix_nanos(1),
+            TaskId::new(),
+            TaskInput::Text("call it".into()),
+        )
+        .unwrap();
+        // The transaction is dropped without ever committing — exactly what
+        // `create_child_run`'s failure path leaves behind before it calls `release_child`.
+        drop(txn);
+        host.release_child(parent_session, child_session);
+
+        assert!(
+            parent_watch.changed().now_or_never().is_none(),
+            "an uncommitted persist_parent_call_task must not wake its session"
+        );
+        assert!(
+            child_watch.changed().now_or_never().is_none(),
+            "release_child must not wake a session it never appended to either"
+        );
+    }
+
+    /// The commit half of the same hand-off: `persist_child_session` (the child's own
+    /// `SessionCreated`) and `persist_parent_call_task` (the parent's `TaskCreated`) both
+    /// stash a receipt inside one real, committed transaction, and `register_child` —
+    /// called only after that commit succeeds, exactly as `create_child_run` calls it —
+    /// drains both into `CommitFeed::notify_appended`, waking BOTH sessions.
+    #[test]
+    fn persist_child_and_parent_call_then_register_child_notifies_both_sessions() {
+        let mut conn = open_test_db();
+        let parent_session = SessionId::new();
+        let parent_run = RunId::new();
+        let mut parent = child_run(RunId::new(), parent_session);
+        parent.id = parent_run;
+        parent.parent_run_id = None;
+        parent.session_depth = Some(0);
+        insert_workflow_run(&mut conn, &parent).unwrap();
+
+        let child = child_run(parent_run, SessionId::new());
+        let commit_feed = roundhouse_store::CommitFeed::default();
+        let mut parent_watch = commit_feed.watch(parent_session);
+        let mut child_watch = commit_feed.watch(child.session_id);
+        parent_watch.mark_seen();
+        child_watch.mark_seen();
+
+        let mut host = WorkflowSessionTree::new(
+            Arc::new(SpawnTree::new()),
+            crate::test_support::runner(),
+            SessionSpec::test_default(),
+            commit_feed,
+        );
+
+        let txn = roundhouse_store::begin_immediate(&mut conn).unwrap();
+        host.persist_child_session(&txn, parent_session, &child)
+            .unwrap();
+        roundhouse_flow::durability::insert_workflow_run_in_transaction(&txn, &child).unwrap();
+        host.persist_parent_call_task(
+            &txn,
+            parent_session,
+            Timestamp::from_unix_nanos(1),
+            TaskId::new(),
+            TaskInput::Text("call it".into()),
+        )
+        .unwrap();
+        txn.commit().unwrap();
+        host.register_child(parent_session, child.session_id, JobId::new())
+            .unwrap();
+
+        assert!(
+            parent_watch.changed().now_or_never().is_some(),
+            "the parent's own TaskCreated must wake its session once register_child runs"
+        );
+        assert!(
+            child_watch.changed().now_or_never().is_some(),
+            "the child's own SessionCreated must wake its session once register_child runs"
+        );
     }
 }

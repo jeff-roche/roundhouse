@@ -97,7 +97,7 @@ use roundhouse_sched::store::{
 use roundhouse_sched::trigger::{
     Binding, OverlapPolicy, StoredBinding, TriggerEventOutcome, TriggerSpec,
 };
-use roundhouse_store::StorePool;
+use roundhouse_store::{AppendedEvent, CommitFeed, StorePool};
 use rusqlite::Connection;
 use uuid::Uuid;
 
@@ -1010,12 +1010,18 @@ impl TaskSink for BufferedTaskSink {
 /// `TaskCreated`/`TaskCompleted` today, so this arm is unreachable — it
 /// exists so that a future emit of a different payload is *loud* rather than
 /// invisible.
+///
+/// This is a direct-commit path (Phase 8 Task 21, Task 2): it owns and commits its own
+/// transaction rather than going through `spawn_writer`, so nothing notifies `session_id`'s
+/// followers unless this function does it itself — hence `commit_feed`, handed the
+/// transaction's collected [`AppendedEvent`] receipts once `txn.commit()` returns `Ok`.
 fn flush_task_events(
     conn: &mut Connection,
     runner: &'static TaskRunner,
     session_id: SessionId,
     now: Timestamp,
     sink: BufferedTaskSink,
+    commit_feed: &CommitFeed,
 ) -> Result<(), roundhouse_store::StoreError> {
     if sink.emitted.is_empty() {
         return Ok(());
@@ -1026,6 +1032,7 @@ fn flush_task_events(
     // redactor to match. When secret resolution lands, this is the call site
     // that must be handed the same values.
     let redactor = roundhouse_store::redact::Redactor::build(&[]);
+    let mut appended: Vec<AppendedEvent> = Vec::new();
     for (task_id, payload) in sink.emitted {
         let event = match payload {
             EventPayload::TaskCreated {
@@ -1076,9 +1083,12 @@ fn flush_task_events(
                 continue;
             }
         };
-        roundhouse_store::append_event_in_transaction(&txn, &event, &redactor)?;
+        appended.push(roundhouse_store::append_event_in_transaction(
+            &txn, &event, &redactor,
+        )?);
     }
     txn.commit()?;
+    commit_feed.notify_appended(&appended);
     Ok(())
 }
 
@@ -2180,6 +2190,10 @@ impl DeliveryExecutor {
         };
         let session_spec = spec.clone();
         let runner = self.resources.runner;
+        // Direct-commit path (Phase 8 Task 21, Task 2): this transaction is this function's
+        // own, not `spawn_writer`'s, so nothing wakes `session_id`'s followers unless this
+        // closure calls `notify_appended` itself after `txn.commit()` succeeds.
+        let commit_feed = self.store.commit_feed().clone();
         self.with_connection(move |conn| {
             let txn = roundhouse_store::begin_immediate(conn)?;
             roundhouse_flow::durability::insert_workflow_run_in_transaction(&txn, &run)
@@ -2191,12 +2205,13 @@ impl DeliveryExecutor {
                 Box::new(session_spec),
                 EVENT_SCHEMA_V,
             );
-            roundhouse_store::append_event_in_transaction(
+            let appended = roundhouse_store::append_event_in_transaction(
                 &txn,
                 &event,
                 &roundhouse_store::redact::Redactor::build(&[]),
             )?;
             txn.commit()?;
+            commit_feed.notify_appended(&[appended]);
             Ok::<_, roundhouse_store::StoreError>(())
         })
         .await?
@@ -2526,7 +2541,37 @@ impl DeliveryExecutor {
             }
         };
 
+        // Issue #93: held for this call's own body only — from here, once the run
+        // definition has actually resolved, until this function returns by any path
+        // below (the loop's two `return`s, or an early `?` from a segment's own
+        // `with_connection` call). `session.actor()` is the same `SessionActor` this
+        // run's session ID names, so `SessionActor::wait_idle` (and so a later
+        // `SessionActor::close`) cannot durably close this session while this run is
+        // still actively driving it — exactly the gap #93 reported: before this guard,
+        // the only production caller of `begin_work` was `run_agent_loop`, so a
+        // workflow-driven session held none at all, and `wait_idle` returned
+        // immediately for it. Never carried past this function's own return: the
+        // caller's `handle_run_outcome` calls `close_and_retire`, which calls this same
+        // `close`, so holding the guard across that call — or across a park, which
+        // leaves the run suspended indefinitely rather than driving to completion —
+        // would deadlock it against itself.
+        //
+        // `dispatch_one_pending`'s `PendingKind::ChildRun` arm drives a `call:` child's
+        // own run to completion by awaiting this same function again, inline, so this
+        // guard — the parent's, not the child's own separate one — stays held for the
+        // child's entire run, however long that takes. Closing the parent session while
+        // that child run is still in flight therefore blocks on `SessionActor::close`'s
+        // own `wait_idle` (which runs before `close_children`) until the child finishes,
+        // bounded only by whatever close timeout the caller applies — a known,
+        // follow-up-tracked cost of driving children inline rather than as their own
+        // independently cancellable tasks.
+        let _work = session.actor().begin_work();
+
         let runner = self.resources.runner;
+        // Cloned once per segment below, not once here: `with_connection`'s closure is
+        // `FnOnce`, so each loop iteration needs its own owned handle. Cloning a
+        // `CommitFeed` is cheap (an `Arc` around its session map).
+        let commit_feed = self.store.commit_feed().clone();
         loop {
             let def = Arc::clone(&def);
             let segment_run_ctx = run_ctx.clone();
@@ -2534,12 +2579,18 @@ impl DeliveryExecutor {
             let segment_workspace_root = workspace_root.clone();
             let spawn_tree = Arc::clone(&self.spawn_tree);
             let resume_segment = resume.take();
+            let segment_commit_feed = commit_feed.clone();
             let outcome = self
                 .with_connection(move |conn| {
                     let mut sink = BufferedTaskSink::default();
                     let mut host = SqliteWorkflowHost::with_session_tree(
                         segment_workspace_root,
-                        Box::new(WorkflowSessionTree::new(spawn_tree, runner, segment_spec)),
+                        Box::new(WorkflowSessionTree::new(
+                            spawn_tree,
+                            runner,
+                            segment_spec,
+                            segment_commit_feed.clone(),
+                        )),
                     );
                     let outcome = run_workflow_from_definition(
                         conn,
@@ -2551,7 +2602,9 @@ impl DeliveryExecutor {
                         now,
                         resume_segment,
                     );
-                    if let Err(error) = flush_task_events(conn, runner, session_id, now, sink) {
+                    if let Err(error) =
+                        flush_task_events(conn, runner, session_id, now, sink, &segment_commit_feed)
+                    {
                         tracing::error!(
                             session_id = %session_id,
                             error = %error,
@@ -3534,6 +3587,12 @@ impl DeliveryExecutor {
             | RunState::AwaitingHuman => return Err(DeliveryError::ChildJoin),
         };
         let runner = self.resources.runner;
+        // Direct-commit path (Phase 8 Task 21, Task 2): `Pending`'s own append below is
+        // this closure's own committed transaction, not `spawn_writer`'s, so nothing wakes
+        // `parent_session_id`'s followers unless this closure calls `notify_appended`
+        // itself. `Joined` appends nothing (a replayed, already-joined call), so there is
+        // nothing to notify on that branch.
+        let commit_feed = self.store.commit_feed().clone();
         let joined = self
             .with_connection(
                 move |conn| -> Result<Option<(WorkflowChildCall, u64, u64)>, roundhouse_store::StoreError> {
@@ -3561,6 +3620,7 @@ impl DeliveryExecutor {
                             "a task projection held a negative creation sequence".into(),
                         )
                     })?;
+                    let mut appended: Option<AppendedEvent> = None;
                     let last_task_seq = match call.join {
                         ChildCallJoin::Joined {
                             terminal_task_seq,
@@ -3614,11 +3674,13 @@ impl DeliveryExecutor {
                                     ))
                                 }
                             };
-                            let terminal_task_seq = roundhouse_store::append_event_in_transaction(
+                            let receipt = roundhouse_store::append_event_in_transaction(
                                 &txn,
                                 &event,
                                 &roundhouse_store::redact::Redactor::build(&[]),
                             )?;
+                            let terminal_task_seq = receipt.seq;
+                            appended = Some(receipt);
                             if !mark_workflow_child_call_joined_in_transaction(
                                 &txn,
                                 child_run_id,
@@ -3636,6 +3698,9 @@ impl DeliveryExecutor {
                         }
                     };
                     txn.commit()?;
+                    if let Some(receipt) = appended {
+                        commit_feed.notify_appended(&[receipt]);
+                    }
                     Ok(Some((call, first_task_seq, last_task_seq)))
                 },
             )
@@ -6739,6 +6804,7 @@ mod child_run_tests {
         let tree = Arc::clone(&executor.resources.spawn_tree);
         let runner = executor.resources.runner;
         let workspace = harness.stored.workspace;
+        let commit_feed = harness.store.commit_feed().clone();
         let conn = harness.store.pool.get().await.unwrap();
         conn.interact(move |connection| {
             let mut sink = BufferedTaskSink::default();
@@ -6754,6 +6820,7 @@ mod child_run_tests {
                         on_degrade: OnDegrade::Refuse,
                         parent: Some(parent_session_id),
                     },
+                    commit_feed.clone(),
                 )),
             );
             let outcome = roundhouse_flow::production::run_workflow_from_storage(
@@ -6785,6 +6852,7 @@ mod child_run_tests {
                 child_session_id,
                 Timestamp::from_unix_nanos(1_700_000_000_000_000_001),
                 sink,
+                &commit_feed,
             )
             .unwrap();
         })
@@ -9132,6 +9200,53 @@ mod child_run_tests {
         assert_eq!(child_runs, 0);
         assert_eq!(calls, 0);
         assert_eq!(agent_tasks, 0);
+    }
+
+    /// Phase 8 Task 21, Task 2: `flush_task_events` commits its own transaction rather than
+    /// going through `spawn_writer`, so nothing wakes a follower of `session_id` unless it
+    /// calls `CommitFeed::notify_appended` itself, once `txn.commit()` returns `Ok`.
+    ///
+    /// Driven directly against the real, production `flush_task_events` — this crate's own
+    /// entry point for a scheduler-flushed workflow task event — rather than through the
+    /// full claim-and-run pipeline: that function's `session_id` is a plain parameter, so a
+    /// self-chosen id here needs no race against an async background task to observe (the
+    /// call below is an ordinary synchronous function call inside this test, not a
+    /// backgrounded one), unlike the full pipeline's own internally-minted session id.
+    #[test]
+    fn flush_task_events_wakes_a_watcher_only_after_its_events_commit() {
+        use futures::FutureExt;
+
+        let mut conn = roundhouse_flow::durability::open_test_db();
+        let session_id = SessionId::new();
+        let commit_feed = CommitFeed::default();
+        let mut watch = commit_feed.watch(session_id);
+        watch.mark_seen();
+
+        let mut sink = BufferedTaskSink::default();
+        sink.emitted.push((
+            TaskId::new(),
+            EventPayload::TaskCreated {
+                kind: TaskKind::Shell,
+                parent: None,
+                origin: Origin::System,
+                input: roundhouse_core::TaskInput::Text("noop".into()),
+            },
+        ));
+
+        flush_task_events(
+            &mut conn,
+            crate::test_support::runner(),
+            session_id,
+            Timestamp::from_unix_nanos(1),
+            sink,
+            &commit_feed,
+        )
+        .unwrap();
+
+        assert!(
+            watch.changed().now_or_never().is_some(),
+            "flush_task_events must notify the commit feed once its transaction commits"
+        );
     }
 
     #[tokio::test]

@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -10,6 +10,7 @@ use roundhouse_core::{
 use rusqlite::OptionalExtension;
 use tokio::sync::{mpsc, oneshot};
 
+use crate::commit_feed::AppendedEvent;
 use crate::redact::Redactor;
 use crate::txn::{
     begin_immediate, is_sqlite_busy, with_bounded_busy_attempt, INITIAL_BACKOFF, MAX_BUSY_RETRIES,
@@ -192,11 +193,18 @@ fn next_seq_or_reject_closed(
 /// updates the task projection before returning. The caller owns commit or
 /// rollback, which lets event-log facts share an atomic transaction with a
 /// workflow row or blob reference.
+///
+/// Returns an [`AppendedEvent`] receipt rather than a bare `seq` (Phase 8 Task 21, Task 2):
+/// since this function never commits the transaction itself, it cannot call
+/// [`CommitFeed::notify`]/[`CommitFeed::notify_appended`] on the caller's behalf — the
+/// caller must, once its own `txn.commit()` returns `Ok`. The `#[must_use]` on
+/// `AppendedEvent` is what makes forgetting that a compile-time `-D warnings` failure
+/// instead of a silent gap.
 pub fn append_event_in_transaction(
     txn: &rusqlite::Transaction<'_>,
     event: &Event,
     redactor: &Redactor,
-) -> Result<u64, StoreError> {
+) -> Result<AppendedEvent, StoreError> {
     let session_id = event.session_id.to_string();
     let task_id = event.task_id.map(|task_id| task_id.to_string());
     let (payload, redactions) = redactor.redact_event_payload(event.payload.clone());
@@ -234,8 +242,12 @@ pub fn append_event_in_transaction(
             }
         }
     }
-    u64::try_from(next_seq)
-        .map_err(|_| StoreError::Interact("event sequence exceeded u64 range".to_string()))
+    let seq = u64::try_from(next_seq)
+        .map_err(|_| StoreError::Interact("event sequence exceeded u64 range".to_string()))?;
+    Ok(AppendedEvent {
+        session_id: event.session_id,
+        seq,
+    })
 }
 
 /// Spawn a dedicated async task that owns the event-append write transaction
@@ -262,12 +274,31 @@ pub async fn spawn_writer(store: StorePool) -> EventWriter {
             match cmd {
                 WriteCmd::Append { event, reply } => {
                     let redactor = redactor_for_task.load_full();
+                    let session_id = event.session_id;
                     let result = append_one(&store, *event, &redactor).await;
+                    // Notify only AFTER the commit returned Ok (CommitFeed::notify's own
+                    // contract, Phase 8 Task 21 Task 1) — a follower must never be woken
+                    // for a write that never landed.
+                    if result.is_ok() {
+                        store.commit_feed().notify(session_id);
+                    }
                     let _ = reply.send(result);
                 }
                 WriteCmd::AppendBatch { events, reply } => {
                     let redactor = redactor_for_task.load_full();
+                    // Collected before `events` moves into `append_batch` below. A
+                    // `HashSet` because a batch can carry more than one event for the
+                    // same session (see `append_batch`'s own seq-assignment doc comment) —
+                    // each distinct session is notified exactly once per batch, not once
+                    // per event.
+                    let touched_sessions: HashSet<SessionId> =
+                        events.iter().map(|event| event.session_id).collect();
                     let result = append_batch(&store, events, &redactor).await;
+                    if result.is_ok() {
+                        for session_id in touched_sessions {
+                            store.commit_feed().notify(session_id);
+                        }
+                    }
                     let _ = reply.send(result);
                 }
                 WriteCmd::AppendBatchWithBlobs {
@@ -276,7 +307,15 @@ pub async fn spawn_writer(store: StorePool) -> EventWriter {
                     reply,
                 } => {
                     let redactor = redactor_for_task.load_full();
+                    // Same distinct-session collection as `AppendBatch` above, same reason.
+                    let touched_sessions: HashSet<SessionId> =
+                        events.iter().map(|event| event.session_id).collect();
                     let result = append_batch_with_blobs(&store, events, state_dir, redactor).await;
+                    if result.is_ok() {
+                        for session_id in touched_sessions {
+                            store.commit_feed().notify(session_id);
+                        }
+                    }
                     let _ = reply.send(result);
                 }
                 WriteCmd::CloseSession {
@@ -289,6 +328,13 @@ pub async fn spawn_writer(store: StorePool) -> EventWriter {
                     let redactor = redactor_for_task.load_full();
                     let result =
                         close_session(&store, runner, session_id, ts, outcome, redactor).await;
+                    // Notified even on `Ok(CloseReceipt::AlreadyClosed)` — a spurious wake
+                    // for a follower that was already caught up is harmless, and treating
+                    // "already closed" as distinct from "closed" here would need this
+                    // match arm to know about `CloseReceipt`'s variants for no benefit.
+                    if result.is_ok() {
+                        store.commit_feed().notify(session_id);
+                    }
                     let _ = reply.send(result);
                 }
             }
@@ -691,8 +737,13 @@ fn append_batch_with_blobs_attempt(
 
     let mut seqs = Vec::with_capacity(events.len());
     for event in events {
+        // `.seq` only: this batch's session-level notify is `spawn_writer`'s own
+        // `WriteCmd::AppendBatchWithBlobs` arm, over its own `touched_sessions` set, once
+        // this whole attempt succeeds — the same reasoning `close_session`'s two call sites
+        // below already give for not threading a receipt through `notify_appended` from
+        // inside the writer's own machinery.
         let seq = match append_event_in_transaction(&tx, event, redactor) {
-            Ok(seq) => seq,
+            Ok(appended) => appended.seq,
             Err(err) => {
                 return match busy_error_in(err) {
                     Ok(busy) => Err(busy),
@@ -902,11 +953,18 @@ async fn close_session(
                             CancelReason::SessionClosed,
                             1,
                         );
-                        append_event_in_transaction(&tx, &cancelled, &redactor)?;
+                        // `spawn_writer`'s `WriteCmd::CloseSession` arm (below, this file)
+                        // calls `CommitFeed::notify` for `session_id` once this whole
+                        // function returns `Ok` — a session-level wake that already covers
+                        // every event this transaction appends. Threading each receipt
+                        // through `notify_appended` here would only duplicate that wake, so
+                        // it is intentionally dropped rather than collected.
+                        let _ = append_event_in_transaction(&tx, &cancelled, &redactor)?;
                     }
 
                     let terminator = runner.record_session_closed(session_id, 0, ts, outcome, 1);
-                    append_event_in_transaction(&tx, &terminator, &redactor)?;
+                    // Same reasoning as the cancellation sweep above.
+                    let _ = append_event_in_transaction(&tx, &terminator, &redactor)?;
 
                     tx.commit()?;
                     Ok(CloseReceipt::Closed {

@@ -14,7 +14,7 @@ mod common;
 use std::sync::Arc;
 use std::time::Duration;
 
-use roundhouse_core::{EventPayload, NoteLevel, SessionId};
+use roundhouse_core::{EventPayload, SessionId};
 use roundhouse_proto::{ClientEvent, ClientRequest};
 use roundhouse_provider::{
     BlockDelta, BlockKind, BoxFut, Capabilities, ChatRequest, ChatStream, ModelId, ModelInfo, Plan,
@@ -54,33 +54,45 @@ async fn two_clients_can_create_and_then_attach_to_the_same_session() {
     .expect("connect_attach must not hang")
     .unwrap();
 
-    registry.publish(
-        session_id,
-        ClientEvent::TaskEvent {
-            session_id,
-            task_id: None,
-            payload: Box::new(EventPayload::Note {
-                level: NoteLevel::Info,
-                text: "hello from creator's session".into(),
-            }),
-        },
+    // Phase 8 Task 21: the watcher replays the session's log from the store,
+    // starting with the durable `SessionCreated` the creator's handshake
+    // committed as seq 0 ...
+    let replayed = tokio::time::timeout(Duration::from_secs(2), watcher.recv())
+        .await
+        .expect("watcher must see the replay before timing out")
+        .unwrap()
+        .expect("watcher must see the replay");
+    assert!(
+        matches!(
+            &replayed,
+            ClientEvent::Committed { seq: 0, payload, session_id: seen, .. }
+                if matches!(**payload, EventPayload::SessionCreated { .. }) && *seen == session_id
+        ),
+        "expected the creator's SessionCreated as seq 0, got {replayed:?}"
     );
 
+    // ... and then follows it live: an event the creator's session commits
+    // after the attach reaches the watcher too.
+    let actor = registry.actor(session_id).expect("the session is live");
+    common::append_note(actor.writer(), session_id, "hello from creator's session").await;
     let seen = tokio::time::timeout(Duration::from_secs(2), watcher.recv())
         .await
         .expect("watcher must see the event before timing out")
         .unwrap()
         .expect("watcher must see the event");
-    assert!(matches!(seen, ClientEvent::TaskEvent { .. }));
+    assert_eq!(
+        common::committed_note(&seen),
+        Some("hello from creator's session"),
+        "got {seen:?}"
+    );
 }
 
 /// `Attach` to a `SessionId` nobody ever created must not hang, panic, or
-/// falsely succeed — it is indistinguishable, from this registry's
-/// perspective, from attaching to a session that existed but whose every
-/// subscriber has since disconnected (see `SessionRegistry::attach`'s doc
-/// comment). The daemon has no `Ack` to send back, so `connect_attach` must
-/// surface that as an error rather than handing back a client that will
-/// never see anything.
+/// falsely succeed. It has neither a live registry entry nor any stored
+/// events (Phase 8 Task 21's store fallback finds nothing to replay), so the
+/// daemon has no `Ack` to send back, and `connect_attach` must surface that
+/// as an error rather than handing back a client that will never see
+/// anything.
 #[tokio::test]
 async fn attaching_to_an_unknown_session_fails_without_hanging() {
     let dir = tempfile::tempdir().unwrap();
@@ -172,6 +184,13 @@ async fn a_session_with_no_more_subscribers_stays_attachable_not_reaped() {
          disconnects — the actor (and any work it may still be doing) \
          outlives the connection that created it"
     );
+    // Since Phase 8 Task 21 an `Attach` also succeeds against a reaped
+    // session's stored log, so the attach alone no longer proves the entry
+    // survived: check the live actor directly.
+    assert!(
+        registry.actor(session_id).is_some(),
+        "the session's live registry entry must survive its last subscriber disconnecting"
+    );
 }
 
 /// Fix round 1, fix 6 (code review Important 2): the existing tests above
@@ -179,16 +198,16 @@ async fn a_session_with_no_more_subscribers_stays_attachable_not_reaped() {
 /// neither proves *isolation* — a registry that broadcast every event to
 /// every live connection regardless of `session_id` would pass both of them
 /// identically. This test creates two independent sessions, attaches a
-/// watcher to only one of them, and publishes to *both* — asserting the
-/// watcher never sees the event meant for the other session, and that the
-/// one event it does see actually carries its own session's id (not just
-/// `matches!(.., TaskEvent { .. })`, which any `TaskEvent` would satisfy).
+/// watcher to only one of them, and commits an event to *both* — asserting
+/// the watcher never sees the event meant for the other session, and that
+/// every event it does see carries its own session's id.
 ///
-/// Publishes to the *other* session first, deliberately: if events were
+/// Commits to the *other* session first, deliberately: if events were
 /// broadcast by socket rather than routed by `SessionId`, that would be the
-/// event the watcher saw *first* — so ordering alone (not a timeout, which
-/// this lane treats as inherently racy) is what proves isolation
-/// deterministically.
+/// event the watcher saw ahead of its own. A final sentinel committed to the
+/// watched session bounds the check by ordering alone (not a timeout, which
+/// this lane treats as inherently racy): once the sentinel arrives, anything
+/// leaked from the other session would already have arrived before it.
 #[tokio::test]
 async fn attach_routes_by_session_id_and_never_leaks_another_sessions_events() {
     let dir = tempfile::tempdir().unwrap();
@@ -229,42 +248,40 @@ async fn attach_routes_by_session_id_and_never_leaks_another_sessions_events() {
     .expect("connect_attach must not hang")
     .unwrap();
 
-    let note = |session_id: roundhouse_core::SessionId, text: &str| ClientEvent::TaskEvent {
-        session_id,
-        task_id: None,
-        payload: Box::new(EventPayload::Note {
-            level: NoteLevel::Info,
-            text: text.into(),
-        }),
-    };
+    let writer_a = registry.actor(session_id_a).unwrap().writer().clone();
+    let writer_b = registry.actor(session_id_b).unwrap().writer().clone();
     // Session B first: if routing were broken (broadcast by socket instead
     // of by SessionId), this is the event the watcher would see first.
-    registry.publish(session_id_b, note(session_id_b, "for-b"));
-    registry.publish(session_id_a, note(session_id_a, "for-a"));
+    common::append_note(&writer_b, session_id_b, "for-b").await;
+    common::append_note(&writer_a, session_id_a, "for-a").await;
+    common::append_note(&writer_a, session_id_a, "sentinel").await;
 
-    let seen = tokio::time::timeout(Duration::from_secs(2), watcher.recv())
-        .await
-        .expect("watcher must see an event before timing out")
-        .unwrap()
-        .expect("watcher must see an event");
-    match seen {
-        ClientEvent::TaskEvent { session_id, .. } => {
-            assert_eq!(
-                session_id, session_id_a,
+    let mut notes = Vec::new();
+    loop {
+        let seen = tokio::time::timeout(Duration::from_secs(2), watcher.recv())
+            .await
+            .expect("watcher must see an event before timing out")
+            .unwrap()
+            .expect("watcher must see an event");
+        match &seen {
+            ClientEvent::Committed { session_id, .. } => assert_eq!(
+                *session_id, session_id_a,
                 "the watcher attached to session A must never see session \
-                 B's event first (or at all) — routing must be by \
-                 SessionId, not by socket"
-            );
+                 B's event — routing must be by SessionId, not by socket"
+            ),
+            other => panic!("expected a Committed event, got {other:?}"),
         }
-        other => panic!("expected a TaskEvent, got {other:?}"),
+        if let Some(text) = common::committed_note(&seen) {
+            notes.push(text.to_string());
+            if text == "sentinel" {
+                break;
+            }
+        }
     }
-
-    // And session B's event must never arrive on this connection at all.
-    let should_not_arrive = tokio::time::timeout(Duration::from_millis(200), watcher.recv()).await;
-    assert!(
-        should_not_arrive.is_err(),
-        "the watcher attached to session A must not receive session B's \
-         event at all, got {should_not_arrive:?}"
+    assert_eq!(
+        notes,
+        vec!["for-a".to_string(), "sentinel".to_string()],
+        "the watcher must see exactly session A's own notes, in order"
     );
 }
 

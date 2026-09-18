@@ -4,7 +4,8 @@
 //!
 //! Phase 1 built this against a hand-rolled, daemon-pre-summarized
 //! `ServerMessage`. Phase 7 Task 2 retired that type: the daemon now forwards
-//! `roundhouse-proto`'s real `ClientEvent::TaskEvent { payload, .. }`, so the
+//! `roundhouse-proto`'s real event payloads (since Phase 8 Task 21, as
+//! `ClientEvent::Committed { payload, .. }`; callers pass `*payload`), so the
 //! presentation-level reduction that used to happen daemon-side (flattening a
 //! `Delta`/`EventPayload` down to `TaskDelta{task_id, text}` or
 //! `SessionSummary{..}`) moves here, into [`Dashboard::apply`].

@@ -14,9 +14,12 @@
 //! handling) is expected to reuse for gating a close until an external signal fires, not
 //! just for simulating a failure.
 
+use std::collections::HashSet;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use arc_swap::ArcSwap;
+use roundhouse_core::{Event, SessionId};
 use tokio::sync::{mpsc, oneshot, Mutex};
 
 use crate::pool::StorePool;
@@ -226,6 +229,151 @@ pub async fn spawn_gated_writer(store: StorePool, gate: Arc<CloseGate>) -> Event
                         }
                         Err(err) => Err(err),
                     };
+                    let _ = reply.send(result);
+                }
+            }
+        }
+    });
+
+    EventWriter { tx, redactor }
+}
+
+/// Which of two shapes a [`spawn_faulting_writer`]'d writer's matching `append` call takes
+/// (Phase 8 Task 21, Task 6 / #89) — the distinction `run_chat_turn`'s own tests need between
+/// "never committed" and "committed anyway", which a caller that only sees
+/// `EventWriter::append`'s `Err` return value can't otherwise tell apart. That ambiguity is
+/// exactly what `roundhouse_engine::chat`'s `TurnTasks::settle_after_append_failure` is built
+/// to treat identically regardless (see that function's own doc comment for why it must).
+pub enum AppendFault {
+    /// Rejects the matching append before it ever reaches the store — `append_one` is never
+    /// called, so nothing commits. The caller sees `Err(StoreError::Interact("injected"))`.
+    FailBeforeCommit,
+    /// Lets the matching append commit for real, through the same `append_one` every other
+    /// path here uses, then drops the reply sender instead of sending it — the exact shape
+    /// `EventWriter::append`'s own doc comment already describes ("the append may have
+    /// committed in that case"): the caller sees
+    /// `Err(StoreError::Interact("writer task dropped reply"))` even though the row is
+    /// durably there.
+    DropReplyAfterCommit,
+}
+
+/// Spawns an [`EventWriter`] that behaves exactly like [`super::spawn_writer`]'s for every
+/// command except the one `Append` call, if any, that `matches` accepts — evaluated in
+/// arrival order and consumed on its first hit; every `Append` before and after it, and
+/// every `AppendBatch`/`AppendBatchWithBlobs`/`CloseSession` regardless of order, runs
+/// unmodified against the real store. Built for Phase 8 Task 21 Task 6 (#89): proving
+/// `run_chat_turn` settles a turn's already-open tasks after a failed append needs a fault
+/// that lands on ONE specific event (e.g. "the first `TaskDelta`") without disturbing the
+/// rest of the turn's real appends, which [`CloseGate`]'s close-only gate can't express.
+///
+/// **`AppendBatch`/`AppendBatchWithBlobs` are never faulted.** `matches` is a single-event
+/// predicate (`impl Fn(&Event) -> bool`), and no `chat.rs` append site this lane's tests
+/// exercise ever goes through either batched command — extending the predicate to "any event
+/// in the batch" would be untested surface. A future caller that needs a batched fault
+/// should extend this rather than assume it's already covered.
+///
+/// Reuses [`append_one`] for both the ordinary pass-through path and
+/// [`AppendFault::DropReplyAfterCommit`]'s real commit — the same reason [`spawn_gated_writer`]
+/// reuses [`close_session`] rather than faking a result: a faulting writer that diverged from
+/// the real append internals would prove nothing about how `run_chat_turn` behaves against a
+/// REAL store.
+///
+/// Notifies [`StorePool::commit_feed`] for every commit this writer lets through, including
+/// [`AppendFault::DropReplyAfterCommit`]'s (a real commit, even though the caller sees
+/// `Err`) — [`super::spawn_writer`]'s own contract (Phase 8 Task 21 Task 1): a follower must
+/// be woken for every commit that actually lands, regardless of what the writing caller
+/// itself observed.
+pub async fn spawn_faulting_writer(
+    store: StorePool,
+    fault: AppendFault,
+    matches: impl Fn(&Event) -> bool + Send + Sync + 'static,
+) -> EventWriter {
+    let (tx, mut rx) = mpsc::channel::<WriteCmd>(1024);
+    let redactor = Arc::new(ArcSwap::from_pointee(Redactor::build(&[])));
+    let redactor_for_task = Arc::clone(&redactor);
+    // Consumed on the first hit -- every `Append` before and after it keeps the ordinary
+    // pass-through behavior below.
+    let consumed = AtomicBool::new(false);
+
+    tokio::spawn(async move {
+        while let Some(cmd) = rx.recv().await {
+            match cmd {
+                WriteCmd::Append { event, reply } => {
+                    if !consumed.load(Ordering::SeqCst) && matches(&event) {
+                        consumed.store(true, Ordering::SeqCst);
+                        match fault {
+                            AppendFault::FailBeforeCommit => {
+                                let _ =
+                                    reply.send(Err(StoreError::Interact("injected".to_string())));
+                            }
+                            AppendFault::DropReplyAfterCommit => {
+                                let redactor = redactor_for_task.load_full();
+                                let session_id = event.session_id;
+                                let result = append_one(&store, *event, &redactor).await;
+                                // Same commit-then-notify ordering as `spawn_writer`'s own
+                                // `Append` arm: notify only once the commit actually landed.
+                                if result.is_ok() {
+                                    store.commit_feed().notify(session_id);
+                                }
+                                // Dropped, not sent: `EventWriter::append`'s receiver then
+                                // sees a closed channel, which it maps to
+                                // `StoreError::Interact("writer task dropped reply")` --
+                                // mirroring a real writer task dying mid-reply, regardless of
+                                // whether `result` above was `Ok` or `Err`.
+                                drop(reply);
+                            }
+                        }
+                        continue;
+                    }
+                    let redactor = redactor_for_task.load_full();
+                    let session_id = event.session_id;
+                    let result = append_one(&store, *event, &redactor).await;
+                    if result.is_ok() {
+                        store.commit_feed().notify(session_id);
+                    }
+                    let _ = reply.send(result);
+                }
+                WriteCmd::AppendBatch { events, reply } => {
+                    let redactor = redactor_for_task.load_full();
+                    let touched_sessions: HashSet<SessionId> =
+                        events.iter().map(|event| event.session_id).collect();
+                    let result = append_batch(&store, events, &redactor).await;
+                    if result.is_ok() {
+                        for session_id in touched_sessions {
+                            store.commit_feed().notify(session_id);
+                        }
+                    }
+                    let _ = reply.send(result);
+                }
+                WriteCmd::AppendBatchWithBlobs {
+                    events,
+                    state_dir,
+                    reply,
+                } => {
+                    let redactor = redactor_for_task.load_full();
+                    let touched_sessions: HashSet<SessionId> =
+                        events.iter().map(|event| event.session_id).collect();
+                    let result = append_batch_with_blobs(&store, events, state_dir, redactor).await;
+                    if result.is_ok() {
+                        for session_id in touched_sessions {
+                            store.commit_feed().notify(session_id);
+                        }
+                    }
+                    let _ = reply.send(result);
+                }
+                WriteCmd::CloseSession {
+                    runner,
+                    session_id,
+                    ts,
+                    outcome,
+                    reply,
+                } => {
+                    let redactor = redactor_for_task.load_full();
+                    let result =
+                        close_session(&store, runner, session_id, ts, outcome, redactor).await;
+                    if result.is_ok() {
+                        store.commit_feed().notify(session_id);
+                    }
                     let _ = reply.send(result);
                 }
             }

@@ -74,3 +74,9 @@ tracing-subscriber = { version = "=0.3.23", features = ["env-filter"] }
 [dev-dependencies]
 # Same exact-pin discipline as the `clap` addition above.
 tempfile = "=3.27.0"
+# Phase 8 Task 21 (#40): `tests/headless_run.rs`'s mock Anthropic server reads
+# and writes raw TCP (`io-util` on top of the workspace's `net`) and the test
+# drives `round`/`round-daemon-internal` as child processes. Not a new
+# dependency, only features on the existing workspace `tokio`; no new
+# `roundhouse-*` edge.
+tokio = { workspace = true, features = ["io-util", "process"] }

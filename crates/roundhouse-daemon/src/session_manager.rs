@@ -58,7 +58,7 @@ use roundhouse_store::{CloseReceipt, StoreError};
 
 use crate::session_bootstrap::{
     create_real_session, teardown_real_session, CreateRealSessionError, DaemonResources,
-    RealSession,
+    RealSession, SessionCreatedRecord,
 };
 use crate::session_registry::SessionRegistry;
 use crate::sub_agent_host::SubAgentSessions;
@@ -279,6 +279,9 @@ async fn build_headless_session(
     workspace_device: Option<i64>,
     workspace_inode: Option<i64>,
 ) -> Result<HeadlessSession, CreateHeadlessSessionError> {
+    // `ByCaller`: every headless caller writes (or, when rehydrating after a
+    // restart, already wrote) this session's `SessionCreated` itself — see
+    // `create_real_session`'s own doc comment.
     let real_session = create_real_session(
         resources,
         session_id,
@@ -286,6 +289,7 @@ async fn build_headless_session(
         workspace_root,
         workspace_device,
         workspace_inode,
+        SessionCreatedRecord::ByCaller,
     )
     .await
     .map_err(|err| CreateHeadlessSessionError::Session(Box::new(err)))?;

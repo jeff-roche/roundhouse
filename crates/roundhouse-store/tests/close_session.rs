@@ -533,7 +533,9 @@ fn append_event_in_transaction_rejects_after_a_session_closed_tail() {
         let txn = roundhouse_store::begin_immediate(&mut conn).unwrap();
         let closed =
             RUNNER.record_session_closed(session_id, 0, now_ts(), SessionOutcome::Completed, 1);
-        roundhouse_store::append_event_in_transaction(&txn, &closed, &redactor).unwrap();
+        // No `CommitFeed` in play here — this test only proves the tail guard rejects the
+        // append below, not anything about commit notification.
+        let _ = roundhouse_store::append_event_in_transaction(&txn, &closed, &redactor).unwrap();
         txn.commit().unwrap();
     }
 

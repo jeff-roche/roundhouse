@@ -1,5 +1,7 @@
-use roundhouse_core::SessionId;
-use roundhouse_proto::{client_event_schema, client_request_schema, ApiVersion, ClientRequest};
+use roundhouse_core::{CancelReason, EventPayload, NoteLevel, SessionId, TaskId};
+use roundhouse_proto::{
+    client_event_schema, client_request_schema, ApiVersion, ClientEvent, ClientRequest, TurnOutcome,
+};
 
 #[test]
 fn client_event_schema_emits_valid_json_schema_with_expected_properties() {
@@ -68,6 +70,139 @@ fn close_session_round_trips_through_json() {
             session_id: round_tripped,
         } => assert_eq!(round_tripped, session_id),
         _ => panic!("unexpected variant"),
+    }
+}
+
+/// Phase 8 Task 21: the emitted schemas must name every new variant, so a
+/// variant dropped from the schema while kept in the enum fails here (the
+/// same reasoning as the `CloseSession` check above).
+#[test]
+fn the_schemas_mention_every_phase8_task21_variant() {
+    let request = serde_json::to_value(client_request_schema())
+        .unwrap()
+        .to_string();
+    assert!(
+        request.contains("Resume"),
+        "ClientRequest schema: {request}"
+    );
+
+    let event = serde_json::to_value(client_event_schema())
+        .unwrap()
+        .to_string();
+    for name in ["Committed", "TurnFinished", "ResyncRequired", "Rejected"] {
+        assert!(
+            event.contains(name),
+            "ClientEvent schema lacks {name}: {event}"
+        );
+    }
+}
+
+#[test]
+fn resume_round_trips_through_json() {
+    let session_id = SessionId::new();
+    let json = serde_json::to_string(&ClientRequest::Resume {
+        session_id,
+        after_seq: 41,
+    })
+    .unwrap();
+    match serde_json::from_str::<ClientRequest>(&json).unwrap() {
+        ClientRequest::Resume {
+            session_id: back,
+            after_seq,
+        } => {
+            assert_eq!(back, session_id);
+            assert_eq!(after_seq, 41);
+        }
+        other => panic!("unexpected variant {other:?}"),
+    }
+}
+
+#[test]
+fn committed_round_trips_with_its_seq_and_payload() {
+    let session_id = SessionId::new();
+    let task_id = TaskId::new();
+    let json = serde_json::to_string(&ClientEvent::Committed {
+        session_id,
+        seq: 7,
+        task_id: Some(task_id),
+        payload: Box::new(EventPayload::Note {
+            level: NoteLevel::Info,
+            text: "hello".into(),
+        }),
+    })
+    .unwrap();
+    match serde_json::from_str::<ClientEvent>(&json).unwrap() {
+        ClientEvent::Committed {
+            session_id: back,
+            seq,
+            task_id: back_task,
+            payload,
+        } => {
+            assert_eq!(back, session_id);
+            assert_eq!(seq, 7);
+            assert_eq!(back_task, Some(task_id));
+            assert!(matches!(*payload, EventPayload::Note { ref text, .. } if text == "hello"));
+        }
+        other => panic!("unexpected variant {other:?}"),
+    }
+}
+
+#[test]
+fn turn_finished_round_trips_every_outcome() {
+    let session_id = SessionId::new();
+    let outcomes = [
+        TurnOutcome::Completed,
+        TurnOutcome::Failed {
+            category: "provider".into(),
+            message: "boom".into(),
+        },
+        TurnOutcome::Cancelled {
+            reason: CancelReason::SessionClosed,
+        },
+        TurnOutcome::Rejected {
+            reason: "turn_in_flight".into(),
+        },
+    ];
+    for outcome in outcomes {
+        let expected = serde_json::to_value(&outcome).unwrap();
+        let json = serde_json::to_string(&ClientEvent::TurnFinished {
+            session_id,
+            outcome,
+            through_seq: Some(3),
+        })
+        .unwrap();
+        match serde_json::from_str::<ClientEvent>(&json).unwrap() {
+            ClientEvent::TurnFinished {
+                session_id: back,
+                outcome,
+                through_seq,
+            } => {
+                assert_eq!(back, session_id);
+                assert_eq!(through_seq, Some(3));
+                assert_eq!(serde_json::to_value(&outcome).unwrap(), expected);
+            }
+            other => panic!("unexpected variant {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn resync_required_round_trips_with_its_head() {
+    let session_id = SessionId::new();
+    let json = serde_json::to_string(&ClientEvent::ResyncRequired {
+        session_id,
+        head: Some(9),
+    })
+    .unwrap();
+    match serde_json::from_str::<ClientEvent>(&json).unwrap() {
+        ClientEvent::ResyncRequired {
+            session_id: back,
+            head,
+        } => {
+            assert_eq!(back, session_id);
+            assert_eq!(head, Some(9));
+        }
+        other => panic!("unexpected variant {other:?}"),
     }
 }
 

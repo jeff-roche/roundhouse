@@ -20,8 +20,10 @@ use std::time::Duration;
 use futures::FutureExt;
 use roundhouse_core::{EventPayload, SessionId, SessionState};
 use roundhouse_daemon::session_registry::SessionRegistry;
-use roundhouse_daemon::socket_server::{drive_established_session, CLOSE_SESSION_TIMEOUT};
-use roundhouse_proto::{ApiVersion, ClientEvent, ClientRequest};
+use roundhouse_daemon::socket_server::{
+    drive_established_session, SessionLink, CLOSE_SESSION_TIMEOUT,
+};
+use roundhouse_proto::{ApiVersion, ClientEvent, ClientRequest, TurnOutcome};
 use roundhouse_store::test_util::{spawn_gated_writer, CloseGate};
 use tokio::sync::mpsc;
 
@@ -70,6 +72,46 @@ impl CapturingWriter {
     }
 }
 
+/// Every frame already queued on `events_rx`, without waiting for more.
+/// Since Phase 8 Task 21 the connection streams the session's committed
+/// events (the close's own `Cancelling` state change among them) alongside
+/// any reply, so "no Ack yet" means "no Ack among these", not "no frame".
+fn ready_frames(events_rx: &mut mpsc::Receiver<ClientEvent>) -> Vec<ClientEvent> {
+    let mut frames = Vec::new();
+    while let Some(Some(frame)) = events_rx.recv().now_or_never() {
+        frames.push(frame);
+    }
+    frames
+}
+
+fn is_ack(event: &ClientEvent) -> bool {
+    matches!(event, ClientEvent::Ack { api_version } if *api_version == ApiVersion::CURRENT)
+}
+
+fn is_session_closed(event: &ClientEvent) -> bool {
+    matches!(
+        event,
+        ClientEvent::Committed { payload, .. }
+            if matches!(**payload, EventPayload::SessionClosed { .. })
+    )
+}
+
+/// Reads frames until the `Ack`, returning every frame before it. Fails if
+/// the connection ends first.
+async fn frames_until_ack(events_rx: &mut mpsc::Receiver<ClientEvent>) -> Vec<ClientEvent> {
+    let mut before = Vec::new();
+    loop {
+        let event = tokio::time::timeout(Duration::from_secs(5), events_rx.recv())
+            .await
+            .expect("the Ack must arrive")
+            .expect("the connection must not have ended before sending the Ack");
+        if is_ack(&event) {
+            return before;
+        }
+        before.push(event);
+    }
+}
+
 /// **An attached (non-creating) connection is read-only for `CloseSession`
 /// too**, exactly as it already is for `SubmitTurn`: its
 /// `CloseSession` must be refused — no `Ack`, and the session itself must be
@@ -85,20 +127,20 @@ impl CapturingWriter {
 #[tokio::test]
 async fn an_attached_connections_close_session_is_refused() {
     let dir = tempfile::tempdir().unwrap();
-    let actor = common::real_actor(dir.path()).await;
+    let resources = common::real_resources(dir.path()).await;
+    let actor = common::real_actor_on(dir.path(), &resources).await;
     let registry = Arc::new(SessionRegistry::new());
-    let (session_id, subscription, session_events) = registry
+    let (session_id, subscription) = registry
         .create(actor.clone(), None, None)
         .expect("registering against a fresh registry must succeed");
-    let resources = common::real_resources(dir.path()).await;
 
     let (requests_tx, requests_rx) = mpsc::channel::<ClientRequest>(8);
     let (events_tx, mut events_rx) = mpsc::channel::<ClientEvent>(8);
 
     let driver = tokio::spawn(drive_established_session(
         session_id,
-        subscription,
-        session_events,
+        SessionLink::Live(subscription),
+        None,
         false, // not the creator
         requests_rx,
         events_tx,
@@ -137,20 +179,20 @@ async fn an_attached_connections_close_session_is_refused() {
 #[tokio::test]
 async fn a_close_naming_a_different_session_is_refused() {
     let dir = tempfile::tempdir().unwrap();
-    let actor = common::real_actor(dir.path()).await;
+    let resources = common::real_resources(dir.path()).await;
+    let actor = common::real_actor_on(dir.path(), &resources).await;
     let registry = Arc::new(SessionRegistry::new());
-    let (session_id, subscription, session_events) = registry
+    let (session_id, subscription) = registry
         .create(actor.clone(), None, None)
         .expect("registering against a fresh registry must succeed");
-    let resources = common::real_resources(dir.path()).await;
 
     let (requests_tx, requests_rx) = mpsc::channel::<ClientRequest>(8);
     let (events_tx, mut events_rx) = mpsc::channel::<ClientEvent>(8);
 
     let driver = tokio::spawn(drive_established_session(
         session_id,
-        subscription,
-        session_events,
+        SessionLink::Live(subscription),
+        None,
         true, // the creator
         requests_rx,
         events_tx,
@@ -197,24 +239,25 @@ async fn a_close_naming_a_different_session_is_refused() {
 async fn the_ack_arrives_only_after_the_durable_close_append() {
     let dir = tempfile::tempdir().unwrap();
     let db_path = dir.path().join("events.db");
-    let store = roundhouse_store::open(&db_path).await.unwrap();
+    // The actor writes through the SAME pool the connection follows, so its
+    // commits wake the connection's follower (see `common::real_actor_on`).
+    let resources = common::real_resources(dir.path()).await;
     let gate = CloseGate::new();
-    let writer = spawn_gated_writer(store, Arc::clone(&gate)).await;
+    let writer = spawn_gated_writer(resources.store.clone(), Arc::clone(&gate)).await;
     let actor = common::real_actor_with_writer(dir.path(), writer).await;
 
     let registry = Arc::new(SessionRegistry::new());
-    let (session_id, subscription, session_events) = registry
+    let (session_id, subscription) = registry
         .create(actor.clone(), None, None)
         .expect("registering against a fresh registry must succeed");
-    let resources = common::real_resources(dir.path()).await;
 
     let (requests_tx, requests_rx) = mpsc::channel::<ClientRequest>(8);
     let (events_tx, mut events_rx) = mpsc::channel::<ClientEvent>(8);
 
     tokio::spawn(drive_established_session(
         session_id,
-        subscription,
-        session_events,
+        SessionLink::Live(subscription),
+        None,
         true,
         requests_rx,
         events_tx,
@@ -245,11 +288,12 @@ async fn the_ack_arrives_only_after_the_durable_close_append() {
     }
 
     // No Ack yet: the durable append is blocked on the held gate, and can
-    // stay blocked indefinitely — a single non-blocking poll is a complete
+    // stay blocked indefinitely — a single non-blocking drain is a complete
     // proof, not a best-effort one.
+    let before_release = ready_frames(&mut events_rx);
     assert!(
-        events_rx.recv().now_or_never().is_none(),
-        "no Ack may arrive before the durable SessionClosed append completes"
+        !before_release.iter().any(is_ack),
+        "no Ack may arrive before the durable SessionClosed append completes: {before_release:?}"
     );
 
     // The store side of the same claim, checked while the gate is still
@@ -268,13 +312,16 @@ async fn the_ack_arrives_only_after_the_durable_close_append() {
 
     gate.release().await;
 
-    let event = tokio::time::timeout(Duration::from_secs(5), events_rx.recv())
-        .await
-        .expect("the Ack must arrive once the durable append is released")
-        .expect("the connection must not have ended before sending the Ack");
+    // Phase 8 Task 21: the connection delivers the close's own durable
+    // `SessionClosed` before the `Ack`, which is its last frame.
+    let before_ack = frames_until_ack(&mut events_rx).await;
     assert!(
-        matches!(event, ClientEvent::Ack { api_version } if api_version == ApiVersion::CURRENT),
-        "expected an Ack, got {event:?}"
+        before_ack.iter().any(is_session_closed),
+        "the SessionClosed frame must be delivered before the Ack: {before_ack:?}"
+    );
+    assert!(
+        events_rx.recv().await.is_none(),
+        "the connection must end after the Ack"
     );
     assert_eq!(actor.state(), SessionState::Closed);
 
@@ -342,25 +389,25 @@ async fn a_wedged_close_times_out_and_a_retry_is_accepted() {
     let _log_guard = tracing::dispatcher::set_default(&dispatch);
 
     let dir = tempfile::tempdir().unwrap();
-    let db_path = dir.path().join("events.db");
-    let store = roundhouse_store::open(&db_path).await.unwrap();
+    // The actor writes through the SAME pool the connection follows, so its
+    // commits wake the connection's follower (see `common::real_actor_on`).
+    let resources = common::real_resources(dir.path()).await;
     let gate = CloseGate::new();
-    let writer = spawn_gated_writer(store, Arc::clone(&gate)).await;
+    let writer = spawn_gated_writer(resources.store.clone(), Arc::clone(&gate)).await;
     let actor = common::real_actor_with_writer(dir.path(), writer).await;
 
     let registry = Arc::new(SessionRegistry::new());
-    let (session_id, subscription, session_events) = registry
+    let (session_id, subscription) = registry
         .create(actor.clone(), None, None)
         .expect("registering against a fresh registry must succeed");
-    let resources = common::real_resources(dir.path()).await;
 
     let (requests_tx, requests_rx) = mpsc::channel::<ClientRequest>(8);
     let (events_tx, mut events_rx) = mpsc::channel::<ClientEvent>(8);
 
     tokio::spawn(drive_established_session(
         session_id,
-        subscription,
-        session_events,
+        SessionLink::Live(subscription),
+        None,
         true,
         requests_rx,
         events_tx,
@@ -412,9 +459,11 @@ async fn a_wedged_close_times_out_and_a_retry_is_accepted() {
         tokio::task::yield_now().await;
     }
 
+    let after_timeout = ready_frames(&mut events_rx);
     assert!(
-        events_rx.recv().now_or_never().is_none(),
-        "a merely-timed-out close must not send an Ack — it failed, it did not succeed"
+        !after_timeout.iter().any(is_ack),
+        "a merely-timed-out close must not send an Ack — it failed, it did not succeed: \
+         {after_timeout:?}"
     );
     assert_eq!(
         actor.state(),
@@ -461,13 +510,20 @@ async fn a_wedged_close_times_out_and_a_retry_is_accepted() {
     // chance to actually finish.
     gate.release().await;
 
-    let event = events_rx
-        .recv()
-        .await
-        .expect("the connection must not have ended before sending the retried close's Ack");
+    let mut before_ack = Vec::new();
+    loop {
+        let event = events_rx
+            .recv()
+            .await
+            .expect("the connection must not have ended before sending the retried close's Ack");
+        if is_ack(&event) {
+            break;
+        }
+        before_ack.push(event);
+    }
     assert!(
-        matches!(event, ClientEvent::Ack { api_version } if api_version == ApiVersion::CURRENT),
-        "expected an Ack for the retried close, got {event:?}"
+        before_ack.iter().any(is_session_closed),
+        "the retried close's Ack must follow the SessionClosed frame: {before_ack:?}"
     );
     assert_eq!(
         actor.state(),
@@ -476,77 +532,41 @@ async fn a_wedged_close_times_out_and_a_retry_is_accepted() {
     );
 }
 
-/// Builds a `ClientEvent::TaskEvent` carrying a distinct `Delta::Text`
-/// marker, for tests that need to tell two published events apart without
-/// `ClientEvent`/`EventPayload`/`Delta` implementing `PartialEq` (none of
-/// the three do).
-fn text_event(session_id: SessionId, marker: &str) -> ClientEvent {
-    ClientEvent::TaskEvent {
-        session_id,
-        task_id: None,
-        payload: Box::new(EventPayload::TaskDelta {
-            delta: roundhouse_core::Delta::Text {
-                text: marker.to_string(),
-            },
-        }),
-    }
-}
-
-fn text_event_marker(event: &ClientEvent) -> Option<&str> {
-    match event {
-        ClientEvent::TaskEvent { payload, .. } => match payload.as_ref() {
-            EventPayload::TaskDelta {
-                delta: roundhouse_core::Delta::Text { text },
-            } => Some(text.as_str()),
-            _ => None,
-        },
-        _ => None,
-    }
-}
-
 /// The `Ack` for a successful `CloseSession` must never overtake a session
-/// event that arrived first — the specific race
-/// `drive_established_session`'s own `pending_event.is_none()` guard on its
-/// close-ack arm exists to prevent (see that guard's own comment, next to
-/// the `permit = events_tx.reserve(), if close_ack_pending &&
-/// pending_event.is_none()` arm): "an event already dequeued out of
-/// `session_events` into `pending_event` could lose [the `select!`] race to
-/// a ready `Ack`... with the client seeing the `Ack` ahead of an event it
-/// was already due."
+/// event that was committed first — the race `drive_established_session`'s
+/// `ack_ready` guard exists to prevent (see that guard's own comment, next to
+/// the `permit = events_tx.reserve(), if ack_ready` arm): an event already
+/// taken from the follower into `pending_event` could otherwise lose the
+/// `select!` race to a ready `Ack`, with the client seeing the `Ack` ahead of
+/// an event it was already due. Since Phase 8 Task 21 the guard also holds
+/// the `Ack` until the close's own `SessionClosed` has been delivered.
 ///
-/// Built with a capacity-1 `events_tx` so `"second"` is provably still
-/// sitting in `pending_event` (not yet resident in the channel) rather than
-/// merely "sent very quickly, in the right order, by luck": `"first"` is
-/// published and settles all the way into the channel (filling its one
-/// slot — `yield_now`, not a sleep, just lets the already-spawned driver
-/// task actually run), THEN `"second"` is published — `session_events.recv()`
-/// still dequeues it into `pending_event`, but the arm that would flush it
-/// into the channel cannot get a permit until this test drains `"first"`.
-/// Only once both events are fully settled is `CloseSession` even sent, so
-/// there is no additional race between the events' own placement and the
-/// close's own completion to reason about: `close_ack_pending` becoming
-/// `true` while `"second"` is still parked is the exact contested state the
-/// guard exists for, constructed here deterministically rather than hoped
-/// for.
+/// Built with a capacity-1 `events_tx` so the connection cannot flush its
+/// events ahead of the close: `"first"` fills the one slot and nothing else
+/// moves until this test reads, which it does only after the close has fully
+/// finished (`actor.state()` reached `Closed`). By then `"second"` is either
+/// parked in `pending_event` or still in the store behind the follower's
+/// cursor; in every interleaving the `Ack` must come last, after both notes
+/// and the `SessionClosed` frame, which is what this asserts.
 #[tokio::test]
 async fn the_ack_never_overtakes_an_event_already_parked_ahead_of_it() {
     let dir = tempfile::tempdir().unwrap();
-    let actor = common::real_actor(dir.path()).await;
+    let resources = common::real_resources(dir.path()).await;
+    let actor = common::real_actor_on(dir.path(), &resources).await;
     let registry = Arc::new(SessionRegistry::new());
-    let (session_id, subscription, session_events) = registry
+    let (session_id, subscription) = registry
         .create(actor.clone(), None, None)
         .expect("registering against a fresh registry must succeed");
-    let resources = common::real_resources(dir.path()).await;
 
     let (requests_tx, requests_rx) = mpsc::channel::<ClientRequest>(8);
-    // Capacity 1: the mechanism this test needs to force "second" to sit in
-    // `pending_event`, unflushed, rather than flow straight through.
+    // Capacity 1: nothing past "first" can reach the channel until this test
+    // reads.
     let (events_tx, mut events_rx) = mpsc::channel::<ClientEvent>(1);
 
     tokio::spawn(drive_established_session(
         session_id,
-        subscription,
-        session_events,
+        SessionLink::Live(subscription),
+        None,
         true,
         requests_rx,
         events_tx,
@@ -554,15 +574,8 @@ async fn the_ack_never_overtakes_an_event_already_parked_ahead_of_it() {
         resources,
     ));
 
-    registry.publish(session_id, text_event(session_id, "first"));
-    for _ in 0..64 {
-        tokio::task::yield_now().await;
-    }
-
-    registry.publish(session_id, text_event(session_id, "second"));
-    for _ in 0..64 {
-        tokio::task::yield_now().await;
-    }
+    common::append_note(actor.writer(), session_id, "first").await;
+    common::append_note(actor.writer(), session_id, "second").await;
 
     let mut state_rx = actor.subscribe();
     requests_tx
@@ -570,58 +583,33 @@ async fn the_ack_never_overtakes_an_event_already_parked_ahead_of_it() {
         .await
         .unwrap();
 
-    // Deterministic: wait for the close to genuinely finish — proving
-    // `close_ack_pending` becomes `true` while `"second"` is *definitely*
-    // still parked (never drained by this test yet), rather than hoping the
-    // close is merely slower than a couple of `yield_now` calls. Without
-    // this wait, draining `"first"` immediately after sending `CloseSession`
-    // risks the close's own real durable append (genuine file I/O) simply
-    // not having finished yet — passing this test for the wrong reason (no
-    // actual contention for the guard to resolve) rather than the right one.
+    // Deterministic: wait for the close to genuinely finish, so the `Ack` is
+    // due while this test has still read nothing.
     loop {
         if actor.state() == SessionState::Closed {
             break;
         }
         state_rx.changed().await.unwrap();
     }
-    // A further settle: `actor.state()` reaching `Closed` happens inside
-    // the spawned close task itself; `drive_established_session`'s own
-    // `select!` loop still needs to be polled again to observe that task's
-    // `JoinHandle` resolving and set `close_ack_pending = true` — see the
-    // identical reasoning in
-    // `a_wedged_close_times_out_and_a_retry_is_accepted`, above.
-    for _ in 0..64 {
-        tokio::task::yield_now().await;
-    }
 
-    let got_first = events_rx
-        .recv()
-        .await
-        .expect("the connection must not have ended before delivering the first event");
+    let before_ack = frames_until_ack(&mut events_rx).await;
+    let notes: Vec<&str> = before_ack
+        .iter()
+        .filter_map(common::committed_note)
+        .collect();
     assert_eq!(
-        text_event_marker(&got_first),
-        Some("first"),
-        "expected the first published event first, got {got_first:?}"
+        notes,
+        vec!["first", "second"],
+        "both notes committed before the close must be delivered, in order, before the Ack: \
+         {before_ack:?}"
     );
-
-    let got_second = events_rx
-        .recv()
-        .await
-        .expect("the connection must not have ended before delivering the second event");
-    assert_eq!(
-        text_event_marker(&got_second),
-        Some("second"),
-        "the second published event — already parked in pending_event before the close even \
-         started — must be delivered before the Ack, never after: got {got_second:?}"
-    );
-
-    let got_third = events_rx
-        .recv()
-        .await
-        .expect("the connection must not have ended before sending the Ack");
     assert!(
-        matches!(got_third, ClientEvent::Ack { api_version } if api_version == ApiVersion::CURRENT),
-        "expected the Ack third, got {got_third:?}"
+        before_ack.last().is_some_and(is_session_closed),
+        "the frame right before the Ack must be the close's own SessionClosed: {before_ack:?}"
+    );
+    assert!(
+        events_rx.recv().await.is_none(),
+        "the Ack must be the connection's last frame"
     );
 }
 
@@ -641,26 +629,23 @@ async fn a_submit_turn_is_refused_while_a_close_is_gated() {
     let _log_guard = tracing::dispatcher::set_default(&dispatch);
 
     let dir = tempfile::tempdir().unwrap();
-    let store = roundhouse_store::open(&dir.path().join("events.db"))
-        .await
-        .unwrap();
+    let resources = common::real_resources(dir.path()).await;
     let gate = CloseGate::new();
-    let writer = spawn_gated_writer(store, Arc::clone(&gate)).await;
+    let writer = spawn_gated_writer(resources.store.clone(), Arc::clone(&gate)).await;
     let actor = common::real_actor_with_writer(dir.path(), writer).await;
 
     let registry = Arc::new(SessionRegistry::new());
-    let (session_id, subscription, session_events) = registry
+    let (session_id, subscription) = registry
         .create(actor.clone(), None, None)
         .expect("registering against a fresh registry must succeed");
-    let resources = common::real_resources(dir.path()).await;
 
     let (requests_tx, requests_rx) = mpsc::channel::<ClientRequest>(8);
     let (events_tx, mut events_rx) = mpsc::channel::<ClientEvent>(8);
 
     tokio::spawn(drive_established_session(
         session_id,
-        subscription,
-        session_events,
+        SessionLink::Live(subscription),
+        None,
         true,
         requests_rx,
         events_tx,
@@ -694,17 +679,34 @@ async fn a_submit_turn_is_refused_while_a_close_is_gated() {
         })
         .await
         .unwrap();
-    for _ in 0..64 {
-        tokio::task::yield_now().await;
+    // Phase 8 Task 21: the refusal now has a reply, `TurnFinished {
+    // outcome: Rejected }`, which is the deterministic signal to wait on.
+    // Committed frames (the close's own `Cancelling` state change) may arrive
+    // around it; an `Ack` must not, since the close is still gated.
+    let rejection = loop {
+        let event = tokio::time::timeout(Duration::from_secs(5), events_rx.recv())
+            .await
+            .expect("the refused SubmitTurn must get its TurnFinished reply")
+            .expect("the connection must stay open while the close is gated");
+        assert!(!is_ack(&event), "no Ack while the close is still gated");
+        if let ClientEvent::TurnFinished { .. } = event {
+            break event;
+        }
+    };
+    match rejection {
+        ClientEvent::TurnFinished {
+            outcome: TurnOutcome::Rejected { reason },
+            through_seq: None,
+            ..
+        } => assert_eq!(reason, "session_closing"),
+        other => panic!("expected a Rejected TurnFinished, got {other:?}"),
     }
-
     assert!(
         captured.contains("refusing SubmitTurn: a CloseSession is already in flight"),
         "a SubmitTurn arriving while a CloseSession is gated must be refused"
     );
     assert!(
-        events_rx.recv().now_or_never().is_none(),
-        "no reply of any kind is expected yet — the close is still gated, and the refused \
-         SubmitTurn produces no event"
+        !ready_frames(&mut events_rx).iter().any(is_ack),
+        "no Ack while the close is still gated"
     );
 }

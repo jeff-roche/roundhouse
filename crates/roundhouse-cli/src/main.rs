@@ -19,20 +19,42 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
 use roundhouse_cli::cli::{Cli, Command, ServiceAction, DEFAULT_WORKSPACE_NAME};
 use roundhouse_cli::commands::{daemon, service_install};
+use roundhouse_proto::{ClientEvent, ClientRequest, TurnOutcome};
 use roundhouse_tui::{DaemonClient, Dashboard, SessionId};
+use std::process::ExitCode;
+use std::time::Duration;
 
 #[tokio::main]
-async fn main() -> color_eyre::Result<()> {
-    color_eyre::install()?;
+async fn main() -> ExitCode {
+    if let Err(report) = color_eyre::install() {
+        eprintln!("Error: {report:?}");
+        return ExitCode::FAILURE;
+    }
     install_tracing_subscriber();
 
-    match Cli::parse().command {
+    let result = match Cli::parse().command {
         Some(Command::Daemon { workspaces }) => run_daemon(workspaces).await,
         Some(Command::Service { action }) => run_service(action),
         Some(Command::Attach { session }) => attach_to_session(session).await,
         Some(Command::Create { workspace }) => create_and_attach(workspace).await,
-        Some(Command::Run { workspace, message }) => run_headless(workspace, message).await,
+        Some(Command::Run {
+            workspace,
+            message: Some(text),
+        }) => return run_one_turn(workspace, text).await,
+        Some(Command::Run {
+            workspace,
+            message: None,
+        }) => run_headless(workspace).await,
         None => create_and_attach(DEFAULT_WORKSPACE_NAME.to_string()).await,
+    };
+    match result {
+        Ok(()) => ExitCode::SUCCESS,
+        // What returning the `Err` from `main` printed before `main` returned
+        // an `ExitCode`.
+        Err(report) => {
+            eprintln!("Error: {report:?}");
+            ExitCode::FAILURE
+        }
     }
 }
 
@@ -175,39 +197,216 @@ async fn run_tui(mut client: DaemonClient) -> color_eyre::Result<()> {
 /// capture it. Exits cleanly once the daemon closes the connection — the
 /// session's own actor keeps running independently of this connection
 /// (ruling W1-R51), so exiting here does not stop whatever the session is
-/// doing.
-async fn run_headless(workspace_name: String, message: Option<String>) -> color_eyre::Result<()> {
+/// doing. With `--message`, [`run_one_turn`] runs instead.
+async fn run_headless(workspace_name: String) -> color_eyre::Result<()> {
     let mut client = roundhouse_tui::connect_create(&socket_path(), &workspace_name)
         .await
         .map_err(|e| color_eyre::eyre::eyre!(e.to_string()))?;
-    let session_id = client.session_id();
-    println!("session_id={session_id}");
-
-    // Ruling W1-R119: the first — and today the only — `SubmitTurn` sender
-    // outside this workspace's own tests. Sent on THIS connection, the one
-    // that ran `CreateSession`, because `drive_session` honors the variant
-    // from the creating connection alone (W1-R37); `round attach` is a
-    // viewer and a turn submitted from it would be refused (W1-R52).
-    //
-    // Sent AFTER `session_id` is printed, so a caller capturing that line
-    // has it even if the submission itself fails.
-    if let Some(text) = message {
-        client
-            .send(&roundhouse_proto::ClientRequest::SubmitTurn { session_id, text })
-            .await
-            .map_err(|e| color_eyre::eyre::eyre!(e.to_string()))?;
-    }
+    println!("session_id={}", client.session_id());
 
     while let Some(event) = client
         .recv()
         .await
         .map_err(|e| color_eyre::eyre::eyre!(e.to_string()))?
     {
-        println!(
-            "{}",
-            serde_json::to_string(&event).map_err(|e| color_eyre::eyre::eyre!(e.to_string()))?
-        );
+        print_frame(&event)?;
     }
+    Ok(())
+}
+
+/// Exit code for a turn that failed, or that the daemon refused.
+const EXIT_TURN_FAILED: u8 = 1;
+/// Exit code for a turn that was cancelled.
+const EXIT_TURN_CANCELLED: u8 = 2;
+/// Exit code when no outcome arrived: the daemon could not be reached, or
+/// the connection ended (or broke) before this turn's `TurnFinished`.
+const EXIT_NO_OUTCOME: u8 = 3;
+
+/// Bounds the wait for `CloseSession`'s `Ack`. The daemon refuses a close
+/// silently (no frame; see `DaemonClient::close_session`), so without a
+/// bound a refusal would hang this process. Same value, for the same reason,
+/// as `roundhouse-tui`'s `CLOSE_SESSION_ACK_TIMEOUT`, which is private.
+const CLOSE_ACK_TIMEOUT: Duration = Duration::from_secs(40);
+
+/// `round run [--workspace NAME] --message TEXT`: [`run_headless`]'s output,
+/// but finishing on the submitted turn's own outcome (Phase 8 Task 21, #40).
+///
+/// Prints `session_id=`, then every frame as NDJSON up to and including THIS
+/// connection's `TurnFinished`. Then it sends `CloseSession` and keeps
+/// printing frames (the close's `SessionClosed`) until the `Ack`. The exit
+/// code is the turn's: 0 completed, 1 failed or refused, 2 cancelled, 3 no
+/// outcome. A failed close is a stderr warning and does not change it.
+async fn run_one_turn(workspace_name: String, text: String) -> ExitCode {
+    let (mut client, session_id) = match create_session_printing_frames(&workspace_name).await {
+        Ok(created) => created,
+        Err(err) => {
+            eprintln!("error: could not create a session: {err}");
+            return ExitCode::from(EXIT_NO_OUTCOME);
+        }
+    };
+
+    // Ruling W1-R119: sent on THIS connection, the one that ran
+    // `CreateSession`, because `drive_session` honors `SubmitTurn` from the
+    // creating connection alone (W1-R37); `round attach` is a viewer and a
+    // turn submitted from it would be refused (W1-R52). Sent AFTER
+    // `session_id` is printed, so a caller capturing that line has it even
+    // if the submission itself fails.
+    if let Err(err) = client
+        .send(&ClientRequest::SubmitTurn { session_id, text })
+        .await
+    {
+        eprintln!("error: could not submit the turn: {err}");
+        return ExitCode::from(EXIT_NO_OUTCOME);
+    }
+
+    let outcome = match await_turn_outcome(&mut client, session_id).await {
+        Ok(Some(outcome)) => outcome,
+        Ok(None) => {
+            eprintln!("error: the daemon closed the connection before the turn finished");
+            return ExitCode::from(EXIT_NO_OUTCOME);
+        }
+        Err(err) => {
+            eprintln!("error: lost the connection before the turn finished: {err}");
+            return ExitCode::from(EXIT_NO_OUTCOME);
+        }
+    };
+
+    if let Err(err) = close_and_print(&mut client, session_id).await {
+        eprintln!("warning: could not close session {session_id}: {err}");
+    }
+    exit_code_for(&outcome)
+}
+
+/// `CreateSession`, printing `session_id=` and then every frame from the
+/// first, so stdout carries the session's seq 0 (`SessionCreated`) too.
+/// `roundhouse_tui::connect_create` would consume that frame without
+/// returning it.
+///
+/// The daemon commits `SessionCreated` as a new session's seq 0 and streams
+/// it to the creator as its first `Committed` frame, so the session id is
+/// read off that frame. Frames before it (none today) are held back until
+/// `session_id=` is printed, which must be the first line.
+async fn create_session_printing_frames(
+    workspace_name: &str,
+) -> color_eyre::Result<(DaemonClient, SessionId)> {
+    let mut client = roundhouse_tui::connect(
+        &socket_path(),
+        roundhouse_tui::ConnectIntent::CreateSession {
+            workspace_name: workspace_name.to_string(),
+        },
+    )
+    .await
+    .map_err(|e| color_eyre::eyre::eyre!(e.to_string()))?;
+    let mut held_back = Vec::new();
+    loop {
+        let event = client
+            .recv()
+            .await
+            .map_err(|e| color_eyre::eyre::eyre!(e.to_string()))?
+            .ok_or_else(|| {
+                color_eyre::eyre::eyre!("the daemon closed the connection before SessionCreated")
+            })?;
+        let created = match &event {
+            ClientEvent::Committed {
+                session_id, seq: 0, ..
+            } => Some(*session_id),
+            _ => None,
+        };
+        held_back.push(event);
+        if let Some(session_id) = created {
+            println!("session_id={session_id}");
+            for event in &held_back {
+                print_frame(event)?;
+            }
+            return Ok((client, session_id));
+        }
+    }
+}
+
+/// Prints frames until this connection's `TurnFinished` for `session_id`,
+/// and returns its outcome; `None` on EOF first.
+async fn await_turn_outcome(
+    client: &mut DaemonClient,
+    session_id: SessionId,
+) -> color_eyre::Result<Option<TurnOutcome>> {
+    while let Some(event) = client
+        .recv()
+        .await
+        .map_err(|e| color_eyre::eyre::eyre!(e.to_string()))?
+    {
+        print_frame(&event)?;
+        if let ClientEvent::TurnFinished {
+            session_id: finished,
+            outcome,
+            ..
+        } = event
+        {
+            if finished == session_id {
+                return Ok(Some(outcome));
+            }
+        }
+    }
+    Ok(None)
+}
+
+/// Sends `CloseSession` and prints every frame up to and including its
+/// `Ack`. Not `DaemonClient::close_session`, which discards the frames that
+/// arrive before the `Ack` — among them the close's own `SessionClosed`,
+/// which belongs in this command's output.
+///
+/// Cancelling the `recv` on [`CLOSE_ACK_TIMEOUT`] can desynchronize the
+/// client's reader (see `DaemonClient::recv`'s cancel-safety note); that is
+/// harmless here because the client is dropped right after.
+async fn close_and_print(
+    client: &mut DaemonClient,
+    session_id: SessionId,
+) -> color_eyre::Result<()> {
+    client
+        .send(&ClientRequest::CloseSession { session_id })
+        .await
+        .map_err(|e| color_eyre::eyre::eyre!(e.to_string()))?;
+    let wait = async {
+        while let Some(event) = client
+            .recv()
+            .await
+            .map_err(|e| color_eyre::eyre::eyre!(e.to_string()))?
+        {
+            print_frame(&event)?;
+            if matches!(event, ClientEvent::Ack { .. }) {
+                return Ok(());
+            }
+        }
+        Err(color_eyre::eyre::eyre!(
+            "the daemon closed the connection without acknowledging CloseSession"
+        ))
+    };
+    tokio::time::timeout(CLOSE_ACK_TIMEOUT, wait)
+        .await
+        .map_err(|_| {
+            color_eyre::eyre::eyre!("no Ack for CloseSession within {CLOSE_ACK_TIMEOUT:?}")
+        })?
+}
+
+/// The exit code for `outcome`, as `cli::Command::Run` documents it.
+fn exit_code_for(outcome: &TurnOutcome) -> ExitCode {
+    match outcome {
+        TurnOutcome::Completed => ExitCode::SUCCESS,
+        TurnOutcome::Cancelled { .. } => ExitCode::from(EXIT_TURN_CANCELLED),
+        TurnOutcome::Failed { .. } | TurnOutcome::Rejected { .. } => {
+            ExitCode::from(EXIT_TURN_FAILED)
+        }
+        // `TurnOutcome` is `#[non_exhaustive]`: an outcome this build does
+        // not know is not a success it can vouch for.
+        _ => ExitCode::from(EXIT_TURN_FAILED),
+    }
+}
+
+/// One frame as one NDJSON line on stdout.
+fn print_frame(event: &ClientEvent) -> color_eyre::Result<()> {
+    println!(
+        "{}",
+        serde_json::to_string(event).map_err(|e| color_eyre::eyre::eyre!(e.to_string()))?
+    );
     Ok(())
 }
 
@@ -242,17 +441,28 @@ where
         .await
         .map_err(|e| color_eyre::eyre::eyre!(e.to_string()))?
     {
-        // `ClientEvent` is `#[non_exhaustive]` (Phase 0) and today carries
-        // only `TaskEvent`/`Ack`; `Ack` — no protocol-version negotiation UI
-        // exists yet (Phase 5) — falls through untouched.
-        if let roundhouse_proto::ClientEvent::TaskEvent {
-            session_id,
-            payload,
-            ..
-        } = event
-        {
-            dashboard.apply(session_id, *payload);
-            dashboard.tick(terminal)?;
+        match event {
+            roundhouse_proto::ClientEvent::Committed {
+                session_id,
+                payload,
+                ..
+            } => {
+                dashboard.apply(session_id, *payload);
+                dashboard.tick(terminal)?;
+            }
+            // The daemon only sends this in answer to a `Resume` whose cursor
+            // is past the session's head; this loop never resumes, so it
+            // means the two sides disagree about the session's history.
+            roundhouse_proto::ClientEvent::ResyncRequired { session_id, head } => {
+                return Err(color_eyre::eyre::eyre!(
+                    "the daemon requires a resync for session {session_id} (head {head:?})"
+                ));
+            }
+            // `TurnFinished` (this loop submits no turns) and `Ack` (no
+            // protocol-version negotiation UI exists yet) carry nothing to
+            // render. `ClientEvent` is `#[non_exhaustive]` (Phase 0), so this
+            // arm also covers any later variant.
+            _ => {}
         }
     }
     Ok(())

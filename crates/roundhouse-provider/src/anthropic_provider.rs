@@ -16,6 +16,113 @@ use crate::ir::{
 use crate::provider_trait::{BoxFut, Provider};
 use crate::transport::HttpRequest;
 
+/// Rejection reason for an operator-supplied `ROUNDHOUSE_ANTHROPIC_BASE_URL`
+/// that [`parse_anthropic_base_url`] refused. Every variant carries at most
+/// the offending scheme or host -- never the raw input, which may embed a
+/// query string or userinfo carrying a credential (exactly the shape
+/// [`BaseUrlError::Credentials`]/[`BaseUrlError::Query`] themselves reject).
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum BaseUrlError {
+    #[error("ROUNDHOUSE_ANTHROPIC_BASE_URL is not a valid URL")]
+    Unparseable,
+    #[error("ROUNDHOUSE_ANTHROPIC_BASE_URL must not include a username or password")]
+    Credentials,
+    #[error("ROUNDHOUSE_ANTHROPIC_BASE_URL must not include a query string")]
+    Query,
+    #[error("ROUNDHOUSE_ANTHROPIC_BASE_URL must not include a fragment")]
+    Fragment,
+    #[error(
+        "ROUNDHOUSE_ANTHROPIC_BASE_URL must start with \"https://\", or \"http://\" only for \
+         a loopback host (127.0.0.0/8, ::1, localhost); got scheme {0:?}"
+    )]
+    UnsupportedScheme(String),
+    #[error(
+        "ROUNDHOUSE_ANTHROPIC_BASE_URL uses \"http://\" but {0:?} is not a loopback host \
+         (127.0.0.0/8, ::1, localhost)"
+    )]
+    NonLoopbackHttp(String),
+}
+
+/// Which `ReqwestTransport` constructor a validated
+/// `ROUNDHOUSE_ANTHROPIC_BASE_URL` requires. [`parse_anthropic_base_url`]
+/// only ever hands back [`HttpLoopback`](Self::HttpLoopback) for a URL it has
+/// already confirmed is `http://` against a loopback host -- but it does not
+/// build the transport itself, so the plaintext escape hatch is always
+/// chosen visibly at the caller's own call site (`roundhouse-daemon`'s
+/// `main`), not silently inside this crate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AnthropicBaseUrlTransport {
+    /// `https://` -- the safe default, `ReqwestTransport::new()`.
+    Https,
+    /// `http://` against a loopback host -- `ReqwestTransport::
+    /// allowing_plaintext_http()`.
+    HttpLoopback,
+}
+
+/// Validates and normalizes an operator-supplied `ROUNDHOUSE_ANTHROPIC_BASE_URL`.
+///
+/// Parses with `reqwest::Url::parse` -- the exact WHATWG-compliant parser
+/// `reqwest` itself uses for every outbound request -- rather than hand-rolled
+/// string splitting. A hand-rolled authority scan that ends only at `/ ? #`
+/// disagrees with the real parser about where the host ends whenever the
+/// input contains a backslash: a "special" scheme like `http` treats `\`
+/// exactly like `/` (a WHATWG quirk), so `http://evil.com\@127.0.0.1` scans,
+/// under naive splitting, as host `127.0.0.1` with a stray path-looking
+/// suffix -- while `reqwest`'s own parser (proven directly against `url`
+/// 2.5.8) resolves the very same string to host `evil.com`, with
+/// `/@127.0.0.1` as its path. A prior version of this function used that
+/// naive scan and accepted the string as loopback; the real request would
+/// have gone to `evil.com` instead. Delegating entirely to the real parser
+/// and reading its own `.host()` back closes that class of bug by
+/// construction, rather than chasing each new bypass string one at a time.
+///
+/// `https` is always allowed. `http` is allowed only when the parsed host is
+/// a loopback `Ipv4`/`Ipv6` address (`127.0.0.0/8`, `::1`) or the literal
+/// domain `localhost` (`Url::host()` itself lowercases domains, so this is
+/// effectively case-insensitive). A non-empty username or password, any
+/// query string, or any fragment is rejected outright, regardless of scheme
+/// -- each is a place an operator-supplied gateway URL could carry a
+/// credential (`https://u:secret@gw.example`, `https://gw.example/?k=secret`)
+/// that this value's own `info!` log line at the call site would otherwise
+/// echo verbatim. A path prefix is fine (`https://gw.example/anthropic`). A
+/// trailing `/` is trimmed, because `AnthropicMessagesProvider::stream_chat`
+/// appends `/v1/messages`.
+pub fn parse_anthropic_base_url(
+    raw: &str,
+) -> Result<(String, AnthropicBaseUrlTransport), BaseUrlError> {
+    let url = reqwest::Url::parse(raw).map_err(|_| BaseUrlError::Unparseable)?;
+
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err(BaseUrlError::Credentials);
+    }
+    if url.query().is_some() {
+        return Err(BaseUrlError::Query);
+    }
+    if url.fragment().is_some() {
+        return Err(BaseUrlError::Fragment);
+    }
+
+    let is_loopback = match url.host() {
+        Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
+        Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
+        Some(url::Host::Domain(d)) => d == "localhost",
+        None => false,
+    };
+
+    let transport = match url.scheme() {
+        "https" => AnthropicBaseUrlTransport::Https,
+        "http" if is_loopback => AnthropicBaseUrlTransport::HttpLoopback,
+        "http" => {
+            return Err(BaseUrlError::NonLoopbackHttp(
+                url.host_str().unwrap_or_default().to_string(),
+            ));
+        }
+        other => return Err(BaseUrlError::UnsupportedScheme(other.to_string())),
+    };
+
+    Ok((url.as_str().trim_end_matches('/').to_string(), transport))
+}
+
 /// Anthropic's required API-version header. Pinned rather than tracking
 /// "latest": the version string *is* the wire contract this crate's encoder and
 /// decoder were written against, so bumping it is a deliberate change that
@@ -40,9 +147,13 @@ const HTTP_OVERLOADED: u16 = 529;
 /// material, and this struct stays trivially shareable across sessions.
 pub struct AnthropicMessagesProvider {
     /// API origin, without a trailing slash. Overridable so a gateway or a
-    /// local mock can be pointed at without touching this adapter; §9.9's
-    /// `ROUNDHOUSE_<PROVIDER>_BASE_URL` resolution chain lands in Phase 2 and
-    /// will set this field rather than replace it.
+    /// local mock can be pointed at without touching this adapter:
+    /// `roundhouse-daemon`'s `main` sets it from the operator's
+    /// `ROUNDHOUSE_ANTHROPIC_BASE_URL` (Phase 8, Task 8), once this module's
+    /// own [`parse_anthropic_base_url`] has confirmed the value is `https://`
+    /// or a loopback `http://` (127.0.0.0/8, `::1`, `localhost`), rejected any
+    /// userinfo/query/fragment, and named which `ReqwestTransport` the daemon
+    /// must build alongside it — never a raw, unvalidated string.
     pub base_url: String,
 }
 
@@ -165,19 +276,21 @@ impl Provider for AnthropicMessagesProvider {
             // `TransportError`'s `Display` never includes request headers, so
             // the API key cannot ride along here.
             //
-            // Fix round 6, J4: `base_url` is only ever set by `::new()` today
-            // (a fixed, non-secret literal), so this sink has no live
-            // exposure -- but the field is `pub`, and its own doc comment
-            // above (`base_url`'s field doc) says the §9.9
-            // `ROUNDHOUSE_<PROVIDER>_BASE_URL` override "will set this field",
-            // at which point a gateway URL carrying credentials in its query
-            // string or userinfo would flow straight into a
-            // `TransportError::Io`'s `Display` (`reqwest`'s error text embeds
-            // the full request URL) and then onto a physically-immutable
-            // `events` row. Routed through the same `redact_transport_error_text`
-            // every other codec's transport-error sinks use, so the guarantee
-            // holds structurally before that override ever lands, not only
-            // once someone remembers to add it then.
+            // Fix round 6, J4 (superseded by Phase 8, Task 8): `base_url` is
+            // no longer only ever set by `::new()` -- `roundhouse-daemon`'s
+            // `main` now sets it from the operator's
+            // `ROUNDHOUSE_ANTHROPIC_BASE_URL`, gated by this module's own
+            // `parse_anthropic_base_url`, which parses with `reqwest::Url`
+            // (not hand-rolled splitting -- fix round 1 found a real
+            // backslash-authority bypass in an earlier hand-rolled version),
+            // accepts only `https://` or a loopback `http://` (127.0.0.0/8,
+            // `::1`, `localhost`), and separately rejects any userinfo, query
+            // string, or fragment. That really does reject the
+            // credential-in-URL shape this note used to warn about (a
+            // gateway URL carrying userinfo or a query-string secret) before
+            // it can ever reach this field. The `redact_transport_error_text`
+            // routing below is unchanged and still the actual guarantee for
+            // whatever URL text does land in a `TransportError`'s `Display`.
             let response = ctx.transport.send(http_req).await.map_err(|e| {
                 ProviderError::Transport(redact_transport_error_text(&e.to_string()))
             })?;
@@ -285,5 +398,182 @@ fn stream_failure_to_provider_error(failure: StreamFailure) -> ProviderError {
         StreamFailureKind::Truncated => ProviderError::StreamInterrupted {
             partial: failure.partial_text,
         },
+    }
+}
+
+#[cfg(test)]
+mod base_url_tests {
+    use super::{parse_anthropic_base_url, AnthropicBaseUrlTransport, BaseUrlError};
+
+    /// Table test covering the brief's original acceptance/rejection cases
+    /// plus every adversarial string the security review (fix round 1)
+    /// added. Each backslash-bearing row is a real bypass a hand-rolled
+    /// authority scan fell for: `reqwest::Url::parse` (proven directly
+    /// against `url` 2.5.8 in this fix) resolves every one of them to host
+    /// `evil.com`, not the loopback address the raw string suggests, so
+    /// they are rejected as `NonLoopbackHttp("evil.com")`.
+    type ExpectedBaseUrl = Result<(&'static str, AnthropicBaseUrlTransport), BaseUrlError>;
+
+    #[test]
+    fn parse_anthropic_base_url_table() {
+        let cases: &[(&str, ExpectedBaseUrl)] = &[
+            // --- brief's original cases ---
+            (
+                "https://api.anthropic.com",
+                Ok((
+                    "https://api.anthropic.com",
+                    AnthropicBaseUrlTransport::Https,
+                )),
+            ),
+            (
+                "http://127.0.0.1:4317",
+                Ok((
+                    "http://127.0.0.1:4317",
+                    AnthropicBaseUrlTransport::HttpLoopback,
+                )),
+            ),
+            (
+                "http://example.com",
+                Err(BaseUrlError::NonLoopbackHttp("example.com".to_string())),
+            ),
+            (
+                "ftp://example.com",
+                Err(BaseUrlError::UnsupportedScheme("ftp".to_string())),
+            ),
+            (
+                "https://api.anthropic.com/",
+                Ok((
+                    "https://api.anthropic.com",
+                    AnthropicBaseUrlTransport::Https,
+                )),
+            ),
+            (
+                "http://localhost:9999/",
+                Ok((
+                    "http://localhost:9999",
+                    AnthropicBaseUrlTransport::HttpLoopback,
+                )),
+            ),
+            (
+                "http://[::1]:9999",
+                Ok(("http://[::1]:9999", AnthropicBaseUrlTransport::HttpLoopback)),
+            ),
+            // --- 127.0.0.0/8 range, not just 127.0.0.1; 128.0.0.1 is NOT loopback ---
+            (
+                "http://127.255.0.1:8080",
+                Ok((
+                    "http://127.255.0.1:8080",
+                    AnthropicBaseUrlTransport::HttpLoopback,
+                )),
+            ),
+            (
+                "http://128.0.0.1",
+                Err(BaseUrlError::NonLoopbackHttp("128.0.0.1".to_string())),
+            ),
+            // --- fix round 1, IMPORTANT 1: backslash-authority bypass ---
+            // Each resolves (per the real WHATWG parser) to host `evil.com`.
+            (
+                r"http://evil.com\@127.0.0.1",
+                Err(BaseUrlError::NonLoopbackHttp("evil.com".to_string())),
+            ),
+            (
+                r"http://\evil.com\@127.0.0.1",
+                Err(BaseUrlError::NonLoopbackHttp("evil.com".to_string())),
+            ),
+            (
+                r"http://evil.com\x@localhost",
+                Err(BaseUrlError::NonLoopbackHttp("evil.com".to_string())),
+            ),
+            (
+                r"http://evil.com\t\@127.0.0.1",
+                Err(BaseUrlError::NonLoopbackHttp("evil.com".to_string())),
+            ),
+            // `[::1].evil.com` is not a valid bracketed IPv6 literal (the
+            // brackets must enclose the WHOLE host), so the real parser
+            // refuses it outright instead of silently taking a prefix.
+            ("http://[::1].evil.com", Err(BaseUrlError::Unparseable)),
+            // userinfo `127.0.0.1`, host `evil.com` -- rejected on both the
+            // userinfo check and (independently) the host check.
+            ("http://127.0.0.1@evil.com", Err(BaseUrlError::Credentials)),
+            (
+                "http://localhost.evil.com",
+                Err(BaseUrlError::NonLoopbackHttp(
+                    "localhost.evil.com".to_string(),
+                )),
+            ),
+            ("http://evil.com#@127.0.0.1", Err(BaseUrlError::Fragment)),
+            // Scheme is case-insensitive (the real parser lowercases it);
+            // still rejected on the real (non-loopback) host, not accepted
+            // by accident of case.
+            (
+                "HTTP://evil.com",
+                Err(BaseUrlError::NonLoopbackHttp("evil.com".to_string())),
+            ),
+            // --- WHATWG's alternate IPv4 notations: real loopback addresses
+            // a naive `std::net::Ipv4Addr::from_str` (decimal-dotted only)
+            // would have wrongly rejected. ---
+            (
+                "http://0x7f.0.0.1",
+                Ok(("http://127.0.0.1", AnthropicBaseUrlTransport::HttpLoopback)),
+            ),
+            (
+                "http://2130706433",
+                Ok(("http://127.0.0.1", AnthropicBaseUrlTransport::HttpLoopback)),
+            ),
+            // --- fix round 1, IMPORTANT 3: credential-in-URL shapes ---
+            ("http://user:pass@127.0.0.1", Err(BaseUrlError::Credentials)),
+            (
+                "https://u:secret@gw.example",
+                Err(BaseUrlError::Credentials),
+            ),
+            ("https://gw.example/?k=secret", Err(BaseUrlError::Query)),
+            ("https://gw.example/#frag", Err(BaseUrlError::Fragment)),
+            // A path prefix (no query, no fragment, no userinfo) is fine.
+            (
+                "https://gw.example/anthropic/",
+                Ok((
+                    "https://gw.example/anthropic",
+                    AnthropicBaseUrlTransport::Https,
+                )),
+            ),
+            // --- whitespace: the real parser trims leading/trailing space
+            // as WHATWG requires; not a bypass, just proven here rather than
+            // assumed. ---
+            (
+                " https://api.anthropic.com",
+                Ok((
+                    "https://api.anthropic.com",
+                    AnthropicBaseUrlTransport::Https,
+                )),
+            ),
+            (
+                "https://api.anthropic.com ",
+                Ok((
+                    "https://api.anthropic.com",
+                    AnthropicBaseUrlTransport::Https,
+                )),
+            ),
+        ];
+
+        for (input, expected) in cases {
+            let actual = parse_anthropic_base_url(input);
+            let expected_owned = expected.clone().map(|(s, t)| (s.to_string(), t));
+            assert_eq!(actual, expected_owned, "input: {input:?}");
+        }
+    }
+
+    /// The controller's exact wiring test: a validated http loopback base
+    /// URL comes back tagged for the plaintext-capable transport, and a
+    /// validated https base URL does not.
+    #[test]
+    fn validated_http_loopback_is_tagged_for_the_plaintext_transport() {
+        let (_, transport) = parse_anthropic_base_url("http://127.0.0.1:9999").unwrap();
+        assert_eq!(transport, AnthropicBaseUrlTransport::HttpLoopback);
+    }
+
+    #[test]
+    fn validated_https_is_tagged_for_the_default_transport() {
+        let (_, transport) = parse_anthropic_base_url("https://api.anthropic.com").unwrap();
+        assert_eq!(transport, AnthropicBaseUrlTransport::Https);
     }
 }

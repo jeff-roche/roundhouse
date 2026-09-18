@@ -6,6 +6,7 @@
 //! `roundhouse_core::task_runner` for why).
 
 use futures::StreamExt;
+use std::collections::HashSet;
 use std::time::Instant;
 
 use roundhouse_core::{
@@ -59,6 +60,106 @@ pub enum AgentError {
     Provider(#[from] ProviderError),
     #[error("store error: {0}")]
     Store(#[from] StoreError),
+}
+
+/// Every task [`run_chat_turn_with_clock`] has opened so far, and which of those already had
+/// a terminal-event append attempted — the bookkeeping [`Self::settle_after_append_failure`]
+/// needs to answer "which of this turn's tasks can I still safely fail out" (#89).
+struct TurnTasks {
+    /// In creation order — `chat` first, then `infer`. `settle_after_append_failure` walks
+    /// this in REVERSE (innermost/last-opened first), so a failed `infer` settles before its
+    /// parent `chat` does, matching the ordering `fail_turn_on_provider_error` already uses
+    /// for the success-path provider-error case.
+    opened: Vec<TaskId>,
+    /// A task lands here the moment ITS OWN terminal append (`TaskCompleted`/`TaskFailed`)
+    /// is ATTEMPTED, whether or not that attempt actually succeeds — see
+    /// `settle_after_append_failure`'s doc comment for why an attempt that itself failed
+    /// still counts.
+    terminal_attempted: HashSet<TaskId>,
+}
+
+impl TurnTasks {
+    fn new() -> Self {
+        TurnTasks {
+            opened: Vec::new(),
+            terminal_attempted: HashSet::new(),
+        }
+    }
+
+    /// Best-effort `TaskFailed{category: "turn_append_failed"}` for every task this turn
+    /// opened whose terminal append was never attempted, innermost (last opened) first —
+    /// #89, overturning Controller ruling R23 for exactly the tasks it's safe to settle
+    /// (constraints.md Decision 3).
+    ///
+    /// A task whose terminal WAS attempted is skipped even if that very attempt is what just
+    /// failed: `AppendFault::DropReplyAfterCommit` (`roundhouse_store::test_util`) exists
+    /// precisely because a failed `EventWriter::append` may have committed anyway (its own
+    /// doc comment), and `tasks_view::upsert_for_event` has no transition check to reject a
+    /// second terminal landing on a task that already has one — a follow-up `TaskFailed`
+    /// here could silently clobber a real `TaskCompleted` the store already durably holds.
+    ///
+    /// No-op when `cause` is `StoreError::SessionClosed`: `EventWriter::close_session`'s own
+    /// sweep already cancelled every task this session had open (including this turn's)
+    /// before minting the `SessionClosed` terminator, so there is nothing left to settle —
+    /// a follow-up append here would either hit the same closed tail guard for nothing, or
+    /// land on a task the sweep already terminated.
+    ///
+    /// Its own append failures are logged (`tracing::error!`) and swallowed, never
+    /// propagated — this function is already the best-effort fallback path, and must never
+    /// become a second, unhandled point of failure for the turn.
+    async fn settle_after_append_failure(
+        &self,
+        writer: &EventWriter,
+        runner: &TaskRunner,
+        session_id: SessionId,
+        cause: &StoreError,
+    ) {
+        if matches!(cause, StoreError::SessionClosed(_)) {
+            return;
+        }
+        for &task_id in self.opened.iter().rev() {
+            if self.terminal_attempted.contains(&task_id) {
+                continue;
+            }
+            let error = TaskError {
+                message: format!("turn aborted after a failed append: {cause}"),
+                category: "turn_append_failed".into(),
+            };
+            let event =
+                runner.record_task_failed(session_id, 0, now_ts(), task_id, error, false, 1);
+            if let Err(settle_err) = writer.append(event).await {
+                tracing::error!(
+                    task_id = %task_id,
+                    session_id = %session_id,
+                    error = %settle_err,
+                    "settle_after_append_failure: best-effort TaskFailed append also failed \
+                     (#89) -- this task stays open for recovery::recover_interrupted_tasks"
+                );
+            }
+        }
+    }
+}
+
+/// The single funnel every fallible append in [`run_chat_turn_with_clock`] and
+/// [`fail_turn_on_provider_error`] goes through instead of a bare `?` (#89): on `Err`, calls
+/// [`TurnTasks::settle_after_append_failure`] before returning the SAME `result` unchanged,
+/// so the caller's own `?` still raises the original error exactly as before. Centralizing
+/// this here, rather than repeating the same `if let Err(_) = &result { settle(...).await }`
+/// at every call site, is what makes "every `?` on a `StoreError` goes through one wrapper"
+/// true by construction rather than by each call site remembering to do it.
+async fn append_or_settle<T>(
+    writer: &EventWriter,
+    runner: &TaskRunner,
+    session_id: SessionId,
+    tasks: &TurnTasks,
+    result: Result<T, StoreError>,
+) -> Result<T, StoreError> {
+    if let Err(cause) = &result {
+        tasks
+            .settle_after_append_failure(writer, runner, session_id, cause)
+            .await;
+    }
+    result
 }
 
 /// Runs one chat turn: records a `chat` task, spawns one child `infer` task
@@ -139,6 +240,18 @@ pub async fn run_chat_turn(
 /// failure path (a `stream_chat` call that fails outright, or a mid-stream `Err` item), the
 /// SAME `finish()`-then-flush happens before `fail_turn_on_provider_error` appends
 /// `TaskFailed` for the infer task (and then the parent `chat` task).
+///
+/// **Best-effort settlement after a failed append (#89, overturning Controller ruling R23
+/// for the tasks it's safe to settle — constraints.md Decision 3):** every `?` on a
+/// `StoreError` in this function and in `fail_turn_on_provider_error` funnels through
+/// `append_or_settle`, which calls `TurnTasks::settle_after_append_failure` before
+/// re-raising the original error unchanged. That never changes what THIS turn returns — the
+/// append failure (or, on the mid-stream provider-error path, the provider error itself, if
+/// the pending deltas still make it out) still ends the turn exactly as before. What changes
+/// is what happens to the tasks this turn already opened: instead of staying open with no
+/// terminal event at all until `recovery::recover_interrupted_tasks` sweeps them on the next
+/// daemon start, each one that never got a terminal-event append attempt gets a same-turn
+/// `TaskFailed{category: "turn_append_failed"}` instead.
 pub async fn run_chat_turn_with_clock(
     writer: &EventWriter,
     runner: &TaskRunner,
@@ -148,35 +261,67 @@ pub async fn run_chat_turn_with_clock(
     request: ChatRequest,
     clock: &dyn MonotonicClock,
 ) -> Result<(TaskId, Vec<ContentBlock>), AgentError> {
+    let mut tasks = TurnTasks::new();
+
     let chat_task_id = TaskId::new();
     // The `chat` task is the user-facing turn; `Origin::User` reflects that.
-    append_created(
+    append_or_settle(
         writer,
         runner,
         session_id,
-        chat_task_id,
-        TaskKind::Chat,
-        None,
-        Origin::User,
+        &tasks,
+        append_created(
+            writer,
+            runner,
+            session_id,
+            chat_task_id,
+            TaskKind::Chat,
+            None,
+            Origin::User,
+        )
+        .await,
     )
     .await?;
-    append_started(writer, runner, session_id, chat_task_id).await?;
+    tasks.opened.push(chat_task_id);
+    append_or_settle(
+        writer,
+        runner,
+        session_id,
+        &tasks,
+        append_started(writer, runner, session_id, chat_task_id).await,
+    )
+    .await?;
 
     let infer_task_id = TaskId::new();
     // The `infer` task is the model actually generating a response;
     // `Origin::Model` reflects that (distinct from the parent `chat` task's
     // `Origin::User`).
-    append_created(
+    append_or_settle(
         writer,
         runner,
         session_id,
-        infer_task_id,
-        TaskKind::Infer,
-        Some(chat_task_id),
-        Origin::Model,
+        &tasks,
+        append_created(
+            writer,
+            runner,
+            session_id,
+            infer_task_id,
+            TaskKind::Infer,
+            Some(chat_task_id),
+            Origin::Model,
+        )
+        .await,
     )
     .await?;
-    append_started(writer, runner, session_id, infer_task_id).await?;
+    tasks.opened.push(infer_task_id);
+    append_or_settle(
+        writer,
+        runner,
+        session_id,
+        &tasks,
+        append_started(writer, runner, session_id, infer_task_id).await,
+    )
+    .await?;
 
     let mut stream = match provider.stream_chat(&request, ctx).await {
         Ok(stream) => stream,
@@ -188,6 +333,7 @@ pub async fn run_chat_turn_with_clock(
                 infer_task_id,
                 chat_task_id,
                 provider_err,
+                &mut tasks,
             )
             .await
         }
@@ -213,7 +359,21 @@ pub async fn run_chat_turn_with_clock(
             Ok(event) => event,
             Err(provider_err) => {
                 let final_deltas = coalescer.finish();
-                append_deltas(writer, runner, session_id, infer_task_id, final_deltas).await?;
+                let append_result =
+                    append_deltas(writer, runner, session_id, infer_task_id, final_deltas).await;
+                if let Err(store_err) = &append_result {
+                    // #89: this append's failure is about to replace `provider_err` as the
+                    // error this function actually returns -- the `?` below never reaches
+                    // `fail_turn_on_provider_error` at all, so log the provider error here
+                    // rather than letting it disappear without a trace.
+                    tracing::error!(
+                        session_id = %session_id,
+                        provider_error = %provider_err,
+                        store_error = %store_err,
+                        "chat turn: provider error superseded by a failed delta append (#89)"
+                    );
+                }
+                append_or_settle(writer, runner, session_id, &tasks, append_result).await?;
                 return fail_turn_on_provider_error(
                     writer,
                     runner,
@@ -221,6 +381,7 @@ pub async fn run_chat_turn_with_clock(
                     infer_task_id,
                     chat_task_id,
                     provider_err,
+                    &mut tasks,
                 )
                 .await;
             }
@@ -230,11 +391,25 @@ pub async fn run_chat_turn_with_clock(
         match &event {
             StreamEvent::BlockDelta { delta, .. } => {
                 let deltas = coalescer.push(delta.clone(), now);
-                append_deltas(writer, runner, session_id, infer_task_id, deltas).await?;
+                append_or_settle(
+                    writer,
+                    runner,
+                    session_id,
+                    &tasks,
+                    append_deltas(writer, runner, session_id, infer_task_id, deltas).await,
+                )
+                .await?;
             }
             StreamEvent::BlockStop { .. } => {
                 let deltas = coalescer.block_stop(now);
-                append_deltas(writer, runner, session_id, infer_task_id, deltas).await?;
+                append_or_settle(
+                    writer,
+                    runner,
+                    session_id,
+                    &tasks,
+                    append_deltas(writer, runner, session_id, infer_task_id, deltas).await,
+                )
+                .await?;
             }
             StreamEvent::UsageDelta {
                 input_tokens,
@@ -263,12 +438,35 @@ pub async fn run_chat_turn_with_clock(
     }
 
     let final_deltas = coalescer.finish();
-    append_deltas(writer, runner, session_id, infer_task_id, final_deltas).await?;
+    append_or_settle(
+        writer,
+        runner,
+        session_id,
+        &tasks,
+        append_deltas(writer, runner, session_id, infer_task_id, final_deltas).await,
+    )
+    .await?;
 
     let blocks = fold.finish();
 
-    append_completed(writer, runner, session_id, infer_task_id, usage).await?;
-    append_completed(writer, runner, session_id, chat_task_id, Usage::default()).await?;
+    tasks.terminal_attempted.insert(infer_task_id);
+    append_or_settle(
+        writer,
+        runner,
+        session_id,
+        &tasks,
+        append_completed(writer, runner, session_id, infer_task_id, usage).await,
+    )
+    .await?;
+    tasks.terminal_attempted.insert(chat_task_id);
+    append_or_settle(
+        writer,
+        runner,
+        session_id,
+        &tasks,
+        append_completed(writer, runner, session_id, chat_task_id, Usage::default()).await,
+    )
+    .await?;
 
     Ok((chat_task_id, blocks))
 }
@@ -279,9 +477,17 @@ pub async fn run_chat_turn_with_clock(
 /// racing several appends or buffering them in a background task. An empty `deltas` (the
 /// common case — most stream events don't trigger a flush) is a harmless no-op loop.
 ///
-/// **A failed append here is FATAL, deliberately (Controller ruling R23).** It propagates
-/// via `?`, so the turn ends with no terminal event for the infer task at all, and
-/// recovery's sweep is what finally resolves it. The shell delta pump does the opposite —
+/// **A failed append here is FATAL to the turn, deliberately (Controller ruling R23) — but
+/// no longer fatal to the infer task's own eventual resolution (#89).** It still propagates
+/// via `?`, ending the turn right here rather than folding a gap in the stored delta log
+/// into an apparently-normal completion — R23's "fatal" was always about the TURN ending,
+/// never about how long the tasks it opened are left unresolved. What changed is that
+/// latter half: the `?` here now goes through `run_chat_turn_with_clock`'s
+/// `append_or_settle` wrapper, which gives the infer task (and its parent chat task, if
+/// neither has a terminal-event append attempt yet) a same-turn, best-effort `TaskFailed`
+/// (`TurnTasks::settle_after_append_failure`) instead of leaving them open for
+/// `recovery::recover_interrupted_tasks` to sweep on the next daemon start. The shell delta
+/// pump does the opposite —
 /// `tool_dispatch::flush_stream`'s callers swallow a failure (`let _ =`) and count the
 /// bytes as lag while the tool call completes normally. The asymmetry is the point, not a
 /// discrepancy to unify: a dropped shell delta loses enrichment only, because the shell
@@ -312,6 +518,13 @@ async fn append_deltas(
 /// provider, which is why the parent `chat` task fails too. Any `TaskDelta` events this
 /// turn produced before the failure were already appended by the caller (Task 7) — this
 /// function only ever appends the two `TaskFailed` terminals, after that.
+///
+/// `tasks` is the SAME `TurnTasks` the caller has been threading through every other append
+/// in the turn (#89): each `append_failed` call below marks its own task in
+/// `terminal_attempted` before attempting it, then goes through the same `append_or_settle`
+/// wrapper as everywhere else — so a failure appending EITHER terminal here still gives this
+/// turn's other, not-yet-attempted task a best-effort `TaskFailed` rather than leaving it
+/// open with no attempt at all.
 async fn fail_turn_on_provider_error(
     writer: &EventWriter,
     runner: &TaskRunner,
@@ -319,21 +532,38 @@ async fn fail_turn_on_provider_error(
     infer_task_id: TaskId,
     chat_task_id: TaskId,
     provider_err: ProviderError,
+    tasks: &mut TurnTasks,
 ) -> Result<(TaskId, Vec<ContentBlock>), AgentError> {
     let error = TaskError {
         message: provider_err.to_string(),
         category: "provider_error".into(),
     };
-    append_failed(
+    tasks.terminal_attempted.insert(infer_task_id);
+    append_or_settle(
         writer,
         runner,
         session_id,
-        infer_task_id,
-        error.clone(),
-        false,
+        &*tasks,
+        append_failed(
+            writer,
+            runner,
+            session_id,
+            infer_task_id,
+            error.clone(),
+            false,
+        )
+        .await,
     )
     .await?;
-    append_failed(writer, runner, session_id, chat_task_id, error, false).await?;
+    tasks.terminal_attempted.insert(chat_task_id);
+    append_or_settle(
+        writer,
+        runner,
+        session_id,
+        &*tasks,
+        append_failed(writer, runner, session_id, chat_task_id, error, false).await,
+    )
+    .await?;
     Err(AgentError::Provider(provider_err))
 }
 

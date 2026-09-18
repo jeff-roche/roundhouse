@@ -418,7 +418,9 @@ than a second policy engine. `on_timeout: deny | fail | default(value) | approve
 **Live progress needs no separate path from history.** `(session_id, seq)` is a cursor;
 the daemon publishes appends and workflow transitions on one bus, and a reconnecting
 client resumes from its last seq and catches up exactly. A direct dividend of the
-append-only invariant, and **a hard constraint on the socket protocol**.
+append-only invariant, and **a hard constraint on the socket protocol**. (Phase 8 Task
+21: "the bus" is the store itself plus `CommitFeed` — see §11.3's amendment in
+`docs/architecture/08-ui-design.md`.)
 
 Controls: **cancel** (cooperative — mark `Cancelling`, refuse new task admission,
 SIGTERM→SIGKILL running shells, run `finally:`); **pause**; **resume**;
