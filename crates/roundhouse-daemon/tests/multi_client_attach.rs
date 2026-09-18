@@ -14,7 +14,6 @@ mod common;
 use std::sync::Arc;
 use std::time::Duration;
 
-use futures::stream;
 use roundhouse_core::{EventPayload, NoteLevel, SessionId};
 use roundhouse_proto::{ClientEvent, ClientRequest};
 use roundhouse_provider::{

@@ -33,7 +33,6 @@ mod common;
 use std::sync::Arc;
 use std::time::Duration;
 
-use futures::stream;
 use roundhouse_core::{
     CancelReason, EventPayload, Origin, SessionId, SessionOutcome, SessionSpec, SessionState,
     TaskKind, Tier,
