@@ -116,9 +116,16 @@ pub async fn run_chat_turn(
 /// that one whole flush decision (which can make several such queries — a size-shrink loop, or
 /// `carve_final_chunk`'s R13 growth-plus-bisection search) sees a single redactor snapshot
 /// throughout: a `set_redactor` landing between two queries within the same flush is not
-/// serialized against this closure, and doesn't need to be — every returned split point is
-/// still one the redactor actually gave at that call, and the resulting chunk is redacted again
-/// (against whatever redactor is live then) when it's actually persisted. See
+/// serialized against this closure. Append-time redaction does not paper over that —
+/// `Redactor::redact_event_payload` runs per payload and cannot see a match straddling two
+/// of them, which is exactly what `Redactor::safe_split_len`'s caller contract exists to
+/// prevent. What makes it safe is structural: this session's `writer` is its own
+/// `EventWriter`, `create_session_with_egress` runs `wire_redaction_for_session` on it once
+/// at session creation before any streaming, and the only writer that sees repeated
+/// `set_redactor` calls is the daemon's shared `proxy_writer`
+/// (`roundhouse_daemon`'s `register_proxy_secrets`), through which no deltas stream. So
+/// there is no mid-stream rotation in production today; if a future change calls
+/// `set_redactor` on a session's own writer mid-turn, this breaks. See
 /// `EventWriter::redaction_split_for_coalescer`'s own doc comment for the full account.
 ///
 /// The stream is consumed exactly once: the same loop that mints deltas via
@@ -271,6 +278,20 @@ pub async fn run_chat_turn_with_clock(
 /// per-session `seq` order and pushes backpressure onto the provider socket rather than
 /// racing several appends or buffering them in a background task. An empty `deltas` (the
 /// common case — most stream events don't trigger a flush) is a harmless no-op loop.
+///
+/// **A failed append here is FATAL, deliberately (Controller ruling R23).** It propagates
+/// via `?`, so the turn ends with no terminal event for the infer task at all, and
+/// recovery's sweep is what finally resolves it. The shell delta pump does the opposite —
+/// `tool_dispatch::flush_stream`'s callers swallow a failure (`let _ =`) and count the
+/// bytes as lag while the tool call completes normally. The asymmetry is the point, not a
+/// discrepancy to unify: a dropped shell delta loses enrichment only, because the shell
+/// tool's authoritative output still reaches the log in its `TaskCompleted`, whereas
+/// streamed assistant text has NO other record before the infer task's terminal event —
+/// dropping it silently would leave a completed task whose stored log is missing content
+/// the model actually produced. The pump has a second reason to stay best-effort that does
+/// not apply here: it must never let a slow store stall a child process's pipes, whereas
+/// this loop's inline await deliberately does apply that backpressure — to the provider
+/// socket, which tolerates it.
 async fn append_deltas(
     writer: &EventWriter,
     runner: &TaskRunner,

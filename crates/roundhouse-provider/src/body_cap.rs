@@ -27,8 +27,18 @@
 //! `codec::openai_chat::decode::decode_openai_chat_stream` still accumulate
 //! a whole `Vec<StreamEvent>` across SSE frames with no byte accounting
 //! either way, and `sse-stream`'s internal line buffer is unbounded
-//! regardless of which decoder consumes it. `decode_guard::DecodeLoopGuard`
-//! bounds only a `saw_message_stop` flag, not bytes or iterations. A
+//! regardless of which decoder consumes it. Even the incremental decoder
+//! keeps one unbounded accumulator of its own on the success path:
+//! `AnthropicDecodeState`'s `partial_text` concatenates every decoded text
+//! fragment for the whole stream (it exists to fill
+//! `StreamFailure::partial_text` if the stream later fails) and is never
+//! capped or drained while the stream is healthy.
+//! `decode_guard::DecodeLoopGuard`
+//! bounds only a `saw_message_stop` flag, not bytes or iterations. The one
+//! success-path quantity that IS bounded is a thinking signature, capped at
+//! `codec::anthropic_messages::MAX_THINKING_SIGNATURE_BYTES` (ruling R22)
+//! because that value is persisted verbatim and unredacted; it bounds one
+//! field, not the body. A
 //! hostile or compromised HTTP-200 endpoint that streams forever is not
 //! stopped by anything this module adds; a total-byte cap on the success
 //! path is separate, carry-forward work, not something this cap closes.

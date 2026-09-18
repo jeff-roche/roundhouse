@@ -1290,6 +1290,14 @@ impl StreamPumpState {
 /// no-op if `stream.buf` is empty (both for an idle tick and for a
 /// zero-output stream's own final flush).
 ///
+/// **This redaction is one notch weaker than the store's own
+/// persistence-boundary pass, and cannot be otherwise.** Blob bytes are
+/// redacted exactly once, here, against the redactor live at flush time;
+/// `Delta::Blob` then falls to `Redactor::redact_event_payload`'s catch-all
+/// (a `BlobRef` is a content hash with nothing to scan), so a `set_redactor`
+/// landing between this flush and the append below re-protects inline
+/// payloads but NOT the bytes already written to disk.
+///
 /// **`final_flush`:** `false` for a size/tick-triggered flush — the chosen
 /// cut is redaction's own non-final holdback-and-split answer, and if that
 /// answer is `0` (nothing safely flushable under the live redactor's
@@ -1584,6 +1592,17 @@ async fn run_shell_delta_pump(
 /// captured independently) — streaming is a best-effort enrichment of the
 /// task log, not the tool call's result. `flush_stream` itself already
 /// counts a failure's bytes as lag before returning `Err`.
+///
+/// **Why this is best-effort while the infer path's is fatal (Controller
+/// ruling R23).** `chat::append_deltas` propagates a failed streamed-delta
+/// append with `?`, failing the turn. The asymmetry is deliberate, not a
+/// discrepancy waiting to be unified in one direction or the other: a
+/// dropped shell delta costs enrichment only, because this task's
+/// authoritative output still reaches the log through its `TaskCompleted`,
+/// whereas streamed assistant text has no other record before the infer
+/// task's terminal event. And the pump must never block a child process's
+/// pipes on the store — a store stall that propagated out of here would
+/// stop draining stdout/stderr and could wedge the child itself.
 #[allow(clippy::too_many_arguments)]
 async fn handle_stream_event(
     writer: &EventWriter,

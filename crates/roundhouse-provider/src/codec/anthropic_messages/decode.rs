@@ -9,6 +9,7 @@
 //! tokens) that this decoder combines into a single normalized [`StreamEvent::UsageDelta`].
 
 use bytes::Bytes;
+use futures::stream::FusedStream;
 use futures::{Stream, StreamExt};
 use serde_json::Value;
 use sse_stream::SseStream;
@@ -57,6 +58,39 @@ pub struct StreamFailure {
     /// fragments, concatenated in first-seen order).
     pub partial_text: String,
 }
+
+/// The largest `signature_delta` value this decoder will accept from the
+/// wire. A frame carrying more than this is treated as a **wire-protocol
+/// violation** and fails the whole stream closed
+/// ([`StreamFailureKind::Transport`]); it is never truncated, and never
+/// silently dropped.
+///
+/// **Why a cap at all (Controller ruling R22).** A thinking signature is the
+/// one piece of provider output that is (a) taken verbatim off the wire here
+/// with no shape validation, (b) deliberately never redacted —
+/// `Redactor::redact_event_payload`'s `Delta::Thinking` arm passes
+/// `signature` through untouched so it can round-trip — and (c) emitted by
+/// `roundhouse_engine::delta_sink::DeltaCoalescer::close_pending` without
+/// ever consulting the inline-size limit (its R3 exemption). Nothing on the
+/// success path caps total bytes either (`body_cap` covers only the
+/// error-classification path, and `sse-stream`'s line buffer is unbounded),
+/// so without this ceiling a hostile or compromised endpoint could write
+/// unbounded, unredacted rows into the `events` table — which physically
+/// rejects `UPDATE`/`DELETE`, so they could never be removed.
+///
+/// **Why fail closed rather than drop or truncate.** A thinking block whose
+/// signature is missing or altered cannot be replayed on the next turn: that
+/// is `docs/architecture/01-data-model.md` §1.1's bug #1, the bricked
+/// resume, which `Delta::Thinking`'s verbatim round-trip exists to prevent.
+/// Failing the turn is recoverable; a silently designature'd thinking block
+/// persisted to an append-only log is not.
+///
+/// **Why 64 KiB.** Real Anthropic signatures run from a few hundred bytes to
+/// low kilobytes, so this leaves more than an order of magnitude of headroom
+/// for a format change while still bounding a single row to something a log
+/// can hold. It is deliberately not tight: the point is to bound the damage,
+/// not to police the wire format.
+pub const MAX_THINKING_SIGNATURE_BYTES: usize = 64 * 1024;
 
 /// Normalizes Anthropic's `input_tokens` usage figure by adding back `cache_read_input_tokens`.
 ///
@@ -118,8 +152,15 @@ impl AnthropicDecodeState {
     /// emitting immediately also keeps the first real *content* event
     /// (`BlockStart`) as the first event a consumer sees, rather than a
     /// usage bookkeeping event with no content behind it yet.
-    fn on_frame(&mut self, payload: &Value) -> Option<StreamEvent> {
-        let kind = payload.get("type").and_then(Value::as_str)?;
+    ///
+    /// The one `Err` this can return is a `signature_delta` past
+    /// [`MAX_THINKING_SIGNATURE_BYTES`] (Controller ruling R22) — a
+    /// wire-protocol violation, terminal for the whole stream. Every other
+    /// malformed shape stays non-fatal (`Ok(None)`).
+    fn on_frame(&mut self, payload: &Value) -> Result<Option<StreamEvent>, StreamFailure> {
+        let Some(kind) = payload.get("type").and_then(Value::as_str) else {
+            return Ok(None);
+        };
 
         let event = match kind {
             "message_start" => {
@@ -185,13 +226,36 @@ impl AnthropicDecodeState {
                             .to_string(),
                         signature: None,
                     }),
-                    "signature_delta" => Some(BlockDelta::Thinking {
-                        text: String::new(),
-                        signature: payload
-                            .pointer("/delta/signature")
-                            .and_then(Value::as_str)
-                            .map(str::to_string),
-                    }),
+                    "signature_delta" => {
+                        let signature = payload.pointer("/delta/signature").and_then(Value::as_str);
+                        // Ruling R22: cap at DECODE and fail closed. See
+                        // `MAX_THINKING_SIGNATURE_BYTES`'s doc comment for why
+                        // this one malformed shape is terminal where every
+                        // other one is skipped, and why dropping or truncating
+                        // the signature would be worse than failing the turn.
+                        // The message reports the LENGTH only -- never the
+                        // signature bytes themselves, which end up in a
+                        // `ProviderError` that gets logged.
+                        if let Some(len) = signature.map(str::len) {
+                            if len > MAX_THINKING_SIGNATURE_BYTES {
+                                return Err(StreamFailure {
+                                    kind: StreamFailureKind::Transport,
+                                    message: format!(
+                                        "anthropic-messages signature_delta carried {len} bytes, \
+                                         past the {MAX_THINKING_SIGNATURE_BYTES}-byte ceiling -- \
+                                         a wire-protocol violation, so this stream fails rather \
+                                         than persisting an unbounded, unredactable thinking \
+                                         signature"
+                                    ),
+                                    partial_text: std::mem::take(&mut self.partial_text),
+                                });
+                            }
+                        }
+                        Some(BlockDelta::Thinking {
+                            text: String::new(),
+                            signature: signature.map(str::to_string),
+                        })
+                    }
                     _ => None,
                 };
                 delta.map(|delta| StreamEvent::BlockDelta { index, delta })
@@ -241,7 +305,7 @@ impl AnthropicDecodeState {
             }
         }
 
-        event
+        Ok(event)
     }
 }
 
@@ -259,9 +323,15 @@ impl AnthropicDecodeState {
 /// each poll drives the SSE parser frame by frame, skipping frames that
 /// decode to no event (`message_start`, keep-alives, malformed/unrecognized
 /// frames), until one produces an event, the body ends, or a transport error
-/// arrives. `done` latches once a terminal item (a `StreamFailure` or a
-/// clean end) has been produced, so this stream never polls the underlying
-/// body again afterward and never yields a second terminal item.
+/// arrives. `done` latches once a `StreamFailure` has been yielded, so the
+/// underlying body is never polled again after one and a second terminal
+/// item can never be produced. A CLEAN end is not latched — the closure
+/// simply returns `None` and the whole `(sse, state, done)` tuple is dropped
+/// — and `unfold` panics rather than yielding if polled after returning
+/// `Poll::Ready(None)`. That is why the returned stream is `.fuse()`d here,
+/// making it a [`FusedStream`] that yields `None` forever once ended: the
+/// panic is unreachable for any caller, including one that re-polls through
+/// a `select!`/`chain`/replay wrapper.
 ///
 /// Ruling R17 (Phase 7, Task 11): joins the "strict" truncation-signaling
 /// group (`openai_chat`, `cohere_v2`) — at EOF, yields at most one terminal
@@ -274,7 +344,7 @@ impl AnthropicDecodeState {
 /// skipped keep-alive frame).
 pub fn decode_anthropic_messages_events<B>(
     body: B,
-) -> impl Stream<Item = Result<StreamEvent, StreamFailure>> + Send
+) -> impl FusedStream<Item = Result<StreamEvent, StreamFailure>> + Send
 where
     B: Stream<Item = Result<Bytes, TransportError>> + Send + Unpin,
 {
@@ -323,26 +393,41 @@ where
                         let Ok(payload) = serde_json::from_str::<Value>(data.trim()) else {
                             continue;
                         };
-                        if let Some(event) = state.on_frame(&payload) {
-                            return Some((Ok(event), (sse, state, false)));
+                        match state.on_frame(&payload) {
+                            // A wire-protocol violation (ruling R22's signature
+                            // ceiling): terminal, like any other `StreamFailure`.
+                            Err(failure) => return Some((Err(failure), (sse, state, true))),
+                            Ok(Some(event)) => return Some((Ok(event), (sse, state, false))),
+                            // This frame decoded to no event (e.g. `message_start`, or an
+                            // unrecognized/malformed shape) — keep polling for the next one
+                            // instead of yielding a hole in the item stream.
+                            Ok(None) => {}
                         }
-                        // This frame decoded to no event (e.g. `message_start`, or an
-                        // unrecognized/malformed shape) — keep polling for the next one
-                        // instead of yielding a hole in the item stream.
                     }
                 }
             }
         },
     )
+    // Ruling R22's sibling correction: `futures::stream::unfold` PANICS
+    // ("Unfold must not be polled after it returned Poll::Ready(None)")
+    // rather than yielding `None` again, and the `done` latch above does
+    // NOT cover the clean-end case (the closure returns `None` and the
+    // whole tuple is dropped, so nothing is left to latch). Fusing here —
+    // inside this `pub fn`, not at each call site — makes that hazard
+    // unrepresentable for every caller: the returned stream is a
+    // [`FusedStream`] that yields `None` forever once it has ended.
+    .fuse()
 }
 
 /// Decodes an Anthropic Messages SSE response body into normalized
 /// [`StreamEvent`]s, collecting the whole body first. A collect adapter over
 /// [`decode_anthropic_messages_events`] — kept as its own function, with this
-/// exact signature, because `AnthropicMessagesProfileProvider` and this
-/// module's own tests still consume a `Vec<StreamEvent>` rather than the
-/// stream directly (Phase 8 T19b Task 3 is what makes the provider consume
-/// the incremental stream instead).
+/// exact signature, because `AnthropicMessagesProfileProvider` still consumes
+/// a `Vec<StreamEvent>` rather than the stream directly (Phase 8 T19b Task 3
+/// is what makes `crate::anthropic_provider::AnthropicMessagesProvider`
+/// consume the incremental stream instead). This crate's integration test
+/// `tests/anthropic_messages_decode.rs` drives it too; this module itself has
+/// no `#[cfg(test)]` module.
 pub async fn decode_anthropic_messages_stream(
     body: impl Stream<Item = Result<Bytes, TransportError>> + Send + Unpin,
 ) -> Result<Vec<StreamEvent>, StreamFailure> {

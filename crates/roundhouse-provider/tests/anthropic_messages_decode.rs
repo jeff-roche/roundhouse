@@ -1,6 +1,7 @@
 use futures::StreamExt;
 use roundhouse_provider::codec::anthropic_messages::{
     decode_anthropic_messages_events, decode_anthropic_messages_stream, StreamFailureKind,
+    MAX_THINKING_SIGNATURE_BYTES,
 };
 use roundhouse_provider::{
     BlockDelta, BlockKind, CassetteTransport, HttpRequest, HttpTransport, StreamEvent,
@@ -174,6 +175,98 @@ fn block_start_arrives_while_the_body_is_still_open() {
     );
 
     drop(tx);
+}
+
+/// Builds one `content_block_delta`/`signature_delta` SSE frame whose
+/// signature is `len` ASCII bytes.
+fn signature_frame(len: usize) -> bytes::Bytes {
+    let signature = "s".repeat(len);
+    bytes::Bytes::from(format!(
+        "event: content_block_delta\ndata: {{\"type\":\"content_block_delta\",\"index\":0,\
+         \"delta\":{{\"type\":\"signature_delta\",\"signature\":\"{signature}\"}}}}\n\n"
+    ))
+}
+
+/// Controller ruling R22: a `signature_delta` is taken verbatim off the wire,
+/// is deliberately never redacted (`Redactor::redact_event_payload` passes
+/// `Delta::Thinking.signature` straight through so it round-trips), and is
+/// emitted by `DeltaCoalescer::close_pending` without consulting the size
+/// limit at all — so an unbounded one would write an unbounded, unredacted
+/// row into a table that physically rejects `UPDATE`/`DELETE`. A signature
+/// past [`MAX_THINKING_SIGNATURE_BYTES`] is a wire-protocol violation that
+/// must FAIL THE STREAM CLOSED, not be dropped or truncated (a thinking
+/// block that loses its signature is `01-data-model.md` §1.1 bug #1, the
+/// bricked resume, reintroduced).
+#[tokio::test]
+async fn a_signature_delta_over_the_ceiling_fails_the_stream_instead_of_being_persisted() {
+    let body = futures::stream::iter(vec![
+        Ok::<_, TransportError>(signature_frame(MAX_THINKING_SIGNATURE_BYTES + 1)),
+        // A `message_stop` the decoder must never reach: the violation is
+        // terminal, so this stream cannot come back as a clean completion.
+        Ok(bytes::Bytes::from(
+            "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+        )),
+    ]);
+    let stream = decode_anthropic_messages_events(body);
+    futures::pin_mut!(stream);
+
+    let mut items = Vec::new();
+    while let Some(item) = stream.next().await {
+        items.push(item);
+    }
+
+    assert_eq!(
+        items.len(),
+        1,
+        "the violation is the stream's one and only item -- nothing decoded before it, and \
+         nothing (not even the trailing message_stop) after it: {items:?}"
+    );
+    match &items[0] {
+        Err(failure) => {
+            assert_eq!(failure.kind, StreamFailureKind::Transport);
+            assert!(
+                !failure
+                    .message
+                    .contains('s'.to_string().repeat(64).as_str()),
+                "the failure message must report the length, never echo the signature itself: {}",
+                failure.message
+            );
+        }
+        Ok(event) => panic!("an oversized signature must not decode to an event: {event:?}"),
+    }
+}
+
+/// The other half of ruling R22: the ceiling is generous enough that a real
+/// signature is untouched. A signature of exactly
+/// [`MAX_THINKING_SIGNATURE_BYTES`] is still under the cap and must round-trip
+/// verbatim, byte for byte.
+#[tokio::test]
+async fn a_signature_delta_at_exactly_the_ceiling_still_round_trips_verbatim() {
+    let body = futures::stream::iter(vec![
+        Ok::<_, TransportError>(signature_frame(MAX_THINKING_SIGNATURE_BYTES)),
+        Ok(bytes::Bytes::from(
+            "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+        )),
+    ]);
+    let events = decode_anthropic_messages_stream(body)
+        .await
+        .expect("a signature at exactly the ceiling is not a violation");
+
+    let signature = events
+        .iter()
+        .find_map(|e| match e {
+            StreamEvent::BlockDelta {
+                delta:
+                    BlockDelta::Thinking {
+                        signature: Some(sig),
+                        ..
+                    },
+                ..
+            } => Some(sig.clone()),
+            _ => None,
+        })
+        .expect("the signature must still be decoded");
+    assert_eq!(signature, "s".repeat(MAX_THINKING_SIGNATURE_BYTES));
 }
 
 /// Splits `bytes` into contiguous chunks at `points` (deduped, sorted,

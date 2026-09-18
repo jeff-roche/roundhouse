@@ -441,9 +441,11 @@ async fn count_tokens_is_unsupported_rather_than_silently_wrong() {
 /// `futures::channel::mpsc` sender the test holds onto, so a claim like
 /// "resolves while the body is still open" is shown by controlling exactly
 /// which bytes exist and whether the channel has been closed -- never by
-/// sleeping and hoping (mirrors `anthropic_messages_decode.rs`'s identical
-/// `ChannelTransport`-shaped helper for the decoder-level equivalent of this
-/// same property).
+/// sleeping and hoping. `anthropic_messages_decode.rs` proves the same
+/// property one level down in
+/// `block_start_arrives_while_the_body_is_still_open`, where the decoder is
+/// driven off a raw `futures::channel::mpsc` receiver directly -- no
+/// transport involved, so there is no helper there to share with this one.
 struct ChannelTransport {
     status: u16,
     rx: Mutex<Option<mpsc::UnboundedReceiver<Result<bytes::Bytes, TransportError>>>>,
@@ -556,6 +558,39 @@ async fn stream_chat_returns_err_when_the_body_closes_before_any_content_arrives
         ProviderError::StreamInterrupted { partial } => assert_eq!(partial, ""),
         other => panic!("expected StreamInterrupted with no partial text, got {other}"),
     }
+}
+
+/// Controller ruling R22, at the provider boundary: a `signature_delta`
+/// past the decoder's `MAX_THINKING_SIGNATURE_BYTES` ceiling is a wire-
+/// protocol violation that fails the turn. With the violating frame first,
+/// nothing is ever handed to the engine at all, so no unbounded, unredacted
+/// `Delta::Thinking` row can reach the append-only `events` table.
+#[tokio::test]
+async fn stream_chat_fails_on_a_thinking_signature_past_the_decoders_ceiling() {
+    let signature = "s"
+        .repeat(roundhouse_provider::codec::anthropic_messages::MAX_THINKING_SIGNATURE_BYTES + 1);
+    let (tx, rx) = mpsc::unbounded::<Result<bytes::Bytes, TransportError>>();
+    tx.unbounded_send(Ok(bytes::Bytes::from(format!(
+        "event: content_block_delta\ndata: {{\"type\":\"content_block_delta\",\"index\":0,\
+         \"delta\":{{\"type\":\"signature_delta\",\"signature\":\"{signature}\"}}}}\n\n"
+    ))))
+    .unwrap();
+
+    let ctx = channel_ctx(rx);
+    let err = expect_err(
+        AnthropicMessagesProvider::new()
+            .stream_chat(&sample_request(), &ctx)
+            .await,
+    );
+    match err {
+        ProviderError::Transport(message) => assert!(
+            !message.contains(&signature),
+            "the error must report the length, never echo the signature: {message}"
+        ),
+        other => panic!("expected a Transport error for a wire-protocol violation, got {other}"),
+    }
+
+    drop(tx);
 }
 
 /// Once a first content event has already decoded, a later truncation must

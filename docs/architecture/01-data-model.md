@@ -174,9 +174,19 @@ Three known failure modes of a literal "everything is a task" model, and the ans
   chosen by a redaction-safe split, never picked locally: `Redactor::safe_split_len`,
   through `EventWriter`'s combined holdback-and-split queries
   (`redaction_split_for_coalescer`/`redaction_split_and_redact`), decides every
-  boundary, so a live secret can never be reassembled from two adjacent deltas. The
-  identical split-safe-boundary rule governs a dispatched `shell` task's streamed
-  stdout/stderr (§4.5).
+  boundary. What that buys, stated at the strength `safe_split_len`'s own doc comment
+  claims and no higher: **within a single coalesced run**, no live secret survives
+  *intact* across the run's delta boundaries. A boundary never lands inside a match
+  `AhoCorasick::find_iter` reported, so every reported match sits wholly inside one
+  delta and is replaced there; an occurrence that overlaps a reported one is never
+  reported at all and a boundary *can* legitimately land inside it, but it loses
+  interior bytes to that `[REDACTED]` replacement and so cannot reassemble as its own
+  literal byte sequence either. The scope matters: `DeltaCoalescer` closes its pending
+  buffer on a content-kind change and at block end, releasing with no holdback, and the
+  next delta starts a fresh empty buffer — so the seam between, say, the last delta of
+  a text block and the first delta of the following tool-args block carries no straddle
+  protection. The identical split-safe-boundary rule, with the identical scope, governs
+  a dispatched `shell` task's streamed stdout/stderr (§4.5).
 - **Non-terminating tasks.** A `shell` task running `npm run dev` never exits. These
   are modelled as **long-running tasks with a handle**: `TaskStarted` carries a
   `handle` (pty/process id), the task stays `Running`, deltas keep arriving, and it is

@@ -1504,10 +1504,11 @@ mod delta_streaming_e2e {
     /// cannot be used here: this test's whole point is a real dispatched
     /// shell process's real stdout/stderr actually streaming as deltas.
     /// Copies `roundhouse-engine`'s own `tests/workflow_tool_dispatch.rs`
-    /// `TestIsolate` (and this crate's own, structurally identical
-    /// `scheduled_trigger_end_to_end.rs`) — a real subprocess with no real
-    /// sandbox, portable to any CI regardless of whether `bwrap` is
-    /// installed anywhere on it.
+    /// `TestIsolate` — a real subprocess with no real sandbox, portable to
+    /// any CI regardless of whether `bwrap` is installed anywhere on it.
+    /// (`scheduled_trigger_end_to_end.rs` holds a structurally identical
+    /// copy, but it sits inside a commented-out block and does not compile,
+    /// so it is not a live precedent.)
     struct RealSpawnTestIsolate;
 
     #[async_trait::async_trait]

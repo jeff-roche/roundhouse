@@ -173,12 +173,19 @@ impl HttpTransport for ReqwestTransport {
             // collect-adapter, `decode_anthropic_messages_stream`, still
             // exists for `AnthropicMessagesProfileProvider` and this crate's
             // own tests, and still buffers the whole decoded sequence).
-            // Neither shape caps total bytes read, and `sse-stream`'s
-            // internal line buffer is unbounded too. `READ_TIMEOUT` is what
+            // Neither shape caps total bytes read, `sse-stream`'s internal
+            // line buffer is unbounded too, and the incremental decoder's
+            // own `AnthropicDecodeState::partial_text` — a running
+            // concatenation of every decoded text fragment, kept for
+            // `StreamFailure::partial_text` — grows for the whole stream
+            // with no ceiling of its own. `READ_TIMEOUT` is what
             // actually stops an infinite-body endpoint — it bounds the *gap*
             // between chunks, so a server that trickles forever is still
             // trickling within the timeout. A total-byte cap on the success
-            // path remains carry-forward work.
+            // path remains carry-forward work. (The one success-path field
+            // that IS bounded is a thinking signature, capped at
+            // `codec::anthropic_messages::MAX_THINKING_SIGNATURE_BYTES`,
+            // because that value is persisted verbatim and unredacted.)
             let body = response
                 .bytes_stream()
                 .map(|chunk| chunk.map_err(|e| TransportError::Io(e.to_string())))

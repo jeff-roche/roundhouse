@@ -594,9 +594,10 @@ fn append_batch_with_blobs_attempt(
 /// SAME transaction as the events insert — extending §4.5's "a blob can never be
 /// referenced by an event that isn't durably recorded, and vice versa" to the batch path
 /// (Phase 8 Task 19 lane B, Task 5). This is what `record_blob_write`'s own doc comment
-/// names as the mechanism wiring it into a real event-append transaction — see that doc
-/// comment for today's actual call-site status (not yet reached from any production code
-/// path itself; a later task's shell pump is the intended caller).
+/// names as the mechanism wiring it into a real event-append transaction. Today's
+/// production caller is `roundhouse_engine::tool_dispatch::flush_stream`, the shell
+/// delta pump, reached from `roundhouse_engine::agent_loop::dispatch_builtin` and
+/// `roundhouse_engine::workflow_dispatch::dispatch_tool_for_workflow` (Task 9).
 ///
 /// Reuses `append_event_in_transaction` per event — same redaction, seq-assignment, and
 /// `tasks`-view upkeep as a single `append` — then, for whichever of
@@ -715,6 +716,12 @@ impl EventWriter {
     /// never-mutates-anything-persisted contract, but over raw bytes rather than validated
     /// UTF-8 text (Phase 8 Task 19 lane B, Task 5: shell stdout/stderr and other
     /// non-text-guaranteed streamed content). See `Redactor::redact_bytes`.
+    ///
+    /// **No production caller (Controller ruling R24).** The live streaming path reaches
+    /// the same `Redactor::redact_bytes` through
+    /// [`Self::redaction_split_and_redact`], which has to do the split and the redaction
+    /// under one `ArcSwap::load`; this stays as the separately-tested standalone
+    /// primitive. Kept deliberately, not dead code.
     pub fn redact_outbound_bytes(&self, bytes: &[u8]) -> (Vec<u8>, u32) {
         self.redactor.load().redact_bytes(bytes)
     }
@@ -743,6 +750,11 @@ impl EventWriter {
     /// `redaction_safe_split_len`) remain as directly-callable, separately-tested
     /// primitives for callers that genuinely only need one of the two numbers (or that can
     /// otherwise guarantee no `set_redactor` lands between two calls of their own).
+    ///
+    /// **No production caller (Controller ruling R24).** This one is named directly by the
+    /// phase text; it and [`Self::redaction_safe_split_len`] are the separately-tested
+    /// primitives the two live methods ([`Self::redaction_split_for_coalescer`] and
+    /// [`Self::redaction_split_and_redact`]) are built from. Kept deliberately.
     pub fn redaction_holdback(&self) -> usize {
         self.redactor.load().max_pattern_len().saturating_sub(1)
     }
@@ -755,14 +767,23 @@ impl EventWriter {
     /// **Same race warning as [`Self::redaction_holdback`]: do not call this and
     /// `redaction_holdback` as two separate calls when you need them to agree on the same
     /// redactor.** Prefer [`Self::redaction_split_for_flush`].
+    ///
+    /// **No production caller (Controller ruling R24)** — see
+    /// [`Self::redaction_holdback`]'s note: a deliberately retained primitive, not dead
+    /// code.
     pub fn redaction_safe_split_len(&self, bytes: &[u8], max: usize) -> usize {
         self.redactor.load().safe_split_len(bytes, max)
     }
 
     /// Combines [`Self::redaction_holdback`] and [`Self::redaction_safe_split_len`] under a
     /// SINGLE `ArcSwap::load` (fix round 1, security finding S3 / Controller Ruling R9) —
-    /// the race-free way to get a streaming flush's split point. Tasks 6 and 8 (later
-    /// tasks in this lane) are the intended callers.
+    /// the race-free way to get a streaming flush's split point.
+    ///
+    /// **No production caller (Controller ruling R24).** Kept as a directly-callable,
+    /// separately-tested primitive; the two methods production actually calls —
+    /// [`Self::redaction_split_for_coalescer`] and [`Self::redaction_split_and_redact`] —
+    /// are built from the same two pieces ([`Self::redaction_holdback`]'s formula and
+    /// `Redactor::safe_split_len`). Deliberately retained, not dead code left behind.
     ///
     /// Returns the number of bytes of `bytes` that are safe to flush and redact now (via
     /// `redact_outbound_bytes`/`Redactor::redact_bytes` for a byte stream, or the
@@ -788,7 +809,13 @@ impl EventWriter {
     /// SINGLE `ArcSwap::load` of the live redactor PER CALL — one non-final-or-final split
     /// QUERY sees one consistent redactor snapshot for its own holdback-and-split-point pair,
     /// the same race [`Self::redaction_split_for_flush`] closes for its own (no-`max`,
-    /// non-final-only) caller.
+    /// non-final-only) shape.
+    ///
+    /// Today's production caller is the `SplitFn` closure
+    /// `roundhouse_engine::chat::run_chat_turn_with_clock` builds for its `DeltaCoalescer`
+    /// (Task 7). The shell delta pump (`roundhouse_engine::tool_dispatch::flush_stream`)
+    /// uses [`Self::redaction_split_and_redact`] instead, which folds this split choice and
+    /// the redaction itself into one snapshot (Task 8).
     ///
     /// **Residual, stated explicitly (fix round 1, finding M1 — an earlier draft of this
     /// comment overclaimed the guarantee at the wrong granularity):** one streaming flush
@@ -797,12 +824,25 @@ impl EventWriter {
     /// own R13 geometric-growth-plus-bisection search — each call an independent `load()`. A
     /// `set_redactor` landing between two of those calls within the same flush is NOT
     /// serialized against this method; the two calls can legitimately see different redactor
-    /// snapshots. That is safe regardless: every individual answer this method ever returns is
-    /// still one the live redactor at THAT call actually gave (never a stale or fabricated
-    /// value), and the payload is redacted again, against whatever redactor is live at append
-    /// time, by `redact_event_payload` when the resulting chunk is actually persisted — this
-    /// method's snapshot consistency is about correctness of a single split-point ANSWER, not
-    /// about serializing an entire multi-call flush against redactor rotation.
+    /// snapshots, so a boundary chosen under one redactor could be redacted under another.
+    /// Note that append-time redaction does NOT repair that: `redact_event_payload` runs
+    /// per payload and cannot see a match straddling two of them — which is the very thing
+    /// `Redactor::safe_split_len`'s caller contract (item 1) exists to prevent.
+    ///
+    /// What actually makes this safe is structural, not compensating: **no writer that
+    /// deltas stream through ever sees a mid-stream `set_redactor` in production today.**
+    /// Each session owns its own `EventWriter`, and
+    /// `roundhouse_engine::create_session_with_egress` calls
+    /// `roundhouse_engine::wire_redaction_for_session` on it exactly once, at session
+    /// creation, before any streaming starts. The one writer that does see repeated
+    /// `set_redactor` calls is the daemon's shared `proxy_writer`
+    /// (`roundhouse_daemon`'s `register_proxy_secrets`, re-installing the accumulated
+    /// union on every new session) — and no deltas stream through that writer at all.
+    /// **Residual: if a future change calls `set_redactor` on a session's OWN writer
+    /// mid-turn, this breaks**, and the multi-call flush above is where it would break.
+    /// This method's snapshot consistency is about the correctness of a single
+    /// split-point ANSWER, not about serializing an entire multi-call flush against
+    /// redactor rotation.
     ///
     /// `max` is an EXTERNAL cap this method always honors on top of whatever the redactor
     /// itself would allow — never a hint an implementation may ignore. `SplitFn`'s contract

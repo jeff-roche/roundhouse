@@ -86,12 +86,14 @@ pub enum RecordBlobError {
 /// caller uses to append the owning event** — never a separate one — per
 /// §4.5's "a blob can never be referenced by an event that isn't durably
 /// recorded, and vice versa." Phase 0 delivered this function; `roundhouse-flow`'s
-/// checkpoint commit (`production.rs`) is today's one real production call site.
-/// `writer::append_batch_with_blobs` (Phase 8 Task 19 lane B, Task 5) is a second
-/// mechanism wiring this into the streamed-delta event-append transaction, but is not
-/// itself reached from any production code path yet — a later task's engine shell pump
-/// is the intended caller; don't read its existence here as "blob-carrying events already
-/// flow through it today."
+/// checkpoint commit (`production.rs`) is one real production call site.
+/// `writer::append_batch_with_blobs` (Phase 8 Task 19 lane B, Task 5) is the second,
+/// wiring this into the streamed-delta event-append transaction. As of Task 9 it IS
+/// reached in production: `roundhouse_engine::tool_dispatch::flush_stream` (the shell
+/// delta pump) calls it for every flushed stdout/stderr chunk, reached from both
+/// dispatch call sites — `roundhouse_engine::agent_loop::dispatch_builtin` and
+/// `roundhouse_engine::workflow_dispatch::dispatch_tool_for_workflow`. Blob-carrying
+/// events do flow through it today, so a blob-GC audit must account for them.
 ///
 /// Rejects (`RecordBlobError::MissingFile`) a `blob_ref` whose file isn't
 /// actually present under `state_dir` — e.g. one that arrived via
