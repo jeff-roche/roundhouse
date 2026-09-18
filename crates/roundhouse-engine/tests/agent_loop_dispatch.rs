@@ -1156,6 +1156,31 @@ async fn a_dispatched_shell_tasks_deltas_and_progress_land_between_started_and_i
 /// flush). The cancel above may therefore land while the pump is still
 /// flushing that backlog rather than while a stream is actively arriving —
 /// either way, the ordering assertion below holds.
+///
+/// **Phase 8, T19a rebase:** this test's SUBJECT is unchanged — every
+/// delta/progress event for a cancelled shell task still has to commit
+/// before that task's own terminal event, and that is still what the
+/// seq comparison at the bottom checks. Two things it incidentally asserted
+/// on the way there did change, because T19a landed on the same base:
+///
+/// - the terminal event is now `TaskCancelled { by: Origin::System }`, not
+///   `TaskFailed { category: "tool_error" }`. A session-cancelled dispatch
+///   is not a tool error — see `dispatch_builtin`'s "Cancellation during
+///   execution" doc comment and its sibling test
+///   `a_session_cancelled_shell_dispatch_is_recorded_as_task_cancelled_not_task_failed`,
+///   which pins that distinction directly.
+/// - `run_agent_loop` now returns `Err(AgentLoopError::Cancelled(reason))`
+///   rather than `Ok(blocks)`, so there is no returned block list to find a
+///   `ToolResult { is_error: true }` in. That assertion is dropped rather
+///   than rewritten: the model-facing error string still exists (it is what
+///   `record_dispatch_cancelled` returns), but a cancelled loop never hands
+///   it to a caller, so asserting on it from here would be asserting on
+///   something production can no longer observe either.
+///
+/// The Global Constraint itself survives the change for the same reason it
+/// held before: `record_dispatch_cancelled` appends through the same
+/// `EventWriter` the pump does, and only after `execute_builtin` has already
+/// returned, so anything the pump enqueued is ahead of it in that one FIFO.
 #[tokio::test]
 async fn a_cancelled_shell_tasks_deltas_all_commit_before_its_terminal_event() {
     let (dir, script) = workspace_contained_script("#!/bin/sh\nyes\n", "cancel_me.sh");
@@ -1257,15 +1282,17 @@ async fn a_cancelled_shell_tasks_deltas_all_commit_before_its_terminal_event() {
             );
         } => {}
     }
-    let blocks = tokio::time::timeout(std::time::Duration::from_secs(5), &mut run)
+    let result = tokio::time::timeout(std::time::Duration::from_secs(5), &mut run)
         .await
-        .expect("model-facing shell dispatch did not observe cancellation")
-        .unwrap();
+        .expect("model-facing shell dispatch did not observe cancellation");
     assert!(
-        blocks
-            .iter()
-            .any(|b| matches!(b, ContentBlock::ToolResult { is_error: true, .. })),
-        "a cancelled shell call must surface as a real tool error, got {blocks:?}"
+        matches!(
+            result,
+            Err(AgentLoopError::Cancelled(
+                roundhouse_core::CancelReason::User
+            ))
+        ),
+        "a cancelled loop reports the cancellation as its own outcome, got {result:?}"
     );
 
     let reopened = open(&db_path).await.unwrap();
@@ -1289,8 +1316,16 @@ async fn a_cancelled_shell_tasks_deltas_all_commit_before_its_terminal_event() {
 
     let terminal = task_events
         .iter()
-        .find(|e| matches!(&e.payload, EventPayload::TaskFailed { error, .. } if error.category == "tool_error"))
-        .expect("a cancelled shell call must record a real TaskFailed{tool_error}");
+        .find(|e| {
+            matches!(
+                &e.payload,
+                EventPayload::TaskCancelled {
+                    by: roundhouse_core::Origin::System,
+                    ..
+                }
+            )
+        })
+        .expect("a session-cancelled shell call must record a real TaskCancelled");
 
     let delta_or_progress_seqs: Vec<u64> = task_events
         .iter()
