@@ -81,10 +81,12 @@ pub enum Command {
     },
     /// Create a new session and stream its events to stdout, one JSON line
     /// per event, with no TUI — for scripting and CI, where there is no
-    /// terminal to draw a dashboard into. Exits once the daemon closes the
-    /// connection (the session itself keeps running independently — ruling
-    /// W1-R51: a session's actor lifetime is not tied to any one attached
-    /// connection).
+    /// terminal to draw a dashboard into. Without `--message`, exits once
+    /// the daemon closes the connection (the session itself keeps running
+    /// independently — ruling W1-R51: a session's actor lifetime is not tied
+    /// to any one attached connection). With `--message`, exits on that
+    /// turn's outcome after closing the session: 0 completed, 1 failed or
+    /// refused, 2 cancelled, 3 no outcome (connection lost first).
     Run {
         /// The workspace the new session belongs to.
         #[arg(long, default_value = DEFAULT_WORKSPACE_NAME)]
