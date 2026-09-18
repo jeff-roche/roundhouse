@@ -33,12 +33,22 @@
 //! at length in this plan's Task 4 and unchanged since: `DeliveryExecutor`'s
 //! two `run_workflow_from_storage` callers both build root runs
 //! (`parent_run_id: None`), so no child run is ever driven, and no child run
-//! ever reaches a terminal state in production. Likewise, nothing terminates
-//! a sub-agent session: `SessionState::Closed` has no production writer. So
-//! "drive the child to a terminal state" means calling the termination seams
-//! themselves — `SessionTree::child_terminated` and
-//! `SubAgentSessions::retire_child` — which is what a future run-driver will
-//! call, and what this test calls.
+//! ever reaches a terminal state in production. So this half calls
+//! `SessionTree::child_terminated` directly, standing in for a future
+//! run-driver that would call it for real.
+//!
+//! The sub-agent half is different (Phase 8, T19a Task 6):
+//! `SubAgentSessions::retire_child` is now a real, wired production path —
+//! `scheduler_driver::DeliveryExecutor::drive_workflow_agent_child`,
+//! `DaemonSubAgentHost::close_children`, and `spawn_session_reaper`'s
+//! `RetireSubAgent` reap action all call it — and it durably closes the
+//! retired child with a terminal `SessionClosed`
+//! (`HeadlessSession::close_and_teardown` → `SessionActor::close` →
+//! `EventWriter::close_session`), not merely an in-memory teardown. This
+//! test calls `retire_child` directly rather than through one of those
+//! production callers only because none of them fits a synthetic sub-agent
+//! assembled by hand for a limits test; the method itself is exactly the one
+//! production code calls.
 
 mod common;
 

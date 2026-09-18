@@ -425,6 +425,16 @@ SIGTERM→SIGKILL running shells, run `finally:`); **pause**; **resume**;
 **retry-from-step**, which **forks a new run** inheriting completed step outputs with a
 `forked_from_run_id` link — history is append-only, so we never rewrite it; **rerun**.
 
+**Amendment (Phase 8 T19a, "session close"):** **close** ends the run's underlying
+*session*, not just the run, and is **cooperative cancel plus a terminator**:
+`SessionActor::close` (`roundhouse-engine`) runs the same cooperative cancel above
+first, then waits for whatever was in flight to actually stop (`wait_idle`), closes
+any tracked sub-agent children the same way, and only then appends the session's own
+`SessionClosed` terminator (§4.3) — the one event after which the store accepts no
+further writes for that session. Cancel alone leaves a session `Cancelling`, still
+open for the `finally:` step and still appendable; close is what makes the ending
+durable and final.
+
 ### 8.14 Open questions
 
 ~~Report schema fixed or core+extension?~~ **Decided (§8.6): core+extension, with the

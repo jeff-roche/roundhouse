@@ -1103,8 +1103,8 @@ fn unanswerable_work(step_id: String, message: String) -> WorkDone {
 /// `Err(append_err)` when even that append failed — in which case
 /// `last_task_seq: None` honestly reports that no terminal event was
 /// confirmed, leaving the task for the next boot's recovery pass, exactly
-/// like `execute_pending_with_context`'s `PendingKind::Tool` timeout arm's
-/// identical `Err` branch.
+/// like `dispatch_one_pending`'s `PendingKind::Tool` timeout arm's identical
+/// `Err` branch.
 /// §6.8: "taint crosses the spawn boundary monotonically, in both
 /// directions" — on a driven child's return, the parent's taint becomes the
 /// union of its own and the child's. A pure, directly testable wrapper over
@@ -1240,19 +1240,20 @@ impl SegmentGapGate {
 }
 
 /// Folds a `dispatch_tool_for_workflow` outcome into the [`WorkDone`] shape
-/// [`DeliveryExecutor::execute_pending`] hands back for one `PendingKind::Tool`
-/// item — shared between its `Shell` branch (no outer timeout wrap) and its
-/// filesystem-kinds branch (wrapped in `tokio::time::timeout`), so the two
-/// only differ in how they got a `Result<WorkflowToolDispatch, String>`, not
-/// in how they interpret one.
+/// [`DeliveryExecutor::dispatch_one_pending`] hands back for one
+/// `PendingKind::Tool` item — shared between its `Shell` branch (no outer
+/// timeout wrap) and its filesystem-kinds branch (wrapped in
+/// `tokio::time::timeout`), so the two only differ in how they got a
+/// `Result<WorkflowToolDispatch, String>`, not in how they interpret one.
 ///
 /// Phase 8 Task 25.4 Task 4: `DispatchOutcome::Cancelled` becomes
 /// `WorkStatus::Cancelled` here — today reachable only through the `Shell`
 /// branch, whose `ToolDispatchError::ShellSessionCancelled` is the only
 /// `DispatchOutcome::Cancelled` producer inside `dispatch_tool_for_workflow`
 /// itself. The four filesystem kinds never produce it from in here; see
-/// [`DeliveryExecutor::execute_pending`]'s own doc comment for how (and why)
-/// those four are instead reclassified by the caller, after the fact.
+/// [`DeliveryExecutor::execute_pending_with_context`]'s own doc comment for
+/// how (and why) those four are instead reclassified by the caller, after
+/// the fact.
 fn work_done_from_dispatch(
     step_id: String,
     dispatched: Result<WorkflowToolDispatch, String>,

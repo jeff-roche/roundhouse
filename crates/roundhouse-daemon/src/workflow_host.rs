@@ -221,89 +221,57 @@ const SESSION_STATE_CHANGED_PAYLOAD_PREFIX: &str = r#"{"SessionStateChanged":"#;
 /// - **Sub-agent child** — a `SessionClosed`, or a `SessionStateChanged`
 ///   carrying [`SessionState::Closed`], on the child's own log.
 ///
-/// # KNOWN GAP: nothing writes a sub-agent child's end today
+/// # KNOWN GAP: a sub-agent child's end had no writer — closed (Phase 8, T19a Task 6)
 ///
-/// The second bullet is, as of this task, a filter with no production writer
-/// in front of it. **No code in this workspace appends `SessionClosed` or
-/// `SessionStateChanged { state: Closed, .. }` to the log**:
-/// `SubAgentSessions::retire_child` (one of the two ways a tracked sub-agent
-/// ends — the other being `SubAgentSessions::take_for_reap`, used by
-/// `spawn_session_reaper`'s `RetireSubAgent` reap action)
-/// removes the map entry and the tree edge and tears the session down entirely
-/// in memory, writing nothing, and `SessionActor::cancel` — the only
-/// production appender of a session-lifecycle state event at all — writes
-/// `Cancelling`, which §8.13 is explicit is *not* terminal. (The retired demo
-/// path and the socket handshake do build such payloads, but as `ClientEvent`
-/// *frames* sent to a client; neither becomes a row.)
+/// The second bullet used to be a filter with no production writer in front
+/// of it: no code in this workspace ever appended `SessionClosed` or
+/// `SessionStateChanged { state: Closed, .. }` for a sub-agent child, so a
+/// retired child reappeared here as an occupied slot after every restart and
+/// this function could not tell it from a live one — and every sub-agent a
+/// parent ever spawned kept its real isolation mount, proxy registration and
+/// MCP subprocess for the life of the daemon process, since nothing ever
+/// tore them down either.
 ///
-/// So today: **a retired sub-agent child reappears here as an occupied slot
-/// after a restart, and this function cannot tell it from a live one.**
+/// That gap is closed. `SubAgentSessions::retire_child` now durably closes
+/// the child it retires — via `HeadlessSession::close_and_teardown` and,
+/// underneath that, `SessionActor::close`, which appends the real
+/// `SessionClosed` this function's filter looks for — before tearing its
+/// real resources down. Three production paths reach it:
+/// `scheduler_driver::DeliveryExecutor::drive_workflow_agent_child` (a
+/// workflow `agent:` step's child, on every path driving it can finish),
+/// `DaemonSubAgentHost::close_children` (a closing session's own tracked
+/// children, as one step of `SessionActor::close`'s own cascade), and
+/// `spawn_session_reaper`'s `RetireSubAgent` reap action (a tracked child
+/// whose own actor reaches `Closed` through neither of those two). Pinned
+/// end to end by `sub_agent_host`'s own restart test,
+/// `a_retired_sub_agent_child_does_not_reappear_after_a_restart`, which
+/// spawns a real child, retires it through the real `retire_child`, and
+/// restarts for real — and, at the daemon scope, by
+/// `spawn_limits_end_to_end.rs`'s fan-out test, which calls the same real
+/// `retire_child` to free a slot a `call:` child then spends.
 ///
-/// ## What that costs, stated plainly
+/// ## One restart-recovery gap remains, deliberately deferred
 ///
-/// [`MAX_DIRECT_CHILD_CALLS`] is `roundhouse_bus::limits::MAX_FAN_OUT` — **8**,
-/// and it is the *same* eight slots both kinds of child draw from. Restoration
-/// applies no ceiling of its own (`SpawnTree::record_child`, unlike
-/// `reserve_child`, takes no `max_children`). So a parent session that has ever
-/// spawned eight sub-agents over its lifetime **can never spawn another after a
-/// daemon restart, for the rest of that session's life**: all eight edges come
-/// back on that restart, and on every restart after it, because nothing ever
-/// writes the signal that would drop one. It does not self-heal on a later
-/// boot; only a real terminal writer heals it.
+/// This function restores a sub-agent child's *edge* into the `SpawnTree`
+/// (so fan-out accounting across a restart is right for a child that is
+/// still genuinely open), but it does **not** recreate a `SubAgentSessions`
+/// entry for that child — the `HeadlessSession` it would need died with the
+/// previous process. So a still-open sub-agent child recovered this way has
+/// no [`LiveSubAgent`](crate::sub_agent_host::LiveSubAgent) for
+/// `retire_child` to `take`: it can only be retired once its own actor is
+/// independently reconstructed and closed through some other route, and
+/// until then it holds its parent's fan-out slot, and its real resources,
+/// for the life of the process that recovered it. Such an edge is only ever
+/// cleared by this function's own `SessionClosed`/`SessionStateChanged`
+/// filter on a *later* restart, never during the live process that
+/// recovered it.
 ///
-/// ## The other half of the same gap: resources are never reclaimed either
-///
-/// Fan-out accounting is the consequence a restart makes visible, but it is
-/// not the only one, and the second does not need a restart to bite. Every
-/// [`LiveSubAgent`](crate::sub_agent_host::LiveSubAgent) holds a real
-/// [`HeadlessSession`](crate::session_manager::HeadlessSession): a real
-/// isolation mount, a real proxy registration, and possibly a real MCP
-/// subprocess. `SubAgentSessions::retire_child` is the one thing that gives
-/// any of those back, and it has **no production caller at all** — not merely
-/// none across restarts. Nothing terminates a sub-agent session in a live,
-/// running daemon, so every sub-agent a parent ever spawns keeps its mount,
-/// its proxy registration and its subprocess **for the life of the daemon
-/// process**, whether or not the model ever looks at that child again.
-///
-/// This is bounded rather than an unbounded resource exhaustion:
-/// `SessionRegistry`'s `DEFAULT_MAX_SESSIONS` (10,000) refuses a new session
-/// fail-closed once the daemon is holding that many, and the eight-slot
-/// fan-out ceiling above bounds what any one parent can accumulate. So the
-/// end state is a daemon that stops accepting sessions, not one that exhausts
-/// the host. It is still a distinct operational consequence from the fan-out
-/// one, and closing it takes the same fix: a real terminal signal for a
-/// sub-agent session, which then drives `retire_child`.
-///
-/// ## A restored edge has no `SubAgentSessions` record behind it
-///
-/// One asymmetry worth stating outright, because it survives the obvious fix:
-/// this function restores a sub-agent child's *edge* into the `SpawnTree` (so
-/// fan-out accounting is right), but it does **not** recreate a
-/// `SubAgentSessions` entry for that child — the `HeadlessSession` it would
-/// need died with the previous process. So even once a real terminal-signal
-/// writer exists, `retire_child` can never be called for a restart-recovered
-/// sub-agent: there is no [`LiveSubAgent`](crate::sub_agent_host::LiveSubAgent)
-/// to `take`. Such an edge is only ever cleared by this function's own
-/// `SessionClosed` filter on a *subsequent* restart, never during the live
-/// process that recovered it.
-///
-/// **This is a new failure mode introduced by wiring this function at boot**,
-/// not a pre-existing one. Until then `reconcile_spawn_tree` had no production
-/// caller, so a restart reset every parent's fan-out to zero — wrong in the
-/// permissive direction (a parent could exceed eight live children across a
-/// restart) rather than the locking one. Whoever decides whether to ship with
-/// the sub-agent terminal writer still deferred is deciding between those two
-/// wrongs, and should be deciding it with this paragraph in hand.
-///
-/// This is a real, current gap, documented rather than papered over (AGENTS.md's
-/// escalation norm). Closing it means appending a durable session-lifecycle
-/// event when a sub-agent is retired — a change to the frozen event contract
-/// and its own task, not something this one invented on the side. The filter
-/// is written now so that the day such a writer lands, boot recovery is
-/// already correct; it was pinned meanwhile by
-/// `sub_agent_host`'s own restart test, renamed to
-/// `a_retired_sub_agent_child_does_not_reappear_after_a_restart` once a
-/// writer landed (Phase 8, T19a Task 6) and the gap closed.
+/// Recorded as an explicit follow-up ("retiring children restored after a
+/// restart while the daemon is running"), not silently accepted: closing it
+/// needs this function, or something downstream of it, to reconstruct a
+/// live handle for a recovered still-open child — a meaningfully different
+/// piece of work from the terminal-event writer Task 6 added, and not this
+/// task's to invent on the side.
 ///
 /// The workflow half has the mirror-image situation and it is *not* a gap in
 /// this function: `finish_run` really does write a terminal `workflow_run`
