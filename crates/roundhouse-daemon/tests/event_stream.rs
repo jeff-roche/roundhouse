@@ -18,7 +18,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use futures::StreamExt;
-use roundhouse_core::{EventPayload, SessionId, TaskId};
+use roundhouse_core::{EventPayload, SessionId, SessionOutcome, TaskId};
+use roundhouse_daemon::socket_server::{drive_established_session, SessionLink};
 use roundhouse_proto::{ClientEvent, ClientRequest, TurnOutcome};
 use roundhouse_provider::{
     BlockDelta, BlockKind, BoxFut, Capabilities, ChatRequest, ChatStream, ModelId, ModelInfo, Plan,
@@ -817,6 +818,216 @@ async fn attach_to_a_stored_session_without_a_terminator_replays_to_its_head_the
         replay.extend(committed(event, session_id));
     }
     assert_eq!(seqs(&replay), seqs(&frames));
+}
+
+/// An in-process `tracing` sink, the same shape `tests/close_session.rs`'s own
+/// `CapturingWriter` uses: the only observable proof, in
+/// [`rejection_survives_an_external_close_once`] below, that its `SubmitTurn` has already
+/// been refused (queued into `pending_rejections`) before the session is closed — the
+/// refusal itself has no other visible side effect until it is either delivered or dropped,
+/// which is exactly the two outcomes that helper tells apart.
+#[derive(Clone, Default)]
+struct CapturingWriter(Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl std::io::Write for CapturingWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturingWriter {
+    type Writer = CapturingWriter;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        self.clone()
+    }
+}
+
+fn captured_logs() -> (CapturingWriter, tracing::Dispatch) {
+    let captured = CapturingWriter::default();
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(captured.clone())
+        .with_ansi(false)
+        .finish();
+    (captured, tracing::Dispatch::new(subscriber))
+}
+
+impl CapturingWriter {
+    fn contains(&self, needle: &str) -> bool {
+        let rendered = String::from_utf8(self.0.lock().unwrap().clone())
+            .expect("the tracing subscriber emits UTF-8");
+        rendered.contains(needle)
+    }
+}
+
+/// One attempt of
+/// [`a_rejection_queued_before_an_external_close_is_still_delivered_before_eof`]: queues a
+/// `session_not_live` rejection on a connection whose session's `Cancelling` and
+/// `SessionClosed` are *already durably committed before the connection is even spawned* —
+/// closed by something other than that connection's own `CloseSession`, so `close_task`/
+/// `close_ack_pending` are never touched here — and reports whether the resulting
+/// `TurnFinished { outcome: Rejected }` reached the wire before the connection ended.
+///
+/// Driven directly against `drive_established_session`, the same shape
+/// `tests/close_session.rs` already uses, rather than a full `Conn` over the real socket.
+///
+/// Closing the session *before* the connection is spawned, rather than partway through
+/// (this helper's first attempt at this test), is what makes the race below fair rather
+/// than one-sided: with `Cancelling` and `SessionClosed` both already on disk, the
+/// follower's very first catch-up read fetches both in the one real (thread-pool-bound)
+/// database round trip, buffering them locally — every `follower.next()` call after that
+/// is a plain in-memory `pop_front()`, exactly as cheap as `pending_rejections`' own
+/// delivery. Closing the session mid-connection instead (tried first) forced a *second*,
+/// separate database read to discover `SessionClosed` once it committed later, and that
+/// read was consistently slower than the purely in-memory rejection reserving the freed
+/// channel permit first — across 500 attempts against the unfixed guards, the rejection
+/// always won, so the drop this finding names never reproduced. Loading both events from
+/// one batch read removes that asymmetry and lets `tokio::select!`'s real (unbiased, no
+/// `biased;` keyword) tie-break decide which of `pending_event` and `pending_rejections`
+/// reaches each freed permit first, which is the actual race the underlying finding names.
+///
+/// `events_tx` is built with capacity 1, and a `Note` is committed *first*, before the
+/// close, so the connection's very first frame consumes that one slot — deterministically,
+/// since this test waits for `events_rx` to stop being empty (a non-consuming check) before
+/// doing anything else. Only once that slot is confirmed full does this attempt remove the
+/// session from the registry and send `SubmitTurn`: with no free capacity, neither
+/// `pending_rejections` nor the follower's own next parked event (already fetched, per
+/// above) can be delivered yet, so this attempt can queue the rejection and confirm (via
+/// the `tracing` capture below) that it was queued with no risk of it — or `Cancelling` —
+/// having already been delivered out from under this check.
+///
+/// What is *not* forced deterministic, deliberately, is which of `pending_rejections` and
+/// the follower's own next parked event (`Cancelling`, then `SessionClosed`) wins each
+/// *later* contested slot, once this test starts draining: that contention is itself the
+/// `tokio::select!` race the underlying finding names ("a rejection queued just before a
+/// CloseSession Ack can lose the select! race"). The fix does not make that particular
+/// contention disappear; it makes `pending_rejections` win it *every* time by construction
+/// (the break/`ack_ready` guards become mutually exclusive with a non-empty
+/// `pending_rejections` rather than racing against it at all), so the caller runs this
+/// attempt many times, and this helper's own job is only to land on the losing
+/// interleaving often enough to prove that.
+async fn rejection_survives_an_external_close_once() -> bool {
+    let (captured, dispatch) = captured_logs();
+    let _log_guard = tracing::dispatcher::set_default(&dispatch);
+
+    let dir = tempfile::tempdir().unwrap();
+    let resources = common::real_resources(dir.path()).await;
+    let actor = common::real_actor_on(dir.path(), &resources).await;
+
+    let registry = Arc::new(roundhouse_daemon::session_registry::SessionRegistry::new());
+    let (session_id, subscription) = registry
+        .create(actor.clone(), None, None)
+        .expect("registering against a fresh registry must succeed");
+
+    // Both committed, through the ordinary (non-gated) writer `real_actor_on` builds —
+    // real `CommitFeed::notify`, so the follower below needs no special-cased wake-up
+    // path to see either — and both BEFORE the connection is even spawned. See this
+    // function's own doc comment for why that ordering (rather than closing partway
+    // through, as a first attempt at this test did) is what makes the race fair.
+    common::append_note(actor.writer(), session_id, "occupy the one slot").await;
+    actor
+        .close(SessionOutcome::Completed)
+        .await
+        .expect("closing a freshly created session must succeed");
+
+    let (requests_tx, requests_rx) = mpsc::channel::<ClientRequest>(8);
+    // Capacity 1 (not the usual 8): the note above must fully occupy this channel before
+    // anything else is sent — see this function's own doc comment.
+    let (events_tx, mut events_rx) = mpsc::channel::<ClientEvent>(1);
+
+    tokio::spawn(drive_established_session(
+        session_id,
+        SessionLink::Live(subscription),
+        None,
+        true,
+        requests_rx,
+        events_tx,
+        registry.clone(),
+        resources,
+    ));
+
+    // Deterministic, non-consuming: waits for the note to occupy the channel's one slot
+    // without draining it (draining here would free the slot this attempt needs held).
+    tokio::time::timeout(BOUND, async {
+        while events_rx.is_empty() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the connection must deliver its first frame into the one-slot channel");
+
+    // Synchronous — the very next `SubmitTurn` this connection processes deterministically
+    // hits `registry.actor(session_id) == None`, i.e. `session_not_live`.
+    registry.remove(session_id);
+    assert!(registry.actor(session_id).is_none());
+
+    requests_tx.send(submit(session_id, "hello")).await.unwrap();
+
+    // The refusal's only observable side effect before it is either delivered or dropped:
+    // proves `pending_rejections` is genuinely non-empty before this attempt starts
+    // draining. With the channel's one slot still held by the undrained note, neither the
+    // rejection nor `Cancelling` can have been delivered already either.
+    tokio::time::timeout(BOUND, async {
+        while !captured.contains("refusing SubmitTurn: this session is no longer live") {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the SubmitTurn must be refused (and the refusal logged) before draining starts");
+
+    let mut frames = Vec::new();
+    loop {
+        let next = tokio::time::timeout(BOUND, events_rx.recv())
+            .await
+            .unwrap_or_else(|_| panic!("the connection must not hang; frames so far: {frames:?}"));
+        match next {
+            Some(event) => frames.push(event),
+            None => break,
+        }
+    }
+
+    frames.iter().any(|event| {
+        matches!(
+            event,
+            ClientEvent::TurnFinished {
+                outcome: TurnOutcome::Rejected { reason },
+                through_seq: None,
+                ..
+            } if reason == "session_not_live"
+        )
+    })
+}
+
+/// Final-review finding #40/1: a `TurnFinished { outcome: Rejected }` already queued in
+/// `pending_rejections` must still reach the client even once this session's
+/// `SessionClosed` becomes visible to this connection's own follower — before this fix,
+/// `drive_established_session`'s top-of-loop break
+/// (`session_closed_seen && turn_settled && close_task.is_none() && !close_ack_pending`)
+/// ignored `pending_rejections` entirely, so it could fire (and the connection end) with a
+/// reply still owed.
+///
+/// Runs [`rejection_survives_an_external_close_once`] repeatedly rather than once: which of
+/// two starved `events_tx` reservations (the follower's own parked `SessionClosed`, or the
+/// queued rejection) wins a given contested slot is itself a `tokio::select!` race — see
+/// that helper's doc comment. Fixed code wins this race by construction on every attempt
+/// (`pending_rejections.is_empty()` in the break/`ack_ready` guards makes the two
+/// mutually exclusive rather than racing at all), so this loop must pass every single
+/// attempt; buggy code loses often enough that this reliably fails within a handful.
+#[tokio::test]
+async fn a_rejection_queued_before_an_external_close_is_still_delivered_before_eof() {
+    const ATTEMPTS: usize = 40;
+    for attempt in 0..ATTEMPTS {
+        assert!(
+            rejection_survives_an_external_close_once().await,
+            "attempt {attempt}/{ATTEMPTS}: the queued rejection must reach the client before \
+             the connection ends"
+        );
+    }
 }
 
 /// An id with no registry entry and no stored events closes the connection with no reply,

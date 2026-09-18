@@ -1690,6 +1690,16 @@ pub async fn drive_established_session(
     // `TurnFinished { outcome: Rejected }` replies for refused `SubmitTurn`s,
     // bounded by `MAX_PENDING_REJECTIONS`. Not ordered against `Committed`
     // frames: a rejected turn committed nothing.
+    //
+    // Final-review finding #40/1: every loop-ending condition below (both
+    // `break`s at the top of the loop, and `ack_ready`) must treat a
+    // non-empty `pending_rejections` as "this connection still owes a
+    // reply" — otherwise a `SubmitTurn` refused with `session_closing`/
+    // `session_not_live` gets queued here and then silently discarded the
+    // moment this session's own `SessionClosed` becomes visible (or, for a
+    // creator's own successful close, discarded by losing a `select!` race
+    // against the `Ack`), with the client never told why its turn never
+    // ran.
     let mut pending_rejections: VecDeque<ClientEvent> = VecDeque::new();
     // Phase 8, T19a Task 8 — the identical shape, applied to `CloseSession`:
     // at most one close in flight per connection, run in its own spawned
@@ -1719,7 +1729,8 @@ pub async fn drive_established_session(
         // `follower` mutably for its `next()` arm.
         let nothing_parked = pending_event.is_none();
         let turn_settled = !turn_in_flight && pending_turn_finished.is_none();
-        if nothing_parked {
+        let reject_ready = !pending_rejections.is_empty();
+        if nothing_parked && !reject_ready {
             if replay_until.is_some_and(|head| follower.cursor() >= Some(head)) {
                 break;
             }
@@ -1731,9 +1742,12 @@ pub async fn drive_established_session(
             && pending_turn_finished
                 .as_ref()
                 .is_some_and(|(_, through_seq)| follower.cursor() >= *through_seq);
-        let ack_ready = close_ack_pending && nothing_parked && session_closed_seen && turn_settled;
+        let ack_ready = close_ack_pending
+            && nothing_parked
+            && session_closed_seen
+            && turn_settled
+            && !reject_ready;
         let follow = nothing_parked && !session_closed_seen;
-        let reject_ready = !pending_rejections.is_empty();
 
         tokio::select! {
             report = turn_done_rx.recv(), if turn_in_flight => {
@@ -1826,6 +1840,18 @@ pub async fn drive_established_session(
             // `session_closed_seen` (the close's own `SessionClosed` has been
             // delivered, since nothing is parked) and a settled turn, so the
             // `Ack` is the last frame this connection sends.
+            //
+            // It also requires `!reject_ready` (final-review finding #40/1):
+            // without that term, a `TurnFinished { outcome: Rejected }`
+            // still sitting in `pending_rejections` when the close's own
+            // `Ack` becomes reservable could lose that SAME `select!` race —
+            // the `break` right after `permit.send` below ends the
+            // connection either way, so a `reject_ready` loss here dropped
+            // the reply on the floor exactly as a lost `pending_event` race
+            // would. Excluding `ack_ready` outright while a rejection is
+            // still owed makes the two arms mutually exclusive rather than
+            // racing: the `Ack` cannot even become a candidate until
+            // `reject_ready`'s own arm has drained `pending_rejections`.
             permit = events_tx.reserve(), if ack_ready => {
                 match permit {
                     Ok(permit) => {
