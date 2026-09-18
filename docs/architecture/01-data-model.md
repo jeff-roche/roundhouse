@@ -75,6 +75,17 @@ pub enum Delta {
 }
 ```
 
+**Redaction coverage (Phase 8 Task 19 lane B).** `Redactor::redact_event_payload`
+(`roundhouse-store`) runs on every `TaskDelta` before it is durably appended:
+`Delta::Text`, `Delta::Thinking.text`, and `Delta::ToolArgs.fragment` are scanned as
+text; `Delta::Stdout`/`Delta::Stderr` are scanned as raw bytes
+(`Redactor::redact_bytes`), since shell output is not guaranteed to be valid UTF-8.
+`Delta::Child` is a session/seq pointer and `Delta::Blob` is a content hash — neither
+carries inline text or bytes for the automaton to scan, so `redact_event_payload`
+leaves both untouched. A blob's actual content is therefore **never** redacted by the
+store: a caller writing secret-bearing bytes to a blob (`roundhouse_store::blobs::write_blob`)
+must redact them itself before that write (see §4.5's shell-output blob routing).
+
 ### 4.2 Task kinds
 
 Core kinds are flat identifiers; plugin-provided kinds are namespaced `vendor:verb`
@@ -150,6 +161,22 @@ Three known failure modes of a literal "everything is a task" model, and the ans
   a restart still cannot know about a sub-agent child.
 - **Streaming.** Solved by `TaskDelta`. A task's output is not written until it
   completes; consumers fold deltas for a live view.
+
+  **Coalescing and ordering (Phase 8 Task 19 lane B).** A provider's raw per-token
+  deltas are batched before persistence by `roundhouse_engine::delta_sink::DeltaCoalescer`:
+  a mid-block flush fires at about 2 KiB of buffered text or after 250ms (4Hz, the
+  cadence §11.2's coalesced session summaries already use) — whichever comes first —
+  plus on a content-kind change and at block/stream end. `roundhouse_engine::chat::run_chat_turn_with_clock`
+  guarantees every infer `TaskDelta` this batching produces commits before that
+  task's terminal event, on both the success path and a mid-stream provider-failure
+  path. Every chunk boundary the coalescer emits — not only the
+  size/time-triggered ones, but every cut inside an oversized final release too — is
+  chosen by a redaction-safe split, never picked locally: `Redactor::safe_split_len`,
+  through `EventWriter`'s combined holdback-and-split queries
+  (`redaction_split_for_coalescer`/`redaction_split_and_redact`), decides every
+  boundary, so a live secret can never be reassembled from two adjacent deltas. The
+  identical split-safe-boundary rule governs a dispatched `shell` task's streamed
+  stdout/stderr (§4.5).
 - **Non-terminating tasks.** A `shell` task running `npm run dev` never exits. These
   are modelled as **long-running tasks with a handle**: `TaskStarted` carries a
   `handle` (pty/process id), the task stays `Running`, deltas keep arriving, and it is
@@ -188,6 +215,39 @@ bodies, and checkpoint snapshots are the dominant sources of large payloads and 
 route through this path regardless of size (avoids a threshold judgment call on the
 kinds most likely to be large); anything else is measured and only escalated to a blob if
 it crosses the threshold.
+
+**A deliberate exception (Controller ruling R14, Phase 8 Task 19 lane B).**
+`roundhouse_engine::delta_sink::DeltaCoalescer` can still emit a single `Delta` whose
+serialized size reaches or exceeds `BLOB_INLINE_THRESHOLD` without routing it to the
+blob store, in two cases: a thinking signature that alone exceeds the threshold (it
+must ride the delta that closes its block and round-trip verbatim — splitting it would
+break that contract), and a redaction match wider than the size budget (a registered
+secret whose own serialized form exceeds the threshold — splitting it would put a
+recoverable secret across two separately redacted payloads, each missing part of the
+match). Both cases put content integrity ahead of the size rule above; the resulting
+delta stays inline and is **never** written to the blob store. This is a deliberate,
+documented deviation from this section's size rule, not an oversight, and closing it
+(e.g. giving an oversized-but-safe-to-inline delta somewhere else to go) is tracked as
+follow-up work, not something this lane resolved.
+
+**Shell output's mime convention (Phase 8 Task 19 lane B).** A dispatched `shell`
+task's streamed stdout/stderr are `Delta::Blob` refs whose `BlobRef.mime` is
+`application/vnd.roundhouse.stdout` or `application/vnd.roundhouse.stderr` — a project
+convention layered on the `BlobRef` shape above, not a new field. The bytes are
+redacted (`Redactor::redact_bytes`, via `EventWriter::redaction_split_and_redact`)
+*before* `roundhouse_store::blobs::write_blob` ever sees them, precisely because (§4.1)
+the store's persistence-boundary redaction pass never inspects blob content — a
+shell-output caller is exactly the kind of caller that must redact before that write.
+
+A streamed shell delta sequence can also contain gaps: `roundhouse_engine::tool_dispatch`'s
+pump drops a chunk from the delta stream alone (never from the task's own authoritative
+captured output, which is assembled independently) when a shared in-flight byte budget
+is exceeded, or truncates once a fixed output cap is reached. Either discontinuity is
+marked by a `TaskProgress` event before the stream continues or ends, so a consumer
+folding `TaskDelta`s into a live view can tell a genuine gap apart from a contiguous
+read. **A consumer must never treat the concatenation of a task's `Delta::Blob`
+sequence as that task's complete output** — a gap marker means bytes existed that will
+never appear in any blob for this task.
 
 **Storage.** Blobs live under `<state_dir>/blobs/<hash[0..2]>/<hash>` (git-style
 sharded-by-prefix layout, avoiding one directory with millions of entries), written via

@@ -11,22 +11,28 @@
 //! [`collect_body_capped`] is the one implementation all seven now call.
 //!
 //! This only ever runs on the error-classification path. **The success path
-//! is deliberately out of scope for this cap and remains unbounded** (fix
-//! round 1, Ruling R26 / security S7 — an earlier version of this comment
-//! wrongly claimed the success path "streams and decodes incrementally
-//! without ever buffering a whole body"; it does not).
-//! `reqwest_transport.rs`'s own doc comment (around its
-//! `decode_anthropic_messages_stream` usage) says the opposite: that
-//! consumer drains its stream into a `Vec<StreamEvent>` before returning,
-//! and `sse-stream`'s internal line buffer is unbounded too.
-//! `codec::openai_chat::decode::decode_openai_chat_stream` shows the same
-//! shape — it accumulates a `Vec<StreamEvent>` across SSE frames with no
-//! byte accounting, and `decode_guard::DecodeLoopGuard` bounds only a
-//! `saw_message_stop` flag, not bytes or iterations. A hostile or
-//! compromised HTTP-200 endpoint that streams forever is not stopped by
-//! anything this module adds; bounding the success path is separate,
-//! carry-forward work, not something this cap closes. Bounding the
-//! error-classification path here closes only that one gap.
+//! has no total-byte cap of its own** (fix round 1, Ruling R26 / security
+//! S7 — an earlier version of this comment wrongly claimed the success path
+//! "streams and decodes incrementally without ever buffering a whole body";
+//! it did not, at the time). That has since partly changed: the production
+//! Anthropic Messages path (`AnthropicMessagesProvider::stream_chat`, in
+//! `anthropic_provider.rs`) now decodes via
+//! `codec::anthropic_messages::decode::decode_anthropic_messages_events`
+//! (Phase 8 Task 19 lane B, Tasks 2/3), which yields `StreamEvent`s as SSE
+//! frames arrive rather than collecting a `Vec<StreamEvent>` first — but it
+//! still applies no ceiling of its own to how many bytes it reads. The
+//! collect-adapter `decode_anthropic_messages_stream` (kept for
+//! `codec::anthropic_messages::provider::AnthropicMessagesProfileProvider`
+//! and this crate's own tests) and
+//! `codec::openai_chat::decode::decode_openai_chat_stream` still accumulate
+//! a whole `Vec<StreamEvent>` across SSE frames with no byte accounting
+//! either way, and `sse-stream`'s internal line buffer is unbounded
+//! regardless of which decoder consumes it. `decode_guard::DecodeLoopGuard`
+//! bounds only a `saw_message_stop` flag, not bytes or iterations. A
+//! hostile or compromised HTTP-200 endpoint that streams forever is not
+//! stopped by anything this module adds; a total-byte cap on the success
+//! path is separate, carry-forward work, not something this cap closes.
+//! Bounding the error-classification path here closes only that one gap.
 //!
 //! **Relationship to `transport::eventstream::MAX_BUFFERED_BYTES` (26 MiB):**
 //! that constant bounds a single AWS eventstream *frame* while it's being

@@ -164,15 +164,21 @@ impl HttpTransport for ReqwestTransport {
             // §9.3's "streaming is the only path" needs from the transport
             // layer.
             //
-            // It does *not* by itself bound memory end-to-end, and an earlier
-            // version of this comment wrongly implied it did: today's only
-            // consumer, `decode_anthropic_messages_stream`, drains this stream
-            // into a `Vec<StreamEvent>` before returning, and `sse-stream`'s
+            // It does *not* by itself bound memory end-to-end. This body feeds
+            // `codec::anthropic_messages::decode::decode_anthropic_messages_events`
+            // (Phase 8 Task 19 lane B, Tasks 2/3), which
+            // `AnthropicMessagesProvider::stream_chat` now consumes
+            // incrementally — it yields `StreamEvent`s as SSE frames arrive
+            // and no longer collects a `Vec<StreamEvent>` first (the
+            // collect-adapter, `decode_anthropic_messages_stream`, still
+            // exists for `AnthropicMessagesProfileProvider` and this crate's
+            // own tests, and still buffers the whole decoded sequence).
+            // Neither shape caps total bytes read, and `sse-stream`'s
             // internal line buffer is unbounded too. `READ_TIMEOUT` is what
             // actually stops an infinite-body endpoint — it bounds the *gap*
             // between chunks, so a server that trickles forever is still
-            // trickling within the timeout. Bounding total response size is
-            // Phase 2's, alongside making the decoder genuinely incremental.
+            // trickling within the timeout. A total-byte cap on the success
+            // path remains carry-forward work.
             let body = response
                 .bytes_stream()
                 .map(|chunk| chunk.map_err(|e| TransportError::Io(e.to_string())))
