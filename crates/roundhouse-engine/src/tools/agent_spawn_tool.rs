@@ -267,6 +267,17 @@ pub trait SubAgentHost: Send + Sync {
     /// level's siblings concurrently so that a level costs its slowest
     /// child rather than the sum of its children.
     ///
+    /// **Nothing here promises this method's future is safe to drop**, and
+    /// an implementor that starts unrecoverable work per child owes that
+    /// property itself. `SessionActor::close` has no timeout of its own, so
+    /// every caller applies one (`socket_server`'s `CLOSE_SESSION_TIMEOUT`,
+    /// `session_manager`'s `SESSION_CLOSE_TIMEOUT`), and a timeout DROPS
+    /// what it bounds — mid-child, with whatever that child's teardown had
+    /// already torn out still torn out. The real implementor closes that by
+    /// detaching each child's retirement onto its own task and awaiting the
+    /// handle, so a dropped cascade still finishes what it started; see its
+    /// own doc comment for what that costs.
+    ///
     /// # Implementor contract
     ///
     /// **Must be idempotent.** `SessionActor::close`'s own retry path can

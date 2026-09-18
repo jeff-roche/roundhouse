@@ -398,58 +398,87 @@ async fn build_headless_session(
 /// dead code: an enclosing timeout created at `t` has deadline `t + 30s`,
 /// while a nested one created at `t + ε` (after the enclosing close's
 /// `cancel`, `wait_idle` and `children_of` snapshot) has deadline
-/// `t + 30s + ε`, so the enclosing timeout always wins and DROPS the nested
-/// timer before it can fire. That inverts the severity ordering that makes
-/// this bound useful at all: one permanently wedged descendant (the
-/// unreleased-`WorkGuard` case) would not be caught at its own level, and
-/// instead of "the wedged child is abandoned, its ancestors still write
-/// their terminators" the whole cascade would be abandoned at the root —
-/// on the socket path, with no forced teardown behind it, retaining the
-/// root's isolate, MCP host, registry entry and proxy token for the
-/// daemon's life.
+/// `t + 30s + ε`, so the enclosing timeout always wins and stops waiting
+/// before the nested one can fire. That inverts the severity ordering that
+/// makes this bound useful at all. One permanently wedged descendant (the
+/// unreleased-`WorkGuard` case) would then take the WHOLE cascade with it:
+/// every level above it would be given up on rather than only the wedged
+/// one, so no ancestor would reach step 5 and none of their terminators
+/// would be written. And at the top there is nothing behind that — a
+/// socket-created root has no `HeadlessSession`, so its own isolate, MCP
+/// host, registry entry and proxy token are retained for the daemon's life
+/// with nothing left to reclaim them. Strictly smaller bounds are what make
+/// "the wedged child is abandoned, its ancestors still write their
+/// terminators" the outcome instead.
+///
+/// The descendant's own RESOURCES are no longer what this ordering
+/// protects: `DaemonSubAgentHost::close_children` detaches each retirement
+/// (Phase 8, T19a, issue #91), so a nested bound that fires late still
+/// fires, in a task nothing dropped. What the ordering buys now is the
+/// terminators above it.
 ///
 /// **What 30s actually promises, and what it does not.** It promises that
 /// ONE session's own close (a leaf, or a root with no tracked children)
 /// cannot block its caller longer than this, and that a root's cascade
-/// cannot either. It does **not** promise the whole cascade fits.
+/// cannot either. It does **not** promise the whole cascade fits, and since
+/// Phase 8, T19a (issue #91) it does not bound the cascade's real WORK at
+/// all — only the caller's wait for it. `DaemonSubAgentHost::close_children`
+/// drives each retirement on its own `tokio::spawn`ed task and awaits the
+/// `JoinHandle`, so this bound elapsing releases the caller and leaves the
+/// subtree below unwinding on the runtime rather than abandoning it. See
+/// that method's own "Every retirement is uncancellable by construction"
+/// section for what that buys and what it deliberately gives up.
 ///
-/// *Across a level, it now very nearly does.* `DaemonSubAgentHost::
-/// close_children` retires one pass's children concurrently (Phase 8, T19a,
-/// issue #91), so a level costs its SLOWEST child rather than the sum of
+/// *Across a level, the budget now very nearly does fit.*
+/// `DaemonSubAgentHost::close_children` retires one pass's children
+/// concurrently, so a level costs its SLOWEST child rather than the sum of
 /// its children. The per-child costs are unchanged and still real: each
 /// child's [`HeadlessSession::finish_teardown`] awaits
 /// [`McpHost::shutdown`], which walks that child's own stdio transports
 /// serially at `roundhouse_mcp`'s `GRACEFUL_EXIT_TIMEOUT` (3s) per server,
-/// and a child holding a SIGTERM-ignoring shell costs about 5.5s inside
-/// `roundhouse_sandbox`'s `Child::cancel` (a 5s SIGTERM grace, then up to
-/// 25 × 20ms of `wait_for_empty_group` confirmation) — but eight such
-/// children now cost about one child's worth of time rather than the ~24s
-/// they used to. What [`nested_close_timeout`]'s per-level step buys is
-/// therefore room for EVERY wedged session at a level, not just the first
-/// one reached: each is abandoned at its own level, where its
-/// `close_and_teardown_within` still runs `finish_teardown` and its
-/// ancestors still go on to write their own terminators.
+/// so eight children with one MCP server each used to cost ~24s and now
+/// cost about 3s. A child holding a SIGTERM-ignoring shell is worse still:
+/// about 5.5s in `roundhouse_sandbox`'s `Child::cancel` (a 5s SIGTERM
+/// grace, then up to 25 × 20ms of `wait_for_empty_group` confirmation),
+/// which for eight such children was ~44s and is now about 5.5s. What
+/// [`nested_close_timeout`]'s per-level step buys is therefore room for
+/// EVERY wedged session at a level, not just the first one reached: each is
+/// abandoned at its own level, where its `close_and_teardown_within` still
+/// runs `finish_teardown` and its ancestors still go on to write their own
+/// terminators.
 ///
 /// *Down a chain, it still does not.* Levels are inherently sequential — a
 /// level's own close CONTAINS its children's — so the 5s step has to cover
-/// that level's own `cancel` grace, `wait_idle` and terminator append on
+/// that level's own `wait_idle` (which waits out whatever that level still
+/// has in flight, grace periods included) and its terminator append on
 /// top of everything below it. §7.7's `MAX_DEPTH` × `MAX_FAN_OUT` permits
 /// thousands of descendants, and a cascade over a deep enough tree WILL
-/// still be abandoned at this bound.
+/// still be given up on at this bound.
 ///
-/// *And the top of the cascade still has only one step of slack.* A depth-1
-/// child arms its 25s bound only after the root's own `cancel`, `wait_idle`
-/// and first `children_of` snapshot have run. If those together consume
-/// more than `NESTED_CLOSE_TIMEOUT_STEP` — a root holding its own
-/// SIGTERM-ignoring shell spends about 5.5s in `cancel` alone — every
-/// child's deadline lands past this one, this bound fires first, and the
-/// whole pass is dropped mid-retirement with each child's `SubAgentSessions`
-/// record and `SpawnTree` edge already taken and its reaper already
-/// aborted. That is the one remaining shape in which a cascade strands
-/// descendants with no route left to reclaim them, and concurrency widens
-/// it from one child to a pass — in exchange for removing the far more
-/// reachable case where merely having a SECOND wedged sibling stranded one
-/// every time.
+/// *And any level can be slow before it arms its children's bounds.* A
+/// depth-1 child arms its 25s bound only after the root's own `cancel`,
+/// `wait_idle` and first `children_of` snapshot have run; if those together
+/// consume more than `NESTED_CLOSE_TIMEOUT_STEP`, every child's deadline
+/// lands past this one and this bound fires first. The root is only the
+/// first level with that shape, not the only one — a depth-1 child slow to
+/// reach its OWN `close_children` does the same to its depth-2 children
+/// against the 25s/20s pair. The cheapest way in is ordinary: an
+/// uninterruptible tool call. [`SessionActor::close`]'s `wait_idle` step
+/// (3) has no timeout of its own and returns only once every `WorkGuard`
+/// has dropped, and a shell's whole ~5.5s SIGTERM-to-SIGKILL grace is spent
+/// inside `roundhouse_sandbox`'s `Child::cancel` under `agent_loop`'s own
+/// guard — so it lands in `wait_idle`, not in [`SessionActor::cancel`],
+/// which only stores the reason, flips the state watch and appends one
+/// event. Any session closed while a tool call is still unwinding therefore
+/// spends the slack before its children ever arm a bound.
+///
+/// What that costs is now bounded: the pass is detached rather than
+/// stranded, so every retirement it had already started still runs to
+/// `finish_teardown` and gives back its isolate, MCP host, registry entry
+/// and egress token. What is still lost is the terminator — this session's
+/// own `SessionClosed` (step 5 is never reached) and that of any descendant
+/// abandoned at its own bound. `close_children`'s own doc comment lists the
+/// rest.
 pub(crate) const SESSION_CLOSE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// How much smaller each tracked level's close budget is than the level
@@ -488,10 +517,13 @@ const MIN_NESTED_CLOSE_TIMEOUT: Duration = Duration::from_secs(10);
 /// children.
 ///
 /// What the step still cannot absorb is a level that is slow BEFORE it gets
-/// here — `cancel`'s SIGTERM grace, `wait_idle`, the `children_of` snapshot
-/// — since all of that is spent inside the enclosing budget before this one
-/// is armed at all. [`SESSION_CLOSE_TIMEOUT`]'s own doc comment carries that
-/// accounting.
+/// here — `wait_idle` waiting out a tool call's own SIGTERM grace, then the
+/// `children_of` snapshot — since all of that is spent inside the enclosing
+/// budget before this one is armed at all. What that now costs is only the
+/// terminators, not the resources: `DaemonSubAgentHost::close_children`
+/// detaches each retirement (Phase 8, T19a, issue #91), so an enclosing
+/// bound that fires first releases the waiter without cancelling the work.
+/// [`SESSION_CLOSE_TIMEOUT`]'s own doc comment carries that accounting.
 ///
 /// A tracked child's depth is `parent depth + 1`, so `depth` is never 0
 /// here (`LiveSubAgent::depth`, set by `DaemonSubAgentHost::
@@ -750,10 +782,11 @@ impl HeadlessSession {
     /// (Phase 8, T19a Task 6).
     ///
     /// `budget` MUST be strictly smaller than the bound of every timeout
-    /// this call runs inside, or this one is dead code: `tokio::time::
+    /// waiting on this call, or this one cannot do its job: `tokio::time::
     /// timeout` fixes its deadline when it is created, and a nested timeout
     /// is always created later than the one enclosing it, so an equal bound
-    /// always yields the later deadline and is dropped before it can fire.
+    /// always yields the later deadline and the enclosing one gives up
+    /// first — leaving every level above this one without a terminator.
     /// [`nested_close_timeout`] is what the one production caller —
     /// `SubAgentSessions`' retirement path, driven by
     /// `DaemonSubAgentHost::close_children` — derives that budget from, and
@@ -832,11 +865,14 @@ impl HeadlessSession {
     ///
     /// The flag alone only made teardown exactly-one-CLAIM. Everything after
     /// it used to run inline on the caller's own future, and this method is
-    /// reached from places where that future can be dropped underneath it:
+    /// reached from places where that future can be dropped underneath it.
     /// [`Self::close_and_teardown`]'s own call to this runs after its inner
-    /// timeout, but a session being retired inside an ancestor's cascade is
-    /// still inside THAT ancestor's `tokio::time::timeout`, whose elapse
-    /// drops the whole nested future — awaits included. A drop landing
+    /// timeout, so that one cannot cut it short — but its CALLER's future
+    /// can be dropped at any point (`scheduler_driver`'s `close_and_retire`
+    /// runs inside a delivery task the daemon can drop at shutdown), and
+    /// `spawn_session_reaper`'s own arm is dropped outright by the
+    /// `reaper.abort()` that [`Self::teardown`] and
+    /// [`Self::close_and_teardown`] both run. A drop landing
     /// between the claim and the end of the body left `torn_down` reading
     /// "done" over a half-unwound isolate, MCP children never shut down and
     /// a still-valid session bearer token registered with
@@ -881,10 +917,11 @@ impl HeadlessSession {
 ///
 /// Both of this session's claiming routes — [`HeadlessSession::
 /// finish_teardown`] and `spawn_session_reaper`'s [`ReapAction::Teardown`]
-/// arm — can have their future dropped mid-body: the first by an ancestor's
-/// close timeout elapsing around a cascade this session is inside of, the
-/// second by the `reaper.abort()` [`HeadlessSession::close_and_teardown`]
-/// and [`HeadlessSession::teardown`] both run. A drop landing between the
+/// arm — can have their future dropped mid-body: the first by whatever the
+/// caller that reached it is running inside of going away (a delivery task
+/// the daemon drops at shutdown, for one), the second by the
+/// `reaper.abort()` [`HeadlessSession::close_and_teardown`] and
+/// [`HeadlessSession::teardown`] both run. A drop landing between the
 /// claim and the last line would leave the flag claiming a teardown that
 /// never happened, and since every other route short-circuits on that flag,
 /// nothing would retry it.
@@ -1868,9 +1905,10 @@ mod tests {
     /// [`claim_teardown`] only ever made teardown exactly-one-CLAIM. The
     /// body behind it awaits real isolation and MCP work, and
     /// [`HeadlessSession::finish_teardown`] is reached from places whose
-    /// future can be dropped underneath it — a descendant being retired
-    /// inside an ancestor's cascade sits inside that ancestor's own close
-    /// timeout, and `tokio::time::timeout` drops what it bounds. A drop
+    /// future can be dropped underneath it — `scheduler_driver`'s
+    /// `close_and_retire` runs inside a delivery task the daemon can drop at
+    /// shutdown, and the reaper's own arm is aborted outright by
+    /// [`HeadlessSession::close_and_teardown`]. A drop
     /// between the claim and the end of the body used to leave `torn_down`
     /// reading "done" over a half-unwound isolate and a still-registered
     /// egress token, with every other route short-circuiting on the flag, so
