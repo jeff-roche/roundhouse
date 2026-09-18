@@ -2541,6 +2541,22 @@ impl DeliveryExecutor {
             }
         };
 
+        // Issue #93: held for this call's own body only — from here, once the run
+        // definition has actually resolved, until this function returns by any path
+        // below (the loop's two `return`s, or an early `?` from a segment's own
+        // `with_connection` call). `session.actor()` is the same `SessionActor` this
+        // run's session ID names, so `SessionActor::wait_idle` (and so a later
+        // `SessionActor::close`) cannot durably close this session while this run is
+        // still actively driving it — exactly the gap #93 reported: before this guard,
+        // the only production caller of `begin_work` was `run_agent_loop`, so a
+        // workflow-driven session held none at all, and `wait_idle` returned
+        // immediately for it. Never carried past this function's own return: the
+        // caller's `handle_run_outcome` calls `close_and_retire`, which calls this same
+        // `close`, so holding the guard across that call — or across a park, which
+        // leaves the run suspended indefinitely rather than driving to completion —
+        // would deadlock it against itself.
+        let _work = session.actor().begin_work();
+
         let runner = self.resources.runner;
         // Cloned once per segment below, not once here: `with_connection`'s closure is
         // `FnOnce`, so each loop iteration needs its own owned handle. Cloning a

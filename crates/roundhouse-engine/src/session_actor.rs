@@ -337,13 +337,16 @@ pub struct SessionActor {
     /// == Closed` check short-circuits it to `CloseReceipt::AlreadyClosed`
     /// without repeating any of the rest.
     close_lock: tokio::sync::Mutex<()>,
-    /// Phase 8, T19a Task 3: the number of [`WorkGuard`]s currently held for
-    /// this session — one per `run_agent_loop` call presently in flight
-    /// against it. [`Self::wait_idle`] resolves once this reaches zero,
-    /// which is what the later `SessionActor::close` waits on after
-    /// `cancel()` before durably closing the session, so an abandoned loop's
-    /// `_work_guard` has genuinely dropped (and with it, any further event
-    /// this loop could still have appended) before close proceeds.
+    /// Phase 8, T19a Task 3 (Issue #93 widened its holders): the number of
+    /// [`WorkGuard`]s currently held for this session — one per `run_agent_loop`
+    /// call presently in flight against it, plus (since #93) one per
+    /// `roundhouse_daemon::scheduler_driver::DeliveryExecutor::
+    /// drive_run_to_completion` call presently driving one of this session's
+    /// workflow runs. [`Self::wait_idle`] resolves once this reaches zero, which is
+    /// what the later `SessionActor::close` waits on after `cancel()` before
+    /// durably closing the session, so an abandoned loop or an in-flight workflow
+    /// drive has genuinely dropped its guard (and with it, any further event
+    /// either could still have appended) before close proceeds.
     work_tx: tokio::sync::watch::Sender<usize>,
 }
 
@@ -801,10 +804,16 @@ impl SessionActor {
         self.state_tx.subscribe()
     }
 
-    /// Marks one unit of live work (a `run_agent_loop` call) as started
-    /// against this session, for as long as the returned [`WorkGuard`] is
-    /// held. `run_agent_loop` acquires one at entry, before the first task
-    /// it creates, and holds it until it returns by any path.
+    /// Marks one unit of live work — a `run_agent_loop` call, or (since Issue
+    /// #93) a `DeliveryExecutor::drive_run_to_completion` call driving one of
+    /// this session's workflow runs — as started against this session, for
+    /// as long as the returned [`WorkGuard`] is held. `run_agent_loop`
+    /// acquires one at entry, before the first task it creates, and holds it
+    /// until it returns by any path; `drive_run_to_completion` acquires one
+    /// once its run definition has resolved and holds it for the rest of its
+    /// own call, dropping it before returning by any path (never across the
+    /// `close_and_retire` its own caller runs afterward, and never across a
+    /// park).
     pub fn begin_work(&self) -> WorkGuard {
         self.work_tx.send_modify(|n| *n += 1);
         WorkGuard {
@@ -827,7 +836,9 @@ impl SessionActor {
     /// a future transition. This is what `SessionActor::close` awaits after
     /// `cancel()`, so it never durably closes a session while a
     /// `run_agent_loop` call (possibly one already abandoning its own
-    /// in-flight work in response to that same `cancel()`) is still
+    /// in-flight work in response to that same `cancel()`) or a
+    /// `DeliveryExecutor::drive_run_to_completion` call still actively
+    /// driving one of this session's workflow runs (Issue #93) is still
     /// unwinding.
     pub async fn wait_idle(&self) {
         let mut rx = self.work_tx.subscribe();
