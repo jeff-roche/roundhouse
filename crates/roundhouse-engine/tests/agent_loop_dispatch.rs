@@ -407,9 +407,9 @@ impl Provider for HangingStreamProvider {
     ) -> BoxFut<'a, Result<ChatStream, ProviderError>> {
         self.polled.notify_one();
         Box::pin(async {
-            Ok(ChatStream(Box::pin(
-                futures::stream::pending::<StreamEvent>(),
-            )))
+            Ok(ChatStream(Box::pin(futures::stream::pending::<
+                Result<StreamEvent, ProviderError>,
+            >())))
         })
     }
     fn count_tokens<'a>(
@@ -3337,7 +3337,7 @@ impl Provider for TwoToolUseProvider {
                 StreamEvent::BlockStop { index: 1 },
                 StreamEvent::MessageStop,
             ];
-            Ok(ChatStream(Box::pin(stream::iter(events))))
+            Ok(ChatStream::from_events(events))
         })
     }
     fn count_tokens<'a>(

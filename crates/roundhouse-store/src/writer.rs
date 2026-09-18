@@ -4,8 +4,8 @@ use std::sync::Arc;
 
 use arc_swap::ArcSwap;
 use roundhouse_core::{
-    CancelReason, Delta, Event, EventPayload, Origin, SessionId, SessionOutcome, TaskId,
-    TaskInput, TaskOutput, TaskRunner, Timestamp,
+    CancelReason, Delta, Event, EventPayload, Origin, SessionId, SessionOutcome, TaskId, TaskInput,
+    TaskOutput, TaskRunner, Timestamp,
 };
 use rusqlite::OptionalExtension;
 use tokio::sync::{mpsc, oneshot};

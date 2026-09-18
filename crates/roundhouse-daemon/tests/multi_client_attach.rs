@@ -305,7 +305,7 @@ impl Provider for ScriptedTextOnlyProvider {
                 StreamEvent::BlockStop { index: 0 },
                 StreamEvent::MessageStop,
             ];
-            Ok(ChatStream(Box::pin(stream::iter(events))))
+            Ok(ChatStream::from_events(events))
         })
     }
     fn count_tokens<'a>(

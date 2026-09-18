@@ -23,7 +23,9 @@ use crate::pool::StorePool;
 use crate::redact::Redactor;
 use crate::StoreError;
 
-use super::{append_batch, append_one, close_session, EventWriter, WriteCmd};
+use super::{
+    append_batch, append_batch_with_blobs, append_one, close_session, EventWriter, WriteCmd,
+};
 
 /// Controls how a [`spawn_gated_writer`]'d [`EventWriter`]'s `close_session` calls behave.
 ///
@@ -156,7 +158,9 @@ impl CloseGate {
 
 /// Spawns an [`EventWriter`] that behaves exactly like [`super::spawn_writer`]'s: one
 /// dedicated task processes every command from its channel strictly in arrival order,
-/// `append`/`append_batch` forwarded unmodified, and now `close_session` is no exception —
+/// `append`/`append_batch`/`append_batch_with_blobs` forwarded unmodified (the last of
+/// those is the streaming-delta flush path, so a gated writer streams exactly as an
+/// ungated one does), and now `close_session` is no exception —
 /// but `close_session` also routes through `gate` first — see [`CloseGate`]'s own doc
 /// comment for what a caller can make it do. Whatever `gate` lets through runs the real
 /// [`close_session`], against the real `store`, with the real redaction and tail-guard
@@ -194,6 +198,15 @@ pub async fn spawn_gated_writer(store: StorePool, gate: Arc<CloseGate>) -> Event
                 WriteCmd::AppendBatch { events, reply } => {
                     let redactor = redactor_for_task.load_full();
                     let result = append_batch(&store, events, &redactor).await;
+                    let _ = reply.send(result);
+                }
+                WriteCmd::AppendBatchWithBlobs {
+                    events,
+                    state_dir,
+                    reply,
+                } => {
+                    let redactor = redactor_for_task.load_full();
+                    let result = append_batch_with_blobs(&store, events, state_dir, redactor).await;
                     let _ = reply.send(result);
                 }
                 WriteCmd::CloseSession {
