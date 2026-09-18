@@ -5,7 +5,6 @@
 
 use crate::working_context::WorkingContext;
 use futures::future::BoxFuture;
-use futures::stream;
 use roundhouse_provider::{
     BlockDelta, BlockKind, Capabilities, ChatRequest, ChatStream, ContentBlock, HttpRequest,
     HttpResponseStream, HttpTransport, Message, MessageRole, ModelId, ModelInfo, Plan, Provider,
@@ -132,7 +131,7 @@ impl Provider for FakeProvider {
                     StreamEvent::MessageStop,
                 ]
             });
-            Ok(ChatStream(Box::pin(stream::iter(events))))
+            Ok(ChatStream::from_events(events))
         })
     }
 

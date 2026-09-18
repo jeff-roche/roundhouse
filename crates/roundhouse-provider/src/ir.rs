@@ -379,12 +379,47 @@ pub struct ModelInfo {
 /// that placeholder's own hand-off comment. A newtype (not a bare type
 /// alias) so `ChatStream` has exactly one name and one definition site
 /// across every codec's `stream_chat` impl.
+///
+/// Items are `Result<StreamEvent, ProviderError>` (Phase 8 T19b Task 1), not
+/// a bare `StreamEvent`: `Provider::stream_chat`'s own `Result` only ever
+/// reports a failure that happens *before* the first item is produced (the
+/// request was rejected, the connection never opened). A transport that
+/// drops mid-stream, or a decoder that hits malformed wire data after
+/// already yielding events, has no way to report that under the old bare
+/// item type except by silently truncating the stream — indistinguishable
+/// from a clean completion. A fallible item lets every consumer (the
+/// fallback chain's replay buffer, the block folder, the conformance
+/// harness) observe exactly where a stream really ended and why.
 pub struct ChatStream(
-    pub std::pin::Pin<Box<dyn futures::Stream<Item = crate::stream_event::StreamEvent> + Send>>,
+    pub  std::pin::Pin<
+        Box<
+            dyn futures::Stream<Item = Result<crate::stream_event::StreamEvent, ProviderError>>
+                + Send,
+        >,
+    >,
 );
 
+impl ChatStream {
+    /// Wraps a `Vec<StreamEvent>` of already-successful items as a
+    /// `ChatStream` — the common case for a codec that buffers a whole
+    /// decode before handing events to its caller, and for tests that don't
+    /// need to inject a mid-stream error. Mirrors [`Self::from_results`].
+    pub fn from_events(events: Vec<crate::stream_event::StreamEvent>) -> Self {
+        ChatStream(Box::pin(futures::stream::iter(events.into_iter().map(Ok))))
+    }
+
+    /// Wraps a `Vec<Result<StreamEvent, ProviderError>>` directly, so a test
+    /// or a replay path can construct a stream that ends in a mid-stream
+    /// error rather than a clean completion.
+    pub fn from_results(
+        results: Vec<Result<crate::stream_event::StreamEvent, ProviderError>>,
+    ) -> Self {
+        ChatStream(Box::pin(futures::stream::iter(results)))
+    }
+}
+
 impl futures::Stream for ChatStream {
-    type Item = crate::stream_event::StreamEvent;
+    type Item = Result<crate::stream_event::StreamEvent, ProviderError>;
     fn poll_next(
         mut self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,

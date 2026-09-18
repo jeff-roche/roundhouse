@@ -15,18 +15,18 @@ use crate::ConformanceCase;
 /// A `ChatStream` emitting one well-formed text block and usage figures
 /// that satisfy `input_tokens >= cache_read_tokens` (§9.3's invariant).
 pub fn good_stream() -> ChatStream {
-    ChatStream(Box::pin(futures::stream::iter(text_block_events(
+    ChatStream::from_events(text_block_events(
         /* input_tokens */ 10, /* cache_read_tokens */ 2,
-    ))))
+    ))
 }
 
 /// The same content-block shape as [`good_stream`], but with
 /// `input_tokens < cache_read_tokens` — a deliberate usage-invariant
 /// violation for `tests/self_test.rs`'s `BrokenSubject` to be caught by.
 pub fn broken_usage_stream() -> ChatStream {
-    ChatStream(Box::pin(futures::stream::iter(text_block_events(
+    ChatStream::from_events(text_block_events(
         /* input_tokens */ 1, /* cache_read_tokens */ 2,
-    ))))
+    ))
 }
 
 fn text_block_events(input_tokens: u64, cache_read_tokens: u64) -> Vec<StreamEvent> {

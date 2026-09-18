@@ -222,6 +222,242 @@ async fn redaction_count_accumulates_on_the_tasks_row_for_task_delta_and_note_ev
     );
 }
 
+// ---------------------------------------------------------------------------------------
+// Phase 8 Task 19 lane B, Task 5: EventWriter byte-redaction and split-safety pass-throughs
+// ---------------------------------------------------------------------------------------
+
+/// `EventWriter::redact_outbound_bytes` must mirror `redact_outbound`, but over raw bytes
+/// (including non-UTF-8 input) — the same live, hot-swappable redactor, just a byte-typed
+/// entry point for callers scanning something that isn't guaranteed-valid text (e.g. a
+/// streamed shell chunk before it's wrapped in a `Delta`).
+#[tokio::test]
+async fn redact_outbound_bytes_mirrors_redact_outbound_over_raw_non_utf8_bytes() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = open(&dir.path().join("events.db")).await.unwrap();
+    let writer = spawn_writer(store).await;
+    writer.set_redactor(Redactor::build(&["sk-live-abc123".to_string()]));
+
+    let mut bytes = vec![0x80, 0xFF];
+    bytes.extend_from_slice(b"sk-live-abc123");
+
+    let (redacted, count) = writer.redact_outbound_bytes(&bytes);
+    assert_eq!(count, 1);
+    assert!(!redacted.windows(14).any(|w| w == b"sk-live-abc123"));
+}
+
+/// `EventWriter::redaction_holdback` reads the LIVE redactor, not one snapshotted at
+/// construction time — `set_redactor` must change the reported holdback for future calls.
+#[tokio::test]
+async fn redaction_holdback_tracks_the_live_redactors_longest_pattern() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = open(&dir.path().join("events.db")).await.unwrap();
+    let writer = spawn_writer(store).await;
+
+    assert_eq!(
+        writer.redaction_holdback(),
+        0,
+        "the default empty redactor has no patterns, so holdback must be 0"
+    );
+
+    writer.set_redactor(Redactor::build(&[
+        "short".to_string(),
+        "a-much-longer-secret-value".to_string(),
+    ]));
+    assert_eq!(
+        writer.redaction_holdback(),
+        "a-much-longer-secret-value".len() - 1,
+        "holdback must be the longest live pattern's byte length minus one"
+    );
+}
+
+/// `EventWriter::redaction_safe_split_len` is a pass-through to the live redactor's
+/// `Redactor::safe_split_len` — proven here by observing it move a split point off a
+/// secret it's told about via `set_redactor`, then react to `set_redactor` changing which
+/// value counts as a secret.
+#[tokio::test]
+async fn redaction_safe_split_len_pass_through_uses_the_live_redactor() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = open(&dir.path().join("events.db")).await.unwrap();
+    let writer = spawn_writer(store).await;
+
+    let bytes = b"prefix sk-live-abc123 suffix";
+    // Before any secret is registered, nothing straddles — the naive split stands.
+    assert_eq!(writer.redaction_safe_split_len(bytes, 10), 10);
+
+    writer.set_redactor(Redactor::build(&["sk-live-abc123".to_string()]));
+    let secret_start = bytes
+        .windows(14)
+        .position(|w| w == b"sk-live-abc123")
+        .unwrap();
+    let naive_split = secret_start + 5;
+    assert_eq!(
+        writer.redaction_safe_split_len(bytes, naive_split),
+        secret_start,
+        "once the live redactor knows the secret, the split must move to its start"
+    );
+}
+
+/// Fix round 1, security finding S3 / Controller Ruling R9: `redaction_holdback` and
+/// `redaction_safe_split_len` each do their own independent `ArcSwap::load`, so calling
+/// them separately races against a concurrent `set_redactor`. `redaction_split_for_flush`
+/// must compute both numbers from a SINGLE live snapshot instead. This test can't directly
+/// observe "one load instead of two" (that's an implementation detail), but it does prove
+/// the combined method produces the same answer the two-call sequence produces when
+/// nothing races — the property both callers and this test can actually check.
+#[tokio::test]
+async fn redaction_split_for_flush_combines_holdback_and_split_from_one_snapshot() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = open(&dir.path().join("events.db")).await.unwrap();
+    let writer = spawn_writer(store).await;
+
+    // Default empty redactor: holdback is 0, so max == bytes.len() and nothing straddles.
+    let bytes = b"prefix sk-live-abc123 suffix";
+    assert_eq!(writer.redaction_split_for_flush(bytes), bytes.len());
+
+    writer.set_redactor(Redactor::build(&["sk-live-abc123".to_string()]));
+    let secret_start = bytes
+        .windows(14)
+        .position(|w| w == b"sk-live-abc123")
+        .unwrap();
+    let secret_end = secret_start + 14;
+
+    // holdback = 14 - 1 = 13, so max = bytes.len() - 13; the secret sits well inside that
+    // window, so the combined split must move back to the secret's start, matching what
+    // `redaction_holdback` + `redaction_safe_split_len` would produce called separately
+    // (with no race, since nothing calls `set_redactor` between them here).
+    let k = writer.redaction_split_for_flush(bytes);
+    assert!(
+        k <= secret_start,
+        "the split must not land inside or after the secret's start: k={k}, \
+         secret_start={secret_start}"
+    );
+    assert_eq!(
+        k, secret_start,
+        "with this haystack, the safe split point is exactly the secret's own start"
+    );
+    assert!(k < secret_end);
+}
+
+/// `redaction_split_for_flush` must return 0 — not panic, not an error — when the whole
+/// buffer is smaller than the live redactor's holdback requirement (nothing is safely
+/// flushable yet).
+#[tokio::test]
+async fn redaction_split_for_flush_returns_zero_when_nothing_is_safely_flushable() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = open(&dir.path().join("events.db")).await.unwrap();
+    let writer = spawn_writer(store).await;
+    writer.set_redactor(Redactor::build(&["a-fairly-long-secret-value".to_string()]));
+
+    let short_buffer = b"short";
+    assert_eq!(writer.redaction_split_for_flush(short_buffer), 0);
+}
+
+/// Phase 8 Task 19 lane B, Task 7: `EventWriter::redaction_split_for_coalescer` is the
+/// production `roundhouse_engine::delta_sink::SplitFn` primitive — it must compute BOTH
+/// modes from one live-redactor snapshot, honor an EXTERNAL `max` the caller supplies (not
+/// just the redactor's own holdback-derived one), and switch behavior on `final_flush`
+/// exactly as documented: holdback-then-cap for a non-final flush, no holdback at all for a
+/// final one. This test isolates the holdback difference with NO secret anywhere near the
+/// requested split point, so any observed difference between the two modes is attributable
+/// only to the holdback subtraction, not to a match being straddled.
+#[tokio::test]
+async fn redaction_split_for_coalescer_non_final_applies_holdback_final_does_not() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = open(&dir.path().join("events.db")).await.unwrap();
+    let writer = spawn_writer(store).await;
+    // A 20-byte pattern that never occurs in `bytes` below — this only exists to give the
+    // live redactor a nonzero `max_pattern_len` (holdback = 20 - 1 = 19), so any gap between
+    // the two modes' answers is provably the holdback subtraction alone.
+    writer.set_redactor(Redactor::build(&["z".repeat(20)]));
+    assert_eq!(writer.redaction_holdback(), 19);
+
+    let bytes = vec![b'a'; 100];
+    let max = 95;
+
+    let non_final = writer.redaction_split_for_coalescer(&bytes, max, false);
+    assert_eq!(
+        non_final, 81,
+        "non-final must apply the holdback (subtracted from the buffer length) THEN cap at \
+         the caller's own max: min(95, 100 - 19) = 81"
+    );
+
+    let final_flush = writer.redaction_split_for_coalescer(&bytes, max, true);
+    assert_eq!(
+        final_flush, max,
+        "a final flush applies no holdback at all — with nothing to match, it must return \
+         exactly the caller's own max"
+    );
+}
+
+/// The external `max` is a hard cap in EITHER mode, never a hint an implementation may
+/// ignore — `DeltaCoalescer` clamps to `max` and trusts the splitter's answer was already
+/// verified against it (see `SplitFn`'s own doc comment). Also proves `redaction_split_for_
+/// coalescer` still finds and stops before a real match, in both modes.
+#[tokio::test]
+async fn redaction_split_for_coalescer_never_lands_inside_a_secret_in_either_mode() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = open(&dir.path().join("events.db")).await.unwrap();
+    let writer = spawn_writer(store).await;
+    writer.set_redactor(Redactor::build(&["sk-live-abc123".to_string()]));
+
+    let bytes = b"prefix sk-live-abc123 suffix";
+    let secret_start = bytes
+        .windows(14)
+        .position(|w| w == b"sk-live-abc123")
+        .unwrap();
+    let naive_max = secret_start + 5; // lands inside the secret
+
+    let non_final = writer.redaction_split_for_coalescer(bytes, naive_max, false);
+    assert!(non_final <= secret_start, "non-final: k={non_final}");
+
+    let final_flush = writer.redaction_split_for_coalescer(bytes, naive_max, true);
+    assert_eq!(
+        final_flush, secret_start,
+        "final: no holdback narrows the cap further here (naive_max is already inside the \
+         secret), so the answer must be exactly the secret's own start"
+    );
+}
+
+/// Controller ruling (Task 7 brief): the production splitter's refusals must be monotone in
+/// `max` for `final_flush = true` — `DeltaCoalescer::carve_final_chunk`'s R13 narrowest-cut
+/// search (geometric growth, then bisection) depends on this. Pins the exact characterization
+/// `Redactor::safe_split_len` documents: a `final_flush = true` call returns `0` exactly when
+/// a match starting at offset `0` extends past `min(max, bytes.len())`, and is non-decreasing
+/// once `max` clears that match's end.
+#[tokio::test]
+async fn redaction_split_for_coalescer_final_flush_refusals_are_monotone_in_max() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = open(&dir.path().join("events.db")).await.unwrap();
+    let writer = spawn_writer(store).await;
+    writer.set_redactor(Redactor::build(&["SECRETSECRETSECRETSECRET".to_string()])); // 24 bytes, offset 0
+    let secret_len = "SECRETSECRETSECRETSECRET".len();
+
+    let mut bytes = b"SECRETSECRETSECRETSECRET".to_vec();
+    bytes.extend_from_slice(b"-trailing-tail-bytes-here");
+
+    // Every max strictly below the match's own end must refuse (0) — the match starts at
+    // offset 0 and extends past any such max.
+    for max in [0usize, 1, secret_len / 2, secret_len - 1] {
+        assert_eq!(
+            writer.redaction_split_for_coalescer(&bytes, max, true),
+            0,
+            "max={max} is still inside the offset-0 match, must refuse"
+        );
+    }
+
+    // At and beyond the match's own end, it must accept, and non-decreasingly so.
+    let mut previous = 0;
+    for max in [secret_len, secret_len + 1, secret_len + 10, bytes.len()] {
+        let k = writer.redaction_split_for_coalescer(&bytes, max, true);
+        assert!(k > 0, "max={max} clears the match, must accept (k={k})");
+        assert!(
+            k >= previous,
+            "refusals/answers must be non-decreasing in max: max={max} gave k={k}, previous={previous}"
+        );
+        previous = k;
+    }
+}
+
 #[tokio::test]
 async fn outbound_payload_containing_a_live_secret_is_ask_by_default_and_deny_hardened() {
     let dir = tempfile::tempdir().unwrap();

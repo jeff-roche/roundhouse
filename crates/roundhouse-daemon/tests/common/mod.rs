@@ -181,16 +181,21 @@ pub async fn resources_with_isolate(dir: &Path, isolate: Arc<dyn Isolate>) -> Ar
     resources_with(dir, isolate, Arc::new(NoopProvider), no_policy_rules()).await
 }
 
-/// The shared body of [`real_resources`]/[`resources_with_isolate`]/
-/// [`resources_with_provider`] — the two axes a test may need to vary
-/// (which `Isolate`, which `Provider`) in one place, so the other
-/// `DaemonResources::new` arguments are constructed identically for all of
-/// them.
-pub async fn resources_with(
+/// [`resources_with`], but over an explicit caller-supplied [`RequestCtx`]
+/// instead of the one [`resources_with`] hard-codes (`NoopTransport`,
+/// `api_key: "test-api-key-not-a-secret"`, no credentials) — for Phase 8
+/// Task 19 lane B's Task 10 end-to-end tests, which need a real
+/// `AnthropicMessagesProvider` talking to a real `CassetteTransport` over
+/// `ctx.transport` (`AnthropicMessagesProvider::stream_chat` reads its
+/// transport off `RequestCtx`, never constructs one itself — see that
+/// method's own doc comment) rather than `NoopTransport`'s always-`Err`
+/// stub.
+pub async fn resources_with_ctx(
     dir: &Path,
     isolate: Arc<dyn Isolate>,
     provider: Arc<dyn Provider>,
     policy_rules: PolicyRuleSource,
+    ctx: RequestCtx,
 ) -> Arc<DaemonResources> {
     let store = roundhouse_store::open(&dir.join("events.db"))
         .await
@@ -237,14 +242,36 @@ pub async fn resources_with(
         BackgroundServices::default(),
         runner(),
         provider,
+        ctx,
+        proxy_writer,
+        Some(workspace_registry),
+        false,
+    ))
+}
+
+/// The shared body of [`real_resources`]/[`resources_with_isolate`]/
+/// [`resources_with_provider`] — the two axes those callers vary (which
+/// `Isolate`, which `Provider`) in one place, calling [`resources_with_ctx`]
+/// with this function's own hard-coded default [`RequestCtx`]
+/// (`NoopTransport`), so the other `DaemonResources::new` arguments are
+/// constructed identically for all of them.
+pub async fn resources_with(
+    dir: &Path,
+    isolate: Arc<dyn Isolate>,
+    provider: Arc<dyn Provider>,
+    policy_rules: PolicyRuleSource,
+) -> Arc<DaemonResources> {
+    resources_with_ctx(
+        dir,
+        isolate,
+        provider,
+        policy_rules,
         RequestCtx {
             trace_id: None,
             transport: Arc::new(NoopTransport),
             api_key: "test-api-key-not-a-secret".into(),
             credentials: None,
         },
-        proxy_writer,
-        Some(workspace_registry),
-        false,
-    ))
+    )
+    .await
 }

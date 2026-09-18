@@ -4,7 +4,6 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use futures::stream;
 use roundhouse_core::{Delta, EventPayload, SessionId, SessionState, TaskRunner};
 use roundhouse_engine::{
     assemble_context, live_secret_values, run_chat_turn, wire_redaction_for_session, AgentError,
@@ -67,7 +66,7 @@ impl Provider for FakeEditProvider {
                 StreamEvent::BlockStop { index: 0 },
                 StreamEvent::MessageStop,
             ];
-            Ok(ChatStream(Box::pin(stream::iter(events))))
+            Ok(ChatStream::from_events(events))
         })
     }
 

@@ -81,6 +81,15 @@ struct OpenBlock {
 /// `BlockDelta` appends to it, `BlockStop` seals it into `blocks` (§12a of
 /// REALITY-CORRECTIONS — the brief's version left this as a bare comment,
 /// which made every round-trip-fidelity check vacuous).
+///
+/// A mid-stream `Err` item (T19b Task 1: `ChatStream` items are now
+/// `Result<StreamEvent, ProviderError>`) is recorded as a loss event and
+/// stops the fold — any blocks still open at that point are also reported as
+/// loss events below, same as an ordinary stream that ends without a
+/// `BlockStop`. In particular, an error that arrives before `MessageStop`
+/// leaves `saw_message_stop` `false`: `decode_prefix_saw_message_stop` in
+/// this module relies on exactly that to treat a mid-stream error the same
+/// as "no MessageStop".
 pub async fn fold_stream(mut stream: ChatStream) -> FoldedResult {
     let mut open: BTreeMap<u32, OpenBlock> = BTreeMap::new();
     let mut blocks = Vec::new();
@@ -88,7 +97,14 @@ pub async fn fold_stream(mut stream: ChatStream) -> FoldedResult {
     let mut loss_events = Vec::new();
     let mut saw_message_stop = false;
 
-    while let Some(event) = stream.next().await {
+    while let Some(item) = stream.next().await {
+        let event = match item {
+            Ok(event) => event,
+            Err(err) => {
+                loss_events.push(format!("stream item error: {err}"));
+                break;
+            }
+        };
         match event {
             StreamEvent::BlockStart { index, kind } => {
                 open.insert(
@@ -657,7 +673,7 @@ mod tests {
             },
             StreamEvent::MessageStop,
         ];
-        let stream = ChatStream(Box::pin(futures::stream::iter(events)));
+        let stream = ChatStream::from_events(events);
         let result = fold_stream(stream).await;
 
         assert_eq!(result.blocks.len(), 1);
@@ -677,12 +693,49 @@ mod tests {
             index: 0,
             delta: BlockDelta::Text("orphaned".into()),
         }];
-        let stream = ChatStream(Box::pin(futures::stream::iter(events)));
+        let stream = ChatStream::from_events(events);
         let result = fold_stream(stream).await;
 
         assert!(result.blocks.is_empty());
         assert_eq!(result.loss_events.len(), 1);
         assert!(result.loss_events[0].contains("BlockDelta"));
+    }
+
+    /// T19b Task 1: `ChatStream` items are `Result<StreamEvent,
+    /// ProviderError>`. A mid-stream `Err` item must be recorded as a loss
+    /// event (not silently dropped) and must stop the fold — a
+    /// `BlockStart` that arrived before the error is left open, so it is
+    /// also reported as its own loss event, same as any other stream that
+    /// ends without a matching `BlockStop`. Also pins the property
+    /// `decode_prefix_saw_message_stop` relies on: an error before
+    /// `MessageStop` leaves `saw_message_stop` `false`.
+    #[tokio::test]
+    async fn fold_stream_records_a_mid_stream_error_item_as_a_loss_event() {
+        let results = vec![
+            Ok(StreamEvent::BlockStart {
+                index: 0,
+                kind: BlockKind::Text,
+            }),
+            Err(roundhouse_provider::ProviderError::StreamInterrupted {
+                partial: "partial".into(),
+            }),
+        ];
+        let stream = ChatStream::from_results(results);
+        let result = fold_stream(stream).await;
+
+        assert!(result.blocks.is_empty());
+        assert!(
+            !result.saw_message_stop,
+            "an error before MessageStop must not be mistaken for a clean completion"
+        );
+        assert!(
+            result
+                .loss_events
+                .iter()
+                .any(|e| e.contains("stream item error") && e.contains("stream interrupted")),
+            "expected a loss event naming the stream item error, got: {:#?}",
+            result.loss_events
+        );
     }
 
     /// A fake decoder with a real chunk-alignment bug: it reports how many
@@ -740,7 +793,7 @@ mod tests {
                     },
                     StreamEvent::BlockStop { index: 0 },
                 ];
-                Ok(ChatStream(Box::pin(futures::stream::iter(events))))
+                Ok(ChatStream::from_events(events))
             })
         }
 
@@ -839,16 +892,14 @@ mod tests {
                 }
                 match received_len {
                     len if len == NON_MONOTONIC_TERMINAL_END || len == NON_MONOTONIC_BODY_LEN => {
-                        Ok(ChatStream(Box::pin(futures::stream::iter(vec![
-                            StreamEvent::MessageStop,
-                        ]))))
+                        Ok(ChatStream::from_events(vec![StreamEvent::MessageStop]))
                     }
                     len if len > NON_MONOTONIC_TERMINAL_END && len < NON_MONOTONIC_BODY_LEN => {
                         Err(roundhouse_provider::ProviderError::StreamInterrupted {
                             partial: String::new(),
                         })
                     }
-                    _ => Ok(ChatStream(Box::pin(futures::stream::iter(Vec::new())))),
+                    _ => Ok(ChatStream::from_events(Vec::new())),
                 }
             })
         }

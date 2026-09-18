@@ -3,10 +3,11 @@
 //! `CassetteTransport` per §9.10's testing philosophy, never a live call. No
 //! `ANTHROPIC_API_KEY`, no outbound connection.
 
+use futures::channel::mpsc;
 use futures::future::BoxFuture;
-use futures::StreamExt;
+use futures::{FutureExt, StreamExt};
 use roundhouse_provider::{
-    AnthropicMessagesProvider, BlockDelta, CassetteTransport, ChatRequest, HttpRequest,
+    AnthropicMessagesProvider, BlockDelta, BlockKind, CassetteTransport, ChatRequest, HttpRequest,
     HttpResponseStream, HttpTransport, ModelId, Params, Provider, ProviderError, ProviderExt,
     ReasoningRequest, RequestCtx, RequestPolicy, ResponseFormat, StreamEvent, ToolChoice,
     TransportError,
@@ -109,7 +110,8 @@ async fn stream_chat_encodes_the_request_and_decodes_a_real_shaped_sse_response(
     let mut stream = provider.stream_chat(&sample_request(), &ctx).await.unwrap();
 
     let mut text = String::new();
-    while let Some(event) = stream.next().await {
+    while let Some(item) = stream.next().await {
+        let event = item.expect("this cassette decodes without a mid-stream error");
         if let StreamEvent::BlockDelta {
             delta: BlockDelta::Text(t),
             ..
@@ -433,4 +435,206 @@ async fn count_tokens_is_unsupported_rather_than_silently_wrong() {
         .count_tokens(&sample_request(), &ctx)
         .await;
     assert!(matches!(result, Err(ProviderError::Unsupported(_))));
+}
+
+/// Phase 8 T19b Task 3: `stream_chat`'s response body driven directly by a
+/// `futures::channel::mpsc` sender the test holds onto, so a claim like
+/// "resolves while the body is still open" is shown by controlling exactly
+/// which bytes exist and whether the channel has been closed -- never by
+/// sleeping and hoping. `anthropic_messages_decode.rs` proves the same
+/// property one level down in
+/// `block_start_arrives_while_the_body_is_still_open`, where the decoder is
+/// driven off a raw `futures::channel::mpsc` receiver directly -- no
+/// transport involved, so there is no helper there to share with this one.
+struct ChannelTransport {
+    status: u16,
+    rx: Mutex<Option<mpsc::UnboundedReceiver<Result<bytes::Bytes, TransportError>>>>,
+}
+
+impl ChannelTransport {
+    fn new(status: u16, rx: mpsc::UnboundedReceiver<Result<bytes::Bytes, TransportError>>) -> Self {
+        Self {
+            status,
+            rx: Mutex::new(Some(rx)),
+        }
+    }
+}
+
+impl HttpTransport for ChannelTransport {
+    fn send<'a>(
+        &'a self,
+        _req: HttpRequest,
+    ) -> BoxFuture<'a, Result<HttpResponseStream, TransportError>> {
+        Box::pin(async move {
+            let rx = self
+                .rx
+                .lock()
+                .unwrap()
+                .take()
+                .expect("ChannelTransport::send called more than once");
+            Ok(HttpResponseStream {
+                status: self.status,
+                headers: vec![],
+                body: rx.boxed(),
+            })
+        })
+    }
+}
+
+fn channel_ctx(rx: mpsc::UnboundedReceiver<Result<bytes::Bytes, TransportError>>) -> RequestCtx {
+    RequestCtx {
+        trace_id: None,
+        transport: Arc::new(ChannelTransport::new(200, rx)),
+        api_key: "test-key".into(),
+        credentials: None,
+    }
+}
+
+/// Task 3's central claim: `stream_chat` must return `Ok(ChatStream)` the
+/// moment the *first* decoded event exists, not only once the whole body has
+/// arrived. Never closing `tx` and never sending `message_stop` here is the
+/// point -- the pre-Task-3 buffered implementation awaited
+/// `decode_anthropic_messages_stream`, which only ever completes once the
+/// decode loop itself ends (a clean EOF or a mid-stream failure), so it
+/// could never resolve under these exact conditions.
+#[tokio::test]
+async fn stream_chat_resolves_once_the_first_content_event_exists_while_the_body_is_still_open() {
+    let (tx, rx) = mpsc::unbounded::<Result<bytes::Bytes, TransportError>>();
+    // Queued before `stream_chat` is even called: an unbounded sender does
+    // not require the receiver to be polled first.
+    tx.unbounded_send(Ok(bytes::Bytes::from(
+        "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\"}}\n\n",
+    )))
+    .unwrap();
+
+    let ctx = channel_ctx(rx);
+    let result = AnthropicMessagesProvider::new()
+        .stream_chat(&sample_request(), &ctx)
+        .now_or_never()
+        .expect(
+            "the first content event already arrived -- stream_chat must not wait for the \
+             body to close before resolving",
+        );
+
+    let mut stream = result.expect("a well-formed first frame must not be an error");
+    assert!(
+        !tx.is_closed(),
+        "the channel must still be open: this proves stream_chat did not wait for EOF"
+    );
+
+    let first = stream
+        .next()
+        .now_or_never()
+        .expect("the first event was already decoded before stream_chat returned")
+        .expect("must not be end-of-stream")
+        .expect("a well-formed content_block_start frame must decode without error");
+    assert!(matches!(
+        first,
+        StreamEvent::BlockStart {
+            index: 0,
+            kind: BlockKind::Text
+        }
+    ));
+
+    drop(tx);
+}
+
+/// A body that closes before any content event ever decoded must fail
+/// `stream_chat` itself (an `Err`, so retry-before-the-first-token keeps
+/// working) rather than returning `Ok` with an empty or immediately-failing
+/// stream.
+#[tokio::test]
+async fn stream_chat_returns_err_when_the_body_closes_before_any_content_arrives() {
+    let (tx, rx) = mpsc::unbounded::<Result<bytes::Bytes, TransportError>>();
+    drop(tx); // closed immediately: no frames at all, not even message_start
+
+    let ctx = channel_ctx(rx);
+    let err = expect_err(
+        AnthropicMessagesProvider::new()
+            .stream_chat(&sample_request(), &ctx)
+            .await,
+    );
+    match err {
+        ProviderError::StreamInterrupted { partial } => assert_eq!(partial, ""),
+        other => panic!("expected StreamInterrupted with no partial text, got {other}"),
+    }
+}
+
+/// Controller ruling R22, at the provider boundary: a `signature_delta`
+/// past the decoder's `MAX_THINKING_SIGNATURE_BYTES` ceiling is a wire-
+/// protocol violation that fails the turn. With the violating frame first,
+/// nothing is ever handed to the engine at all, so no unbounded, unredacted
+/// `Delta::Thinking` row can reach the append-only `events` table.
+#[tokio::test]
+async fn stream_chat_fails_on_a_thinking_signature_past_the_decoders_ceiling() {
+    let signature = "s"
+        .repeat(roundhouse_provider::codec::anthropic_messages::MAX_THINKING_SIGNATURE_BYTES + 1);
+    let (tx, rx) = mpsc::unbounded::<Result<bytes::Bytes, TransportError>>();
+    tx.unbounded_send(Ok(bytes::Bytes::from(format!(
+        "event: content_block_delta\ndata: {{\"type\":\"content_block_delta\",\"index\":0,\
+         \"delta\":{{\"type\":\"signature_delta\",\"signature\":\"{signature}\"}}}}\n\n"
+    ))))
+    .unwrap();
+
+    let ctx = channel_ctx(rx);
+    let err = expect_err(
+        AnthropicMessagesProvider::new()
+            .stream_chat(&sample_request(), &ctx)
+            .await,
+    );
+    match err {
+        ProviderError::Transport(message) => assert!(
+            !message.contains(&signature),
+            "the error must report the length, never echo the signature: {message}"
+        ),
+        other => panic!("expected a Transport error for a wire-protocol violation, got {other}"),
+    }
+
+    drop(tx);
+}
+
+/// Once a first content event has already decoded, a later truncation must
+/// surface as the *stream's own* terminal item, not as `stream_chat`'s
+/// `Result` -- `stream_chat` already returned `Ok` by that point, and
+/// `ChatStream`'s fallible item type (Task 1) exists precisely so a
+/// mid-stream failure after the first token doesn't have to be silently
+/// dropped.
+#[tokio::test]
+async fn a_body_that_closes_after_content_but_before_message_stop_ends_the_stream_in_an_error() {
+    let (tx, rx) = mpsc::unbounded::<Result<bytes::Bytes, TransportError>>();
+    tx.unbounded_send(Ok(bytes::Bytes::from(
+        "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\"}}\n\n",
+    )))
+    .unwrap();
+    tx.unbounded_send(Ok(bytes::Bytes::from(
+        "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"cut off\"}}\n\n",
+    )))
+    .unwrap();
+    drop(tx); // closed before content_block_stop/message_stop ever arrive
+
+    let ctx = channel_ctx(rx);
+    let mut stream = AnthropicMessagesProvider::new()
+        .stream_chat(&sample_request(), &ctx)
+        .await
+        .expect("the first content event arrived before the body closed, so this must be Ok");
+
+    let mut items = Vec::new();
+    while let Some(item) = stream.next().await {
+        items.push(item);
+    }
+
+    let (last, rest) = items
+        .split_last()
+        .expect("must yield at least the BlockStart event before the terminal error");
+    assert!(matches!(
+        rest.first(),
+        Some(Ok(StreamEvent::BlockStart {
+            index: 0,
+            kind: BlockKind::Text
+        }))
+    ));
+    match last {
+        Err(ProviderError::StreamInterrupted { partial }) => assert_eq!(partial, "cut off"),
+        other => panic!("expected the stream's last item to be StreamInterrupted, got {other:?}"),
+    }
 }

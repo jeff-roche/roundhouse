@@ -179,7 +179,7 @@ impl Provider for CohereV2Provider {
             let events = decode_cohere_v2_stream(response.body)
                 .await
                 .map_err(stream_failure_to_provider_error)?;
-            let stream = ChatStream(Box::pin(futures::stream::iter(events)));
+            let stream = ChatStream::from_events(events);
             Ok(stream)
         })
     }

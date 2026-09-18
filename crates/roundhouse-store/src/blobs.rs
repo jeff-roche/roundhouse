@@ -85,15 +85,28 @@ pub enum RecordBlobError {
 /// `blobs` row for `blob_ref`. **Must be called in the same transaction the
 /// caller uses to append the owning event** — never a separate one — per
 /// §4.5's "a blob can never be referenced by an event that isn't durably
-/// recorded, and vice versa." Phase 0 delivers this function; wiring the
-/// call site into the real event-append transaction is Phase 1's
-/// `roundhouse-store` work (the same deferral Task 10's Interfaces note
-/// already states for the event-append path itself).
+/// recorded, and vice versa." Phase 0 delivered this function; `roundhouse-flow`'s
+/// checkpoint commit (`production.rs`) is one real production call site.
+/// `writer::append_batch_with_blobs` (Phase 8 Task 19 lane B, Task 5) is the second,
+/// wiring this into the streamed-delta event-append transaction. As of Task 9 it IS
+/// reached in production: `roundhouse_engine::tool_dispatch::flush_stream` (the shell
+/// delta pump) calls it for every flushed stdout/stderr chunk, reached from both
+/// dispatch call sites — `roundhouse_engine::agent_loop::dispatch_builtin` and
+/// `roundhouse_engine::workflow_dispatch::dispatch_tool_for_workflow`. Blob-carrying
+/// events do flow through it today, so a blob-GC audit must account for them.
 ///
 /// Rejects (`RecordBlobError::MissingFile`) a `blob_ref` whose file isn't
 /// actually present under `state_dir` — e.g. one that arrived via
 /// deserialized/persisted event data rather than a real `write_blob` call
 /// in this process — rather than indexing a row the filesystem can't back.
+///
+/// **Known TOCTOU (fix round 1, security finding S8), not closed by this function:**
+/// the existence check below (`fs::metadata`) and the `INSERT`/`UPDATE` it guards are not
+/// atomic with each other — a file deleted in the window between them (e.g. a concurrent,
+/// misbehaving GC pass, or anything else touching the blob store outside this crate's own
+/// discipline) leaves a `blobs` row (and the event that references it) committed while the
+/// file itself is gone, the mirror image of the gap this check exists to prevent. Not
+/// fixed here; recorded as a known gap.
 pub fn record_blob_write(
     txn: &Transaction,
     state_dir: &Path,

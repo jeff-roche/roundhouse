@@ -37,17 +37,19 @@ pub use roundhouse_bus::limits;
 mod chat;
 pub mod compact;
 mod context;
+mod delta_sink;
 mod infer;
 pub mod mcp_spawner;
 pub mod message_render;
 mod session_actor;
 mod working_context;
 
-pub use chat::{run_chat_turn, AgentError};
+pub use chat::{run_chat_turn, run_chat_turn_with_clock, AgentError, MonotonicClock, SystemClock};
 // `compact` is `pub mod` so tests can use the path `roundhouse_engine::compact::*`.
 // Re-export the common items at crate root for convenience.
 pub use compact::{execute_compact, CompactError, CompactInput, CompactOutput, CompactStrategy};
 pub use context::assemble_context;
+pub use delta_sink::{DeltaCoalescer, SplitFn};
 pub use infer::fold_stream_to_blocks;
 pub use session_actor::{
     create_session_isolation, create_session_with_egress, effective_tier,

@@ -1513,6 +1513,25 @@ async fn dispatch_builtin(
         };
     }
 
+    // Phase 8 Task 19 lane B, Task 9: `TaskParams::Shell` streams real
+    // deltas; the four filesystem kinds stay one-shot (`None`). `writer`
+    // here is `actor.writer()` (`run_agent_loop`'s own `let writer =
+    // actor.writer();`), the exact `EventWriter` this function's own
+    // `TaskCompleted`/`TaskFailed` appends below use — `writer.clone()`
+    // must stay a clone of THAT SAME writer for the Global Constraint to
+    // hold; see `run_isolated_shell_dispatch`'s comment on `completion`
+    // for the full argument.
+    let delta_sink = match &params {
+        roundhouse_policy::TaskParams::Shell(_) => Some(crate::tool_dispatch::ShellDeltaSink::new(
+            writer.clone(),
+            actor.runner(),
+            actor.session_id(),
+            task_id,
+            actor.state_dir().to_path_buf(),
+        )),
+        _ => None,
+    };
+
     match crate::tool_dispatch::execute_builtin(
         &params,
         &extras,
@@ -1524,6 +1543,7 @@ async fn dispatch_builtin(
         // 120s bound `execute_builtin` used to hardcode internally, just
         // passed explicitly now that the parameter is real.
         crate::tool_dispatch::SHELL_TIMEOUT,
+        delta_sink,
     )
     .await
     {

@@ -199,7 +199,7 @@ impl Provider for EchoProvider {
             },
             StreamEvent::MessageStop,
         ];
-        Box::pin(async move { Ok(ChatStream(Box::pin(futures::stream::iter(events)))) })
+        Box::pin(async move { Ok(ChatStream::from_events(events)) })
     }
 
     fn count_tokens<'a>(
@@ -210,6 +210,100 @@ impl Provider for EchoProvider {
         let input = self.input;
         Box::pin(async move { Ok(TokenCount { tokens: input }) })
     }
+}
+
+/// A provider whose `stream_chat` itself succeeds (the request was accepted
+/// and streaming began) but whose stream emits a mid-stream `Err` item
+/// after one event — T19b Task 1's `ChatStream` items are
+/// `Result<StreamEvent, ProviderError>`, so this is representable without a
+/// second, separate failure channel.
+struct MidStreamErrorProvider;
+
+impl Provider for MidStreamErrorProvider {
+    fn capabilities(&self, _model: &ModelId) -> Capabilities {
+        Capabilities {
+            streaming: true,
+            tools: false,
+            thinking: false,
+            max_breakpoints: 0,
+        }
+    }
+
+    fn resolve(&self, _req: &ChatRequest) -> Result<Plan, ProviderError> {
+        Ok(Plan {
+            endpoint: "stub".into(),
+        })
+    }
+
+    fn stream_chat<'a>(
+        &'a self,
+        _req: &'a ChatRequest,
+        _ctx: &'a RequestCtx,
+    ) -> roundhouse_provider::BoxFut<'a, Result<ChatStream, ProviderError>> {
+        Box::pin(async {
+            Ok(ChatStream::from_results(vec![
+                Ok(StreamEvent::BlockStart {
+                    index: 0,
+                    kind: roundhouse_provider::BlockKind::Text,
+                }),
+                Err(ProviderError::StreamInterrupted {
+                    partial: "partial text".into(),
+                }),
+            ]))
+        })
+    }
+
+    fn count_tokens<'a>(
+        &'a self,
+        _req: &'a ChatRequest,
+        _ctx: &'a RequestCtx,
+    ) -> roundhouse_provider::BoxFut<'a, Result<TokenCount, ProviderError>> {
+        Box::pin(async {
+            todo!("MidStreamErrorProvider's stream_chat succeeds; it never gets billed via count_tokens")
+        })
+    }
+}
+
+/// T19b Task 1: a mid-stream `Err` item (as opposed to `stream_chat` itself
+/// returning `Err`) must stop `consume_and_replay`'s consumption immediately,
+/// and the replayed stream it hands back must end with that same error —
+/// never silently truncated to look like a clean completion, and never
+/// continuing to poll past the error.
+#[tokio::test]
+async fn a_mid_stream_error_item_stops_consumption_and_the_replay_ends_with_it() {
+    let runner = RUNNER.get_or_init(TaskRunner::bootstrap);
+    let chain = FallbackChain {
+        steps: vec![(ProviderId("only".into()), ModelId("test".into()))],
+    };
+    let mut providers: HashMap<ProviderId, Arc<dyn Provider>> = HashMap::new();
+    providers.insert(ProviderId("only".into()), Arc::new(MidStreamErrorProvider));
+
+    let outcome = infer_with_fallback(
+        &chain,
+        &dummy_request(),
+        &dummy_ctx(),
+        &providers,
+        &CircuitBreaker::new(),
+        &AimdSemaphore::new(),
+        &FlatPricing,
+        runner,
+        SessionId::new(),
+        TaskId::new(),
+    )
+    .await
+    .expect("stream_chat itself returns Ok; a mid-stream item error is not a fallback failure");
+
+    let replayed: Vec<Result<StreamEvent, ProviderError>> = outcome.stream.collect().await;
+    assert_eq!(
+        replayed.len(),
+        2,
+        "consumption must stop at the first Err item, not continue polling past it"
+    );
+    assert!(matches!(replayed[0], Ok(StreamEvent::BlockStart { .. })));
+    assert!(
+        matches!(replayed[1], Err(ProviderError::StreamInterrupted { .. })),
+        "the replayed stream must end with the same error the original stream reported"
+    );
 }
 
 #[tokio::test]
@@ -268,7 +362,11 @@ async fn failed_first_attempt_never_reports_zero_cost_and_falls_back() {
     );
 
     // The stream must replay the provider's events (not be empty/estimated).
-    let replayed: Vec<StreamEvent> = outcome.stream.collect().await;
+    let replayed: Vec<StreamEvent> = outcome
+        .stream
+        .map(|item| item.expect("EchoProvider's stream never errors"))
+        .collect()
+        .await;
     assert!(matches!(replayed.last(), Some(StreamEvent::MessageStop)));
 }
 

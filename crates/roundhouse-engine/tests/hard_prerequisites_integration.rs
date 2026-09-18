@@ -59,7 +59,6 @@
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 
-use futures::stream;
 use roundhouse_bus::spawn_tree::SpawnTree;
 use roundhouse_bus::teams::TeamRegistry;
 use roundhouse_core::{
@@ -385,7 +384,7 @@ impl Provider for ScriptedToolCallProvider {
                     StreamEvent::MessageStop,
                 ]
             };
-            Ok(ChatStream(Box::pin(stream::iter(events))))
+            Ok(ChatStream::from_events(events))
         })
     }
     fn count_tokens<'a>(

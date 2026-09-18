@@ -1,8 +1,9 @@
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use arc_swap::ArcSwap;
-use roundhouse_core::{Event, EventPayload};
+use roundhouse_core::{Delta, Event, EventPayload, TaskInput, TaskOutput};
 use tokio::sync::{mpsc, oneshot};
 
 use crate::redact::Redactor;
@@ -18,6 +19,15 @@ pub(crate) enum WriteCmd {
     },
     AppendBatch {
         events: Vec<Event>,
+        reply: oneshot::Sender<Result<Vec<u64>, StoreError>>,
+    },
+    /// Phase 8 Task 19 lane B, Task 5: same batching as `AppendBatch`, plus indexing every
+    /// `Delta::Blob`/`TaskInput::Blob`/`TaskOutput::Blob` ref the batch's events carry, in
+    /// the SAME transaction as the events insert. See `append_batch_with_blobs` (the free
+    /// function).
+    AppendBatchWithBlobs {
+        events: Vec<Event>,
+        state_dir: PathBuf,
         reply: oneshot::Sender<Result<Vec<u64>, StoreError>>,
     },
 }
@@ -163,6 +173,15 @@ pub async fn spawn_writer(store: StorePool) -> EventWriter {
                 WriteCmd::AppendBatch { events, reply } => {
                     let redactor = redactor_for_task.load_full();
                     let result = append_batch(&store, events, &redactor).await;
+                    let _ = reply.send(result);
+                }
+                WriteCmd::AppendBatchWithBlobs {
+                    events,
+                    state_dir,
+                    reply,
+                } => {
+                    let redactor = redactor_for_task.load_full();
+                    let result = append_batch_with_blobs(&store, events, state_dir, redactor).await;
                     let _ = reply.send(result);
                 }
             }
@@ -480,6 +499,196 @@ async fn append_batch(
     Ok(seqs)
 }
 
+/// The single `BlobRef` a payload carries, if any — `Delta::Blob` (streamed shell output
+/// routed to a blob, per Task 19b's convention), `TaskInput::Blob`, or `TaskOutput::Blob`
+/// are the only three shapes in `EventPayload` that carry one (see each type's own
+/// definition in `roundhouse-core`), and none of them can carry more than one at a time.
+fn blob_ref_in_payload(payload: &EventPayload) -> Option<&roundhouse_core::BlobRef> {
+    match payload {
+        EventPayload::TaskDelta {
+            delta: Delta::Blob(blob_ref),
+        } => Some(blob_ref),
+        EventPayload::TaskCreated {
+            input: TaskInput::Blob(blob_ref),
+            ..
+        } => Some(blob_ref),
+        EventPayload::TaskCompleted {
+            output: TaskOutput::Blob(blob_ref),
+            ..
+        } => Some(blob_ref),
+        _ => None,
+    }
+}
+
+/// Pulls a genuinely retriable `SQLITE_BUSY`/`SQLITE_BUSY_SNAPSHOT` error out of a
+/// `StoreError`, wherever it's nested — either directly (`StoreError::Sqlite`) or one
+/// level down inside `StoreError::Blob(RecordBlobError::Sqlite(_))`, the two shapes a busy
+/// collision can take when it surfaces through `append_event_in_transaction`/
+/// `record_blob_write` rather than a raw SQL call this function makes itself (fix round 1,
+/// Controller Ruling R6). `Ok` means "the caller should retry the whole attempt with this
+/// as the outer, retriable error"; `Err` returns the original (non-retriable) `StoreError`
+/// unchanged.
+fn busy_error_in(err: StoreError) -> Result<rusqlite::Error, StoreError> {
+    match err {
+        StoreError::Sqlite(e) if is_sqlite_busy(&e) => Ok(e),
+        StoreError::Blob(crate::blobs::RecordBlobError::Sqlite(e)) if is_sqlite_busy(&e) => Ok(e),
+        other => Err(other),
+    }
+}
+
+/// One `BEGIN IMMEDIATE`-through-`commit` attempt of `append_batch_with_blobs`'s
+/// transaction, run inside `with_bounded_busy_attempt` (fix round 1, Controller Ruling
+/// R6) — hence the doubly-nested return type: the OUTER `rusqlite::Result` is what
+/// `with_bounded_busy_attempt`/the caller's retry loop inspect for `SQLITE_BUSY` (via
+/// `is_sqlite_busy`), and the INNER `Result<Vec<u64>, StoreError>` is the real,
+/// non-retriable business outcome (success, or a genuine failure like
+/// `RecordBlobError::MissingFile`) once no more retries are worth attempting.
+/// `busy_error_in` is what routes a busy error from `append_event_in_transaction`/
+/// `record_blob_write` (both `StoreError`-typed, not raw `rusqlite::Error`) into the OUTER
+/// slot so it's retried the same way a busy error from `begin_immediate`/`tx.commit()`
+/// (already raw `rusqlite::Error`) is.
+fn append_batch_with_blobs_attempt(
+    c: &mut rusqlite::Connection,
+    events: &[Event],
+    state_dir: &Path,
+    redactor: &Redactor,
+) -> rusqlite::Result<Result<Vec<u64>, StoreError>> {
+    let tx = match begin_immediate(c) {
+        Ok(tx) => tx,
+        Err(e) if is_sqlite_busy(&e) => return Err(e),
+        Err(e) => return Ok(Err(StoreError::Sqlite(e))),
+    };
+
+    let mut seqs = Vec::with_capacity(events.len());
+    for event in events {
+        let seq = match append_event_in_transaction(&tx, event, redactor) {
+            Ok(seq) => seq,
+            Err(err) => {
+                return match busy_error_in(err) {
+                    Ok(busy) => Err(busy),
+                    Err(other) => Ok(Err(other)),
+                }
+            }
+        };
+        if let Some(blob_ref) = blob_ref_in_payload(&event.payload) {
+            if let Err(err) =
+                crate::blobs::record_blob_write(&tx, state_dir, blob_ref, event.ts.as_unix_nanos())
+            {
+                return match busy_error_in(StoreError::from(err)) {
+                    Ok(busy) => Err(busy),
+                    Err(other) => Ok(Err(other)),
+                };
+            }
+        }
+        seqs.push(seq);
+    }
+
+    match tx.commit() {
+        Ok(()) => Ok(Ok(seqs)),
+        Err(e) if is_sqlite_busy(&e) => Err(e),
+        Err(e) => Ok(Err(StoreError::Sqlite(e))),
+    }
+}
+
+/// Batched append that also indexes every blob reference the batch's events carry, in the
+/// SAME transaction as the events insert — extending §4.5's "a blob can never be
+/// referenced by an event that isn't durably recorded, and vice versa" to the batch path
+/// (Phase 8 Task 19 lane B, Task 5). This is what `record_blob_write`'s own doc comment
+/// names as the mechanism wiring it into a real event-append transaction. Today's
+/// production caller is `roundhouse_engine::tool_dispatch::flush_stream`, the shell
+/// delta pump, reached from `roundhouse_engine::agent_loop::dispatch_builtin` and
+/// `roundhouse_engine::workflow_dispatch::dispatch_tool_for_workflow` (Task 9).
+///
+/// Reuses `append_event_in_transaction` per event — same redaction, seq-assignment, and
+/// `tasks`-view upkeep as a single `append` — then, for whichever of
+/// `Delta::Blob`/`TaskInput::Blob`/`TaskOutput::Blob` that event's payload carries (if
+/// any; see `blob_ref_in_payload`), calls `blobs::record_blob_write` in the SAME
+/// transaction. Blob refs are never mutated by redaction (a `BlobRef` is a content hash,
+/// not inline text — see `Redactor::redact_event_payload`'s handling of the same three
+/// shapes), so scanning the ORIGINAL, pre-redaction `event.payload` for a ref to index is
+/// equivalent to scanning the redacted one and cheaper. **This does NOT redact blob
+/// CONTENT** — only the three shapes above (a content hash, never inline text) are ever
+/// looked at; a caller that writes secret-bearing bytes to a blob (`blobs::write_blob`)
+/// must redact them itself before that write.
+///
+/// **Ordering precondition this function assumes, not enforces (fix round 1, security
+/// finding S7 / Controller Ruling R10):** every `BlobRef` this call is asked to index must
+/// already have a real file on disk — i.e. the caller has already run `blobs::write_blob`
+/// for it — BEFORE calling this function, the same precondition `record_blob_write` itself
+/// documents. If this call's transaction rolls back (a later member's `MissingFile`, or a
+/// non-retriable error of any kind), any file an EARLIER member's successful
+/// `record_blob_write` referenced is left on disk with NO `blobs` row — an unindexed
+/// orphan `gc_eligible_blobs` cannot discover (it queries the `blobs` table only, so a
+/// file with no row is invisible to it, not merely ineligible). This is a real reclamation
+/// gap: an unindexed file leaked by a rolled-back batch is not cleaned up by anything in
+/// this crate today. Ruling R10 explicitly defers closing it (no `record_unreferenced_blob`
+/// pre-pass added here) — `roundhouse-flow`'s checkpoint path
+/// (`production.rs::index_prepared_checkpoint`) shows the alternative for a caller that
+/// needs the file discoverable even across a failed owner transaction: call
+/// `blobs::record_unreferenced_blob` (a zero-ref-count placeholder row) BEFORE the
+/// transaction that would otherwise be this call, so GC can still find the file if that
+/// transaction never happens. This function does not do that on a caller's behalf; a
+/// caller with the same need should follow that same pattern itself.
+///
+/// A `RecordBlobError` (including `MissingFile` — a `BlobRef` with no backing file under
+/// `state_dir`) propagates before `tx.commit()` runs, so the whole batch rolls back:
+/// neither the events nor any ref-count bump from this call commits — for EVERY member of
+/// the batch, not just the one that failed (see
+/// `a_missing_blob_file_rolls_back_the_whole_batch_including_an_earlier_real_blob`'s own
+/// doc comment for the two-member case this specifically proves).
+///
+/// **`SQLITE_BUSY` retry (fix round 1, Controller Ruling R6):** unlike the version of this
+/// function shipped in this task's first draft, this DOES retry on `SQLITE_BUSY` /
+/// `SQLITE_BUSY_SNAPSHOT`, with the same bounded backoff as `append_one`/`append_batch`
+/// (`with_bounded_busy_attempt`, `MAX_BUSY_RETRIES`, `INITIAL_BACKOFF`) — see
+/// `append_batch_with_blobs_attempt`/`busy_error_in` for how a busy error nested inside
+/// `append_event_in_transaction`'s or `record_blob_write`'s own `StoreError`-typed result
+/// gets routed into that retry loop. A retry re-runs the ENTIRE attempt from
+/// `begin_immediate`, which is safe and idempotent here specifically because nothing about
+/// it can have partially committed: the whole transaction, including every
+/// `record_blob_write` ref-count bump, only ever commits or rolls back as one unit.
+async fn append_batch_with_blobs(
+    store: &StorePool,
+    events: Vec<Event>,
+    state_dir: PathBuf,
+    redactor: Arc<Redactor>,
+) -> Result<Vec<u64>, StoreError> {
+    if events.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let conn = store.pool.get().await?;
+    let events = std::sync::Arc::new(events);
+
+    let mut attempt: u32 = 0;
+    let result = loop {
+        attempt += 1;
+        let events = std::sync::Arc::clone(&events);
+        let state_dir = state_dir.clone();
+        let redactor = Arc::clone(&redactor);
+
+        let write_result = conn
+            .interact(move |c| -> rusqlite::Result<Result<Vec<u64>, StoreError>> {
+                with_bounded_busy_attempt(c, |c| {
+                    append_batch_with_blobs_attempt(c, &events, &state_dir, &redactor)
+                })
+            })
+            .await
+            .map_err(|e| StoreError::Interact(e.to_string()))?;
+
+        match write_result {
+            Ok(inner) => break inner,
+            Err(err) if is_sqlite_busy(&err) && attempt < MAX_BUSY_RETRIES => {
+                tokio::time::sleep(INITIAL_BACKOFF * 2u32.pow(attempt - 1)).await;
+                continue;
+            }
+            Err(err) => break Err(StoreError::Sqlite(err)),
+        }
+    };
+
+    result
+}
+
 impl EventWriter {
     /// Hot-swaps the redactor consulted on every future `append`/`append_batch` call
     /// (Task 19, §6.7). Does not affect already-committed rows, only writes from this
@@ -501,6 +710,216 @@ impl EventWriter {
     /// boundary guarantee is unaffected by this method's existence.
     pub fn redact_outbound(&self, text: &str) -> (String, u32) {
         self.redactor.load().redact(text)
+    }
+
+    /// Byte-oriented counterpart to [`Self::redact_outbound`] — same live redactor, same
+    /// never-mutates-anything-persisted contract, but over raw bytes rather than validated
+    /// UTF-8 text (Phase 8 Task 19 lane B, Task 5: shell stdout/stderr and other
+    /// non-text-guaranteed streamed content). See `Redactor::redact_bytes`.
+    ///
+    /// **No production caller (Controller ruling R24).** The live streaming path reaches
+    /// the same `Redactor::redact_bytes` through
+    /// [`Self::redaction_split_and_redact`], which has to do the split and the redaction
+    /// under one `ArcSwap::load`; this stays as the separately-tested standalone
+    /// primitive. Kept deliberately, not dead code.
+    pub fn redact_outbound_bytes(&self, bytes: &[u8]) -> (Vec<u8>, u32) {
+        self.redactor.load().redact_bytes(bytes)
+    }
+
+    /// The number of bytes a streaming caller must hold back, unflushed, at every
+    /// non-final split point so that no live secret value can straddle it undetected: the
+    /// live redactor's longest pattern length minus one (0 for the default empty
+    /// redactor). Reads the LIVE redactor via `ArcSwap::load` on every call, exactly like
+    /// `redact_outbound`/`redact_outbound_bytes` — a `set_redactor` mid-stream changes the
+    /// holdback a caller sees on its very next call, same as it changes what gets matched.
+    ///
+    /// On its own this bounds how far a match can straddle a boundary a caller already
+    /// committed to — it does not choose that boundary. Pair it with
+    /// [`Self::redaction_safe_split_len`], which does: see that method's, and
+    /// `Redactor::safe_split_len`'s, own doc comments for why holdback alone isn't enough
+    /// and why the split point must be chosen with the buffered bytes in view.
+    ///
+    /// **Race warning (fix round 1, security finding S3 / Controller Ruling R9): calling
+    /// this and [`Self::redaction_safe_split_len`] as two separate calls is NOT safe** —
+    /// each does its own independent `ArcSwap::load`, so a `set_redactor` landing between
+    /// the two calls (e.g. `wire_redaction_for_session`, called on every session creation)
+    /// can mean the holdback was computed against one redactor and the split against a
+    /// DIFFERENT, freshly-installed one with a longer pattern, holding back too few bytes
+    /// for what the split actually used. Prefer [`Self::redaction_split_for_flush`], which
+    /// reads the redactor exactly once for both numbers. This method (and
+    /// `redaction_safe_split_len`) remain as directly-callable, separately-tested
+    /// primitives for callers that genuinely only need one of the two numbers (or that can
+    /// otherwise guarantee no `set_redactor` lands between two calls of their own).
+    ///
+    /// **No production caller (Controller ruling R24).** This one is named directly by the
+    /// phase text; it and [`Self::redaction_safe_split_len`] are the separately-tested
+    /// primitives the two live methods ([`Self::redaction_split_for_coalescer`] and
+    /// [`Self::redaction_split_and_redact`]) are built from. Kept deliberately.
+    pub fn redaction_holdback(&self) -> usize {
+        self.redactor.load().max_pattern_len().saturating_sub(1)
+    }
+
+    /// Pass-through to the live redactor's `Redactor::safe_split_len` — the split-point
+    /// choice `redaction_holdback`'s doc comment says to pair it with. Same hot-swap
+    /// semantics as every other method here: reads whichever `Redactor` is live at call
+    /// time via `ArcSwap::load`.
+    ///
+    /// **Same race warning as [`Self::redaction_holdback`]: do not call this and
+    /// `redaction_holdback` as two separate calls when you need them to agree on the same
+    /// redactor.** Prefer [`Self::redaction_split_for_flush`].
+    ///
+    /// **No production caller (Controller ruling R24)** — see
+    /// [`Self::redaction_holdback`]'s note: a deliberately retained primitive, not dead
+    /// code.
+    pub fn redaction_safe_split_len(&self, bytes: &[u8], max: usize) -> usize {
+        self.redactor.load().safe_split_len(bytes, max)
+    }
+
+    /// Combines [`Self::redaction_holdback`] and [`Self::redaction_safe_split_len`] under a
+    /// SINGLE `ArcSwap::load` (fix round 1, security finding S3 / Controller Ruling R9) —
+    /// the race-free way to get a streaming flush's split point.
+    ///
+    /// **No production caller (Controller ruling R24).** Kept as a directly-callable,
+    /// separately-tested primitive; the two methods production actually calls —
+    /// [`Self::redaction_split_for_coalescer`] and [`Self::redaction_split_and_redact`] —
+    /// are built from the same two pieces ([`Self::redaction_holdback`]'s formula and
+    /// `Redactor::safe_split_len`). Deliberately retained, not dead code left behind.
+    ///
+    /// Returns the number of bytes of `bytes` that are safe to flush and redact now (via
+    /// `redact_outbound_bytes`/`Redactor::redact_bytes` for a byte stream, or the
+    /// UTF-8-char-boundary-floored counterpart for text — see
+    /// `Redactor::safe_split_len`'s doc comment on flooring, S4) — the rest of `bytes`
+    /// must be retained and prefixed onto whatever arrives next.
+    ///
+    /// **A return of `0` means "nothing is safely flushable yet under the live redactor's
+    /// current holdback requirement" — it is not an error and not "flush nothing, ever".**
+    /// The caller must keep buffering and try again once more bytes have arrived; nothing
+    /// here bounds how long that buffering can go on unflushed — that bound belongs to the
+    /// buffer's own size/time-based flush policy (a later task's concern), not to this
+    /// method.
+    pub fn redaction_split_for_flush(&self, bytes: &[u8]) -> usize {
+        let redactor = self.redactor.load();
+        let holdback = redactor.max_pattern_len().saturating_sub(1);
+        let max = bytes.len().saturating_sub(holdback);
+        redactor.safe_split_len(bytes, max)
+    }
+
+    /// The production [`crate::delta_sink`]-shaped split primitive (Phase 8 Task 19 lane B,
+    /// Task 7): computes BOTH of `roundhouse_engine::delta_sink::SplitFn`'s modes from a
+    /// SINGLE `ArcSwap::load` of the live redactor PER CALL — one non-final-or-final split
+    /// QUERY sees one consistent redactor snapshot for its own holdback-and-split-point pair,
+    /// the same race [`Self::redaction_split_for_flush`] closes for its own (no-`max`,
+    /// non-final-only) shape.
+    ///
+    /// Today's production caller is the `SplitFn` closure
+    /// `roundhouse_engine::chat::run_chat_turn_with_clock` builds for its `DeltaCoalescer`
+    /// (Task 7). The shell delta pump (`roundhouse_engine::tool_dispatch::flush_stream`)
+    /// uses [`Self::redaction_split_and_redact`] instead, which folds this split choice and
+    /// the redaction itself into one snapshot (Task 8).
+    ///
+    /// **Residual, stated explicitly (fix round 1, finding M1 — an earlier draft of this
+    /// comment overclaimed the guarantee at the wrong granularity):** one streaming flush
+    /// decision inside `DeltaCoalescer` routinely calls this method SEVERAL times — the
+    /// size-shrink loop in `attempt_nonfinal_flush`/`carve_final_chunk`, and `carve_final_chunk`'s
+    /// own R13 geometric-growth-plus-bisection search — each call an independent `load()`. A
+    /// `set_redactor` landing between two of those calls within the same flush is NOT
+    /// serialized against this method; the two calls can legitimately see different redactor
+    /// snapshots, so a boundary chosen under one redactor could be redacted under another.
+    /// Note that append-time redaction does NOT repair that: `redact_event_payload` runs
+    /// per payload and cannot see a match straddling two of them — which is the very thing
+    /// `Redactor::safe_split_len`'s caller contract (item 1) exists to prevent.
+    ///
+    /// What actually makes this safe is structural, not compensating: **no writer that
+    /// deltas stream through ever sees a mid-stream `set_redactor` in production today.**
+    /// Each session owns its own `EventWriter`, and
+    /// `roundhouse_engine::create_session_with_egress` calls
+    /// `roundhouse_engine::wire_redaction_for_session` on it exactly once, at session
+    /// creation, before any streaming starts. The one writer that does see repeated
+    /// `set_redactor` calls is the daemon's shared `proxy_writer`
+    /// (`roundhouse_daemon`'s `register_proxy_secrets`, re-installing the accumulated
+    /// union on every new session) — and no deltas stream through that writer at all.
+    /// **Residual: if a future change calls `set_redactor` on a session's OWN writer
+    /// mid-turn, this breaks**, and the multi-call flush above is where it would break.
+    /// This method's snapshot consistency is about the correctness of a single
+    /// split-point ANSWER, not about serializing an entire multi-call flush against
+    /// redactor rotation.
+    ///
+    /// `max` is an EXTERNAL cap this method always honors on top of whatever the redactor
+    /// itself would allow — never a hint an implementation may ignore. `SplitFn`'s contract
+    /// requires the returned `k <= min(max, bytes.len())`; a wrapper that dropped `max` here
+    /// would hand `DeltaCoalescer` a cut its own size-shrink loop never verified, since the
+    /// coalescer clamps to `max` before trusting the answer (see `DeltaCoalescer::
+    /// attempt_nonfinal_flush`'s doc comment).
+    ///
+    /// - `final_flush == false`: applies the holdback (`redaction_holdback()`) THEN caps at
+    ///   `max` — `redactor.safe_split_len(bytes, max.min(bytes.len().saturating_sub(holdback)))`
+    ///   — mirroring `redaction_split_for_flush`'s own holdback formula, but honoring an
+    ///   externally supplied `max` too instead of only ever asking about the whole buffer.
+    /// - `final_flush == true`: no holdback (nothing more is coming for this run) —
+    ///   `redactor.safe_split_len(bytes, max)` directly.
+    ///
+    /// **Monotonicity in `max` (load-bearing for `DeltaCoalescer::carve_final_chunk`'s R13
+    /// narrowest-cut search, which calls this ONLY with `final_flush = true`):** the
+    /// `final_flush = true` branch is a direct, unmodified call to `Redactor::safe_split_len`,
+    /// so it inherits that method's own documented property verbatim — it answers `0` exactly
+    /// when a match starting at offset `0` extends past `min(max, bytes.len())`, and is
+    /// non-decreasing in `max` (a larger `max` can only ever admit a cut at least as large,
+    /// since `safe_split_len` starts its own candidate at `max.min(bytes.len())` and only ever
+    /// walks it down to an earlier match's `start()`, never below what a smaller `max` would
+    /// have produced). The `final_flush = false` branch composes two non-decreasing functions
+    /// of `max` (the `min` cap, then `safe_split_len` itself), so it is non-decreasing too,
+    /// though `carve_final_chunk`'s search never exercises that branch.
+    pub fn redaction_split_for_coalescer(
+        &self,
+        bytes: &[u8],
+        max: usize,
+        final_flush: bool,
+    ) -> usize {
+        let redactor = self.redactor.load();
+        if final_flush {
+            redactor.safe_split_len(bytes, max)
+        } else {
+            let holdback = redactor.max_pattern_len().saturating_sub(1);
+            let capped = max.min(bytes.len().saturating_sub(holdback));
+            redactor.safe_split_len(bytes, capped)
+        }
+    }
+
+    /// Combines [`Self::redaction_split_for_coalescer`]'s split choice and
+    /// [`Self::redact_outbound_bytes`]'s redaction under a SINGLE `ArcSwap::load` of the live
+    /// redactor (Phase 8 Task 19 lane B, Task 8 fix round 1, security finding M4). Two
+    /// independent loads — call `redaction_split_for_coalescer` and then separately
+    /// `redact_outbound_bytes` on the returned prefix — let a `set_redactor` land between them:
+    /// the holdback/cut computed against the OLD redactor and the automaton scan run against the
+    /// NEW one can legitimately disagree (a longer pattern in the new redactor could straddle a
+    /// cut the old one judged safe), which is exactly the race
+    /// [`Self::redaction_split_for_coalescer`]'s own doc comment already closed for computing
+    /// `final_flush`'s two component numbers together — this method closes the identical race one
+    /// level up, for a caller that also needs the redacted bytes themselves under that same
+    /// snapshot.
+    ///
+    /// Returns `(cut, redacted, matches)`: `cut` is exactly what
+    /// `redaction_split_for_coalescer(bytes, max, final_flush)` would have returned under the SAME
+    /// snapshot; `redacted`/`matches` are `redact_bytes(&bytes[..cut])` under that identical
+    /// snapshot. A non-final `cut` of `0` means nothing is safely flushable yet — `redacted` is
+    /// then empty and the caller must not persist it (mirrors
+    /// `redaction_split_for_coalescer`'s own "0 means keep buffering" contract).
+    pub fn redaction_split_and_redact(
+        &self,
+        bytes: &[u8],
+        max: usize,
+        final_flush: bool,
+    ) -> (usize, Vec<u8>, u32) {
+        let redactor = self.redactor.load();
+        let cut = if final_flush {
+            redactor.safe_split_len(bytes, max)
+        } else {
+            let holdback = redactor.max_pattern_len().saturating_sub(1);
+            let capped = max.min(bytes.len().saturating_sub(holdback));
+            redactor.safe_split_len(bytes, capped)
+        };
+        let (redacted, matches) = redactor.redact_bytes(&bytes[..cut]);
+        (cut, redacted, matches)
     }
 
     /// Append an event to the log. The event's `seq` field is ignored (the writer
@@ -536,6 +955,39 @@ impl EventWriter {
         let (reply, rx) = oneshot::channel();
         self.tx
             .send(WriteCmd::AppendBatch { events, reply })
+            .await
+            .map_err(|_| StoreError::Interact("writer task shut down".into()))?;
+        rx.await
+            .map_err(|_| StoreError::Interact("writer task dropped reply".into()))?
+    }
+
+    /// Same as `append_batch`, plus indexing every `Delta::Blob`/`TaskInput::Blob`/
+    /// `TaskOutput::Blob` ref the batch's events carry, in the SAME transaction as the
+    /// events insert (Phase 8 Task 19 lane B, Task 5). `state_dir` is the workspace's blob
+    /// root — the same directory `blobs::write_blob`/`record_blob_write` use elsewhere.
+    ///
+    /// A blob ref whose file isn't actually present under `state_dir`
+    /// (`blobs::RecordBlobError::MissingFile`, surfaced here as `StoreError::Blob`) fails
+    /// the WHOLE call: neither the events nor any ref-count bump commit — for every
+    /// member of the batch, not just the one that failed. Retries on `SQLITE_BUSY` with
+    /// the same bounded backoff as `append`/`append_batch`. Every `BlobRef` passed in must
+    /// already have a real file on disk (`blobs::write_blob` already ran for it); this
+    /// does NOT redact blob content, only the reference. See `append_batch_with_blobs`'s
+    /// (the free function's) own doc comment for the full design, including the
+    /// unindexed-orphan-file gap a rolled-back call can leave behind (fix round 1,
+    /// security findings S6/S7).
+    pub async fn append_batch_with_blobs(
+        &self,
+        events: Vec<Event>,
+        state_dir: PathBuf,
+    ) -> Result<Vec<u64>, StoreError> {
+        let (reply, rx) = oneshot::channel();
+        self.tx
+            .send(WriteCmd::AppendBatchWithBlobs {
+                events,
+                state_dir,
+                reply,
+            })
             .await
             .map_err(|_| StoreError::Interact("writer task shut down".into()))?;
         rx.await

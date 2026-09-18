@@ -319,6 +319,27 @@ pub async fn dispatch_tool_for_workflow(
         });
     }
 
+    // Phase 8 Task 19 lane B, Task 9: `TaskParams::Shell` streams real
+    // deltas; the four filesystem kinds stay one-shot (`None`). `writer`
+    // here is `actor.writer()` (this function's own `let writer =
+    // actor.writer();` above) — the same instance this function's own
+    // `TaskCompleted` append below uses, and the same instance
+    // `record_workflow_task_failed` reaches for via `actor.writer()` on the
+    // terminal-failure path. `writer.clone()` must stay a clone of THAT
+    // writer for the Global Constraint to hold; see
+    // `run_isolated_shell_dispatch`'s comment on `completion` for the
+    // full argument.
+    let delta_sink = match &params {
+        TaskParams::Shell(_) => Some(crate::tool_dispatch::ShellDeltaSink::new(
+            writer.clone(),
+            runner,
+            actor.session_id(),
+            task_id,
+            actor.state_dir().to_path_buf(),
+        )),
+        _ => None,
+    };
+
     match crate::tool_dispatch::execute_builtin(
         &params,
         &extras,
@@ -327,6 +348,7 @@ pub async fn dispatch_tool_for_workflow(
         pre_spawned,
         actor,
         step_timeout,
+        delta_sink,
     )
     .await
     {
