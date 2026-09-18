@@ -2451,6 +2451,49 @@ fn turn_outcome(
     }
 }
 
+/// Final-review finding #40/3: pins that a `TurnOutcome::Failed.message` is genuinely
+/// redacted, not merely commented as redacted. A provider `Transport` error's `Display`
+/// embeds whatever text the upstream call failed with verbatim ("transport error: {0}") —
+/// exactly the kind of upstream text that can carry a secret (a proxied API key baked into
+/// a URL, an auth header echoed back in an error body) — so `turn_outcome` must never hand
+/// that text to a client without the same redactor every stored row already passes
+/// through.
+#[cfg(test)]
+mod turn_outcome_redaction_tests {
+    use super::*;
+    use roundhouse_engine::agent_loop::AgentLoopError;
+    use roundhouse_engine::AgentError;
+    use roundhouse_provider::ProviderError;
+    use roundhouse_store::redact::Redactor;
+
+    #[tokio::test]
+    async fn a_failed_outcomes_message_has_its_secret_redacted() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = roundhouse_store::open(&dir.path().join("events.db"))
+            .await
+            .unwrap();
+        let writer = roundhouse_store::spawn_writer(store).await;
+        writer.set_redactor(Redactor::build(&["hunter2".to_string()]));
+
+        let err = AgentLoopError::Chat(AgentError::Provider(ProviderError::Transport(
+            "upstream rejected credential hunter2".to_string(),
+        )));
+
+        let outcome = turn_outcome(Err(err), &writer);
+
+        match outcome {
+            TurnOutcome::Failed { category, message } => {
+                assert_eq!(category, "provider");
+                assert!(
+                    !message.contains("hunter2"),
+                    "the secret must not reach the client: {message:?}"
+                );
+            }
+            other => panic!("expected TurnOutcome::Failed, got {other:?}"),
+        }
+    }
+}
+
 /// Why [`construct_real_session_bounded`] exists, in one line: real session
 /// construction must be BOUNDED without ever being CANCELLED.
 ///
