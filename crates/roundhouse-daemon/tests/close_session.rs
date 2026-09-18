@@ -422,6 +422,16 @@ async fn a_wedged_close_times_out_and_a_retry_is_accepted() {
         "a timed-out close must leave the actor stuck in Cancelling — neither Closed (the \
          abandoned call never reached its own state_tx.send_replace) nor Running"
     );
+    // Positive control for the negative assertion below: proves `captured`
+    // is actually wired up and capturing this connection's own log output,
+    // so `!captured.contains("a close is already in flight")` further down
+    // means "that warning genuinely did not fire," not "the log capture
+    // silently captured nothing" — which a reworded warning message could
+    // otherwise make true forever without this line ever failing.
+    assert!(
+        captured.contains("CloseSession did not durably append within the timeout"),
+        "expected the timeout's own log line to have fired"
+    );
 
     // Sent BEFORE releasing the gate, and checked via the captured log
     // rather than `events_rx` — see this test's own doc comment for why an

@@ -134,24 +134,41 @@ const SUBMIT_TURN_SYSTEM_PROMPT: &str =
 /// **What elapsing here actually fixes, and what it does not.** This
 /// timeout only unlatches the CONNECTION side: it lets `close_task` resolve
 /// (to a failed close) so this loop can move on and report an error rather
-/// than hang forever. It does **not** close the underlying resource leak —
-/// dropping `SessionActor::close`'s future mid-flight abandons whatever step
-/// it was on without running the rest: if it was still waiting on `wait_idle`
-/// (step 4), the actor never reaches `Closed`, `spawn_session_reaper` never
-/// fires, and the isolate, MCP children, registry entry, and proxy token are
-/// retained for the daemon's whole remaining life with no route left to
-/// reclaim them. If it was instead inside step 5's cascade
-/// (`sub_agent_host().close_children`) — which every socket-created session
-/// has, since `drive_session`'s `CreateSession` branch always calls
-/// `wire_sub_agent_host` — the drop can additionally strand a descendant
-/// `close_children` had already `take`n out of `SubAgentSessions` with its
-/// reaper already aborted, exactly the "genuine, permanent leak of that one
-/// session" `session_manager`'s `SESSION_CLOSE_TIMEOUT` documents at length
-/// for the identical cascade shape. Either way the session itself is left
-/// stuck in `Cancelling` forever, not "closed" and not "still running":
-/// `admit_task` refuses everything against a `Cancelling` session except a
-/// trusted System finally step, so a client that retries `CloseSession`
-/// after this timeout gets the same outcome, not a fresh chance to succeed.
+/// than hang forever. It does **not**, by itself, close the underlying
+/// resource leak — dropping `SessionActor::close`'s future mid-flight
+/// abandons whatever step it was on without running the rest. If it was
+/// still waiting on `wait_idle` (step 3), the actor never reaches `Closed`,
+/// `spawn_session_reaper` never fires, and the isolate, MCP children,
+/// registry entry, and proxy token are retained for the daemon's whole
+/// remaining life with no route left to reclaim them UNLESS something later
+/// clears whatever wedged it and a retry succeeds (see below). If it was
+/// instead inside step 4's cascade (`sub_agent_host().close_children`) —
+/// which every socket-created session has, since `drive_session`'s
+/// `CreateSession` branch always calls `wire_sub_agent_host` — the drop can
+/// additionally strand a descendant `close_children` had already `take`n
+/// out of `SubAgentSessions` with its reaper already aborted, exactly the
+/// "genuine, permanent leak of that one session" `session_manager`'s
+/// `SESSION_CLOSE_TIMEOUT` documents at length for the identical cascade
+/// shape — that particular leak is NOT undone by a later successful retry
+/// of the parent's own close. Either way, immediately after the timeout the
+/// session itself is left in `Cancelling`, not "closed" and not "still
+/// running".
+///
+/// **A retry can still succeed, unlike either leak above might suggest.**
+/// `SessionActor::close`'s own doc comment is explicit that a retry re-runs
+/// steps 3 (`wait_idle`) and 4 (`close_children`) from scratch — both
+/// idempotent by design — before reaching step 5
+/// (`EventWriter::close_session`), the drop point
+/// `a_wedged_close_times_out_and_a_retry_is_accepted` (below, in this
+/// crate's own `tests/close_session.rs`) actually constructs: a retry sent
+/// after the wedged writer eventually drains that first attempt's append
+/// finds `SessionClosed` already durable, gets back
+/// `CloseReceipt::AlreadyClosed`, and `close` treats that as success,
+/// publishing `Closed` for the first time. So a retry succeeds if and only
+/// if whatever wedged the first attempt has cleared by the time it runs: a
+/// leaked `WorkGuard` (step 3 never resolving) wedges every retry
+/// identically, forever; a merely slow store append or child close does
+/// not, and a retry sent after it finishes can genuinely complete.
 ///
 /// A distinct constant from `session_manager`'s own `SESSION_CLOSE_TIMEOUT`
 /// (private to that module, so not reusable here directly) rather than a

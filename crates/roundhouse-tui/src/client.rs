@@ -119,6 +119,15 @@ pub struct DaemonClient {
     /// spurious `TuiError::Json` (or worse, a well-formed but wrong frame).
     /// There is no way to clear it: a client in this state must be
     /// discarded, not reused.
+    ///
+    /// Read this field's name as "unreadable," not "bytes were definitely
+    /// lost": it is set unconditionally on every `close_session` timeout,
+    /// including the common silent-refusal case where the cancelled `recv`
+    /// was still waiting for the first byte of a fresh line and nothing was
+    /// actually consumed. There is no cheap way to tell, after the fact,
+    /// which case occurred, so this errs conservative and burns the client
+    /// either way rather than risk the rare case silently. It says nothing
+    /// about `self.writer` — the write half is entirely unaffected.
     read_desynchronized: bool,
 }
 
@@ -295,6 +304,14 @@ impl DaemonClient {
     /// later call to [`Self::recv`] fails immediately with `ErrorKind::Other`
     /// rather than risk decoding a truncated frame as a spurious
     /// `TuiError::Json`, or worse, a well-formed but wrong one.
+    ///
+    /// **This call itself must not be cancelled from the outside** (wrapped
+    /// in a caller's own `tokio::time::timeout`, raced in a `select!`
+    /// branch, or otherwise dropped before it resolves). Doing so drops this
+    /// method's own internal `recv` wait without ever reaching the code
+    /// above that marks the client unusable — the safeguard this method
+    /// provides for its own internal timeout does not extend to a cancel
+    /// imposed on the whole call from outside it.
     ///
     /// # Panics
     /// Panics under the same condition [`Self::session_id`] does: this
