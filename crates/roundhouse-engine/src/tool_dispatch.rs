@@ -1464,6 +1464,17 @@ async fn flush_stream(
 /// environment-dependent number of `Budget` ones. Best-effort like every
 /// other streamed append here — a failure is not this call's problem to
 /// propagate.
+///
+/// Best-effort still means logged, not discarded (Phase 8, T19a rebase). One
+/// of the ways this append can now fail is `StoreError::SessionClosed`:
+/// T19a's tail guard rejects any append whose session log already ends in
+/// the `SessionClosed` terminator, and this marker rides the same
+/// `EventWriter` every other append does. Dropping that silently would make
+/// a genuinely lost discontinuity marker indistinguishable from one that
+/// committed, so the error is logged at `warn` here rather than thrown away
+/// — the same disposition `flush_stream` gives its own failed append. It is
+/// still not propagated: the caller is the shell output pump, which must
+/// never let a store failure stall a child process's pipes.
 async fn emit_gap_progress(
     writer: &EventWriter,
     runner: &TaskRunner,
@@ -1486,7 +1497,13 @@ async fn emit_gap_progress(
         },
         1,
     );
-    let _ = writer.append(event).await;
+    if let Err(e) = writer.append(event).await {
+        tracing::warn!(
+            error = %e, %reason, lag_bytes,
+            "shell output discontinuity marker could not be appended; the gap it records \
+             is not in this session's log"
+        );
+    }
 }
 
 /// Drives both streams' [`StreamPumpState`] to completion: buffers each

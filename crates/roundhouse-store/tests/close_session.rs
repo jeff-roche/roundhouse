@@ -10,9 +10,10 @@
 //! task, including one merely waiting on an approval/elicitation/reply, is cancelled.
 
 use roundhouse_core::{
-    CancelReason, IsolationAttestation, Origin, SessionId, SessionOutcome, SuspendReason, TaskId,
-    TaskInput, TaskKind, Tier, Timestamp, Trust, Usage,
+    CancelReason, Delta, IsolationAttestation, Origin, SessionId, SessionOutcome, SuspendReason,
+    TaskId, TaskInput, TaskKind, Tier, Timestamp, Trust, Usage,
 };
+use roundhouse_store::blobs::write_blob;
 use roundhouse_store::{fold_task, open, spawn_writer, CloseReceipt, StoreError, StoredEvent};
 
 static RUNNER: once_cell::sync::Lazy<roundhouse_core::TaskRunner> =
@@ -352,6 +353,82 @@ async fn append_batch_after_close_is_rejected_and_commits_nothing() {
     assert!(
         open_session_rows.is_empty(),
         "a rejected batch must commit nothing, including for a session that was itself still open"
+    );
+}
+
+/// The tail guard must cover `append_batch_with_blobs` — the streaming-delta flush path
+/// (`roundhouse_engine::tool_dispatch::flush_stream`) — and not only the `append`/
+/// `append_batch` paths the two tests above pin.
+///
+/// It does so structurally rather than by a check of its own:
+/// `append_batch_with_blobs_attempt` assigns every member's seq through
+/// `append_event_in_transaction`, the same function `next_seq_or_reject_closed` guards for
+/// every other path. This test exists because that is an easy property to lose — the two
+/// functions were written against the same base by different lanes and neither one's tests
+/// covered the other's path — and because the failure mode is unrepairable: `events`
+/// physically rejects `UPDATE`/`DELETE`, so a delta that slipped past the terminator would
+/// stay in the log forever.
+///
+/// Asserts the blob is left UNINDEXED as well as the event unwritten. The rejection has to
+/// happen before `record_blob_write` runs, or a closed session's log would end up with a
+/// `blobs` row whose `ref_count` counts a reference no event ever made.
+#[tokio::test]
+async fn append_batch_with_blobs_after_close_is_rejected_and_indexes_no_blob() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = open(&dir.path().join("events.db")).await.unwrap();
+    let writer = spawn_writer(store).await;
+
+    let session_id = SessionId::new();
+    writer
+        .close_session(&RUNNER, session_id, now_ts(), SessionOutcome::Completed)
+        .await
+        .unwrap();
+
+    // A real file on disk, so `record_blob_write` would genuinely succeed if it ran —
+    // the rejection under test must come from the tail guard, not from a missing blob.
+    let blob = write_blob(dir.path(), b"shell stdout streamed after the close", None).unwrap();
+    let delta = RUNNER.record_task_delta(
+        session_id,
+        0,
+        now_ts(),
+        TaskId::new(),
+        Delta::Blob(blob.clone()),
+        1,
+    );
+
+    let err = writer
+        .append_batch_with_blobs(vec![delta], dir.path().to_path_buf())
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, StoreError::SessionClosed(_)),
+        "expected StoreError::SessionClosed, got {err:?}"
+    );
+
+    let query_store = open(&dir.path().join("events.db")).await.unwrap();
+    let rows = session_events_ordered(&query_store, session_id).await;
+    let last_payload = &rows.last().expect("the terminator is always there").1;
+    assert!(
+        last_payload.contains("SessionClosed"),
+        "the terminator must still be the last event, got {last_payload}"
+    );
+
+    let hash = blob.hash.as_str().to_string();
+    let conn = query_store.pool.get().await.unwrap();
+    let indexed: Option<i64> = conn
+        .interact(move |c| {
+            c.query_row(
+                "SELECT ref_count FROM blobs WHERE hash = ?1",
+                [hash],
+                |row| row.get::<_, i64>(0),
+            )
+            .ok()
+        })
+        .await
+        .unwrap();
+    assert!(
+        indexed.is_none(),
+        "a rejected flush must index no blob, got ref_count {indexed:?}"
     );
 }
 
