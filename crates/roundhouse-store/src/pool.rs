@@ -2,6 +2,7 @@ use std::path::Path;
 
 use deadpool_sqlite::{Config, Hook, HookError, Pool, Runtime};
 
+use crate::commit_feed::CommitFeed;
 use crate::txn::BUSY_TIMEOUT;
 
 /// The migration harness for this crate's SQLite schema. Wraps Phase 0's complete
@@ -117,6 +118,30 @@ pub enum StoreError {
 #[derive(Debug, Clone)]
 pub struct StorePool {
     pub pool: deadpool_sqlite::Pool,
+    /// Phase 8 Task 21, Task 1: the per-session commit-notification feed a follower
+    /// (SSE/UDS) watches to learn when to re-read `events_after`. Not `pub`, unlike
+    /// `pool`: every caller reaches it through `commit_feed()`/`with_commit_feed()`
+    /// instead of the field directly, so this struct stays free to change how the feed is
+    /// stored without becoming a breaking change for callers outside this crate.
+    commit_feed: CommitFeed,
+}
+
+impl StorePool {
+    /// The commit-notification feed for this pool's database. See [`CommitFeed`]'s own
+    /// doc comment for what it carries and why.
+    pub fn commit_feed(&self) -> &CommitFeed {
+        &self.commit_feed
+    }
+
+    /// Replaces this pool's feed with `feed`, so several `StorePool`s independently opened
+    /// over the SAME underlying database (e.g. a writer's pool and a reader's pool) share
+    /// one `CommitFeed` rather than each maintaining its own — a `notify()` on one pool's
+    /// feed would otherwise never wake a `watch()` taken from a different pool's feed, even
+    /// though both point at the same file on disk.
+    pub fn with_commit_feed(mut self, feed: CommitFeed) -> Self {
+        self.commit_feed = feed;
+        self
+    }
 }
 
 /// One connection checked out of a [`StorePool`], returned to the pool when it
@@ -251,5 +276,8 @@ pub async fn open(path: &Path) -> Result<StorePool, StoreError> {
     .await
     .map_err(|e| StoreError::Interact(e.to_string()))??;
 
-    Ok(StorePool { pool })
+    Ok(StorePool {
+        pool,
+        commit_feed: CommitFeed::default(),
+    })
 }

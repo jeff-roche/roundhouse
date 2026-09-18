@@ -14,6 +14,7 @@
 
 pub mod attention;
 pub mod blobs;
+mod commit_feed;
 pub mod cost;
 mod fold;
 mod migrations;
@@ -74,6 +75,12 @@ pub use attention::{blocked_anywhere, BlockedTask};
 // Task 18 (Phase 2) exports: session-scoped event reads (used by
 // roundhouse-secrets' keyring-fallback Degradation visibility test).
 pub use session_events::session_events;
+
+// Phase 8 Task 21, Task 1 exports: the store-side commit feed a follower watches
+// (`CommitFeed`/`CommitWatch`), and the sync, paged reads it re-reads with
+// (`events_after`/`session_head`).
+pub use commit_feed::{CommitFeed, CommitWatch};
+pub use session_events::{events_after, session_head};
 
 // CQRS read-model exports (storage replay / fold)
 pub use replay::StoredEvent;

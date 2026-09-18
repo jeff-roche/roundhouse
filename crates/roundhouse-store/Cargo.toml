@@ -49,6 +49,13 @@ arc-swap = "1"
 tempfile = "3"
 tokio = { version = "1.53", features = ["full"] }
 rusqlite = { workspace = true }
+# Task 21 Task 1's `tests/commit_feed.rs` only: `now_or_never()`, to assert a `CommitWatch`'s
+# `changed()` is still Pending without a sleep (this lane's no-clock-timing-tests rule).
+# Dev-only — no production code in this crate depends on `futures`. Same version other
+# crates in this workspace already pin their own `futures = "0.3"` dependency edge to
+# (`roundhouse-provider`, `roundhouse-engine`, et al.), so this doesn't add a new version
+# to the lockfile.
+futures = "0.3"
 # Self dev-dependency, activating the `test-util` feature for this crate's own `tests/*.rs`
 # integration-test crates — `cfg(test)` alone does not cover them, only this crate's in-lib
 # `#[cfg(test)] mod tests`. Mirrors the identical pattern in `roundhouse-policy`/

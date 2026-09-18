@@ -3916,6 +3916,7 @@ dependencies = [
  "arc-swap",
  "blake3",
  "deadpool-sqlite",
+ "futures",
  "once_cell",
  "roundhouse-core",
  "roundhouse-provider",

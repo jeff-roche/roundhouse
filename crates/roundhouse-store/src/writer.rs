@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -262,12 +262,31 @@ pub async fn spawn_writer(store: StorePool) -> EventWriter {
             match cmd {
                 WriteCmd::Append { event, reply } => {
                     let redactor = redactor_for_task.load_full();
+                    let session_id = event.session_id;
                     let result = append_one(&store, *event, &redactor).await;
+                    // Notify only AFTER the commit returned Ok (CommitFeed::notify's own
+                    // contract, Phase 8 Task 21 Task 1) — a follower must never be woken
+                    // for a write that never landed.
+                    if result.is_ok() {
+                        store.commit_feed().notify(session_id);
+                    }
                     let _ = reply.send(result);
                 }
                 WriteCmd::AppendBatch { events, reply } => {
                     let redactor = redactor_for_task.load_full();
+                    // Collected before `events` moves into `append_batch` below. A
+                    // `HashSet` because a batch can carry more than one event for the
+                    // same session (see `append_batch`'s own seq-assignment doc comment) —
+                    // each distinct session is notified exactly once per batch, not once
+                    // per event.
+                    let touched_sessions: HashSet<SessionId> =
+                        events.iter().map(|event| event.session_id).collect();
                     let result = append_batch(&store, events, &redactor).await;
+                    if result.is_ok() {
+                        for session_id in touched_sessions {
+                            store.commit_feed().notify(session_id);
+                        }
+                    }
                     let _ = reply.send(result);
                 }
                 WriteCmd::AppendBatchWithBlobs {
@@ -276,7 +295,15 @@ pub async fn spawn_writer(store: StorePool) -> EventWriter {
                     reply,
                 } => {
                     let redactor = redactor_for_task.load_full();
+                    // Same distinct-session collection as `AppendBatch` above, same reason.
+                    let touched_sessions: HashSet<SessionId> =
+                        events.iter().map(|event| event.session_id).collect();
                     let result = append_batch_with_blobs(&store, events, state_dir, redactor).await;
+                    if result.is_ok() {
+                        for session_id in touched_sessions {
+                            store.commit_feed().notify(session_id);
+                        }
+                    }
                     let _ = reply.send(result);
                 }
                 WriteCmd::CloseSession {
@@ -289,6 +316,13 @@ pub async fn spawn_writer(store: StorePool) -> EventWriter {
                     let redactor = redactor_for_task.load_full();
                     let result =
                         close_session(&store, runner, session_id, ts, outcome, redactor).await;
+                    // Notified even on `Ok(CloseReceipt::AlreadyClosed)` — a spurious wake
+                    // for a follower that was already caught up is harmless, and treating
+                    // "already closed" as distinct from "closed" here would need this
+                    // match arm to know about `CloseReceipt`'s variants for no benefit.
+                    if result.is_ok() {
+                        store.commit_feed().notify(session_id);
+                    }
                     let _ = reply.send(result);
                 }
             }
