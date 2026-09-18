@@ -205,9 +205,12 @@ Three known failure modes of a literal "everything is a task" model, and the ans
   as the transaction's last event. Closing an already-closed session is a no-op read
   (`CloseReceipt::AlreadyClosed`); a genuine close reports `CloseReceipt::Closed
   { swept }`, the count of tasks it cancelled. A tail guard enforces the terminator at
-  the store boundary too: any later `append`/`append_batch` for that session is
-  rejected with `StoreError::SessionClosed` rather than silently accepted after the
-  log has already ended.
+  the store boundary too: any later `append`/`append_batch`/`append_batch_with_blobs`
+  for that session is rejected with `StoreError::SessionClosed` rather than silently
+  accepted after the log has already ended. That last one is the streaming-delta flush
+  path described in the amendment to §4.3's streaming bullet above; it is covered
+  because every append path assigns sequence numbers through the same guarded
+  `append_event_in_transaction`, not because each one carries a check of its own.
 
 ### 4.4 Identity and provenance
 
