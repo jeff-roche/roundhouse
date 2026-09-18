@@ -40,9 +40,12 @@ const HTTP_OVERLOADED: u16 = 529;
 /// material, and this struct stays trivially shareable across sessions.
 pub struct AnthropicMessagesProvider {
     /// API origin, without a trailing slash. Overridable so a gateway or a
-    /// local mock can be pointed at without touching this adapter; §9.9's
-    /// `ROUNDHOUSE_<PROVIDER>_BASE_URL` resolution chain lands in Phase 2 and
-    /// will set this field rather than replace it.
+    /// local mock can be pointed at without touching this adapter:
+    /// `roundhouse-daemon`'s `main` sets it from the operator's
+    /// `ROUNDHOUSE_ANTHROPIC_BASE_URL` (Phase 8, Task 8), once that crate's
+    /// `parse_anthropic_base_url` has confirmed the value is `https://` or a
+    /// loopback `http://` (127.0.0.0/8, `::1`, `localhost`) — never a raw,
+    /// unvalidated string.
     pub base_url: String,
 }
 
@@ -165,19 +168,18 @@ impl Provider for AnthropicMessagesProvider {
             // `TransportError`'s `Display` never includes request headers, so
             // the API key cannot ride along here.
             //
-            // Fix round 6, J4: `base_url` is only ever set by `::new()` today
-            // (a fixed, non-secret literal), so this sink has no live
-            // exposure -- but the field is `pub`, and its own doc comment
-            // above (`base_url`'s field doc) says the §9.9
-            // `ROUNDHOUSE_<PROVIDER>_BASE_URL` override "will set this field",
-            // at which point a gateway URL carrying credentials in its query
-            // string or userinfo would flow straight into a
-            // `TransportError::Io`'s `Display` (`reqwest`'s error text embeds
-            // the full request URL) and then onto a physically-immutable
-            // `events` row. Routed through the same `redact_transport_error_text`
-            // every other codec's transport-error sinks use, so the guarantee
-            // holds structurally before that override ever lands, not only
-            // once someone remembers to add it then.
+            // Fix round 6, J4 (superseded by Phase 8, Task 8): `base_url` is
+            // no longer only ever set by `::new()` -- `roundhouse-daemon`'s
+            // `main` now sets it from the operator's
+            // `ROUNDHOUSE_ANTHROPIC_BASE_URL`, gated by that crate's
+            // `parse_anthropic_base_url`, which accepts only `https://` or a
+            // loopback `http://` (127.0.0.0/8, `::1`, `localhost`) and
+            // rejects everything else as a startup error. That rejects the
+            // credential-in-URL shape this note used to warn about (a
+            // gateway URL carrying userinfo or a query-string secret) before
+            // it can ever reach this field. The `redact_transport_error_text`
+            // routing below is unchanged and still the actual guarantee for
+            // whatever URL text does land in a `TransportError`'s `Display`.
             let response = ctx.transport.send(http_req).await.map_err(|e| {
                 ProviderError::Transport(redact_transport_error_text(&e.to_string()))
             })?;
