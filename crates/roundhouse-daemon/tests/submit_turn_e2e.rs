@@ -1414,6 +1414,17 @@ mod human_join_guard {
 /// and terminal event, the first turn's text replaying into the second
 /// request's transcript, and the shell task's stdout/stderr replaying into
 /// that same request's folded tool result.
+///
+/// **What this does NOT prove:** the model-issued `shell` call in both
+/// tests runs as a real, but deliberately UNSANDBOXED, subprocess
+/// ([`RealSpawnTestIsolate`], below — no bwrap, no landlock, no seccomp),
+/// whose `attest()` hand-returns `Tier::Sandbox` purely so
+/// `roundhouse-policy`'s `sealed_tier_shortfall` doesn't deny the task for
+/// an attested tier below the session's requested one. The real sandbox
+/// mechanisms, the sealed-floor attestation-shortfall check they feed, the
+/// project-file trust dance, and general policy-language coverage are all
+/// out of scope for these two tests — do not read "real e2e" here as
+/// including the sandbox.
 mod delta_streaming_e2e {
     use super::*;
 
@@ -1688,15 +1699,7 @@ mod delta_streaming_e2e {
                             index: 1,
                             delta: BlockDelta::ToolArgsFragment(shell_args),
                         },
-                        // Deliberately no `BlockStop { index: 1 }` before
-                        // `MessageStop`: `DeltaCoalescer::block_stop` is what
-                        // flushes a block's buffer at an explicit stop, so a
-                        // stream that goes straight to `MessageStop` (which
-                        // `run_chat_turn_with_clock`'s own loop does nothing
-                        // with) leaves this fragment sitting in the coalescer
-                        // until the post-loop `coalescer.finish()` flush —
-                        // exactly the pre-terminal flush the break-it check
-                        // must prove is load-bearing.
+                        StreamEvent::BlockStop { index: 1 },
                         StreamEvent::MessageStop,
                     ]
                 } else {
@@ -1709,7 +1712,23 @@ mod delta_streaming_e2e {
                             index: 0,
                             delta: BlockDelta::Text(TURN2_TEXT.to_string()),
                         },
-                        // Same reasoning as turn 1's tool-call block above.
+                        // Deliberately no `BlockStop { index: 0 }` before
+                        // `MessageStop` — the one place in either test where
+                        // this stream isn't canonical Anthropic framing (a
+                        // real stream always sends `content_block_stop`
+                        // before `message_stop`; `tool_call_cassette` and
+                        // `final_text_cassette` below both keep it, and so
+                        // does turn 1's own tool-call block above).
+                        // `DeltaCoalescer::block_stop`, not
+                        // `coalescer.finish()`, is what flushes every OTHER
+                        // block in both this test and (e) — so this is the
+                        // one deliberate exercise of the specific case the
+                        // post-loop `finish()` flush exists for: a stream
+                        // that reaches `message_stop` with an unterminated
+                        // block. Restoring this stop would make (a-deltas)
+                        // pass even with that flush deleted (see the break-it
+                        // check's own report for what that means it does and
+                        // doesn't prove).
                         StreamEvent::MessageStop,
                     ]
                 };
@@ -1815,7 +1834,15 @@ mod delta_streaming_e2e {
                         status: 200,
                         headers: vec![],
                         body,
-                        chunk_size: 0,
+                        // A prime, deliberately small chunk size — never `0`
+                        // (`CassetteTransport::send`'s `ChunkStrategy::
+                        // WholeBody` shape), so this cassette's SSE body is
+                        // actually split across several transport-level
+                        // chunks at boundaries unlikely to land on any frame
+                        // structure, exercising `sse_stream::SseStream`'s
+                        // real incremental framing rather than handing the
+                        // decoder one whole-body chunk.
+                        chunk_size: 37,
                     })
                     .collect(),
                 calls: AtomicU32::new(0),
@@ -1889,11 +1916,10 @@ mod delta_streaming_e2e {
                 "delta": {"type": "input_json_delta", "partial_json": tool_input.to_string()},
             }),
         );
-        // Deliberately no `content_block_stop` for index 1 before
-        // `message_delta`/`message_stop` — see `DeltaStreamingProvider`'s
-        // identical omission for why: it's what makes the post-loop
-        // `coalescer.finish()` flush load-bearing for this block's content
-        // rather than `DeltaCoalescer::block_stop`.
+        body += &sse_frame(
+            "content_block_stop",
+            serde_json::json!({"type": "content_block_stop", "index": 1}),
+        );
         body += &sse_frame(
             "message_delta",
             serde_json::json!({
@@ -1930,7 +1956,10 @@ mod delta_streaming_e2e {
                 "delta": {"type": "text_delta", "text": text},
             }),
         );
-        // Same reasoning as `tool_call_cassette`'s missing `content_block_stop`.
+        body += &sse_frame(
+            "content_block_stop",
+            serde_json::json!({"type": "content_block_stop", "index": 0}),
+        );
         body += &sse_frame(
             "message_delta",
             serde_json::json!({
@@ -1961,6 +1990,24 @@ mod delta_streaming_e2e {
                     EventPayload::TaskCompleted { .. } | EventPayload::TaskFailed { .. }
                 )
         })
+    }
+
+    /// How many `TaskProgress` events `task_id` produced. Kept separate from
+    /// [`assert_deltas_sit_between_started_and_terminal`]'s combined
+    /// `TaskDelta | TaskProgress` non-vacuity guard: that guard alone cannot
+    /// tell a `TaskProgress` regression apart from a `TaskDelta`-only task,
+    /// since the shell task produces both kinds and its `TaskDelta` count
+    /// alone already satisfies the guard. This lane's entire premise is
+    /// that `record_task_progress` (`tool_dispatch.rs`'s `flush_stream`
+    /// pairing and `emit_gap_progress`) gains a real production caller, so a
+    /// dedicated `progress_count(..) > 0` assertion is what actually pins
+    /// that.
+    fn progress_count(events: &[roundhouse_store::StoredEvent], task_id: TaskId) -> usize {
+        events
+            .iter()
+            .filter(|e| e.task_id == Some(task_id))
+            .filter(|e| matches!(e.payload, EventPayload::TaskProgress { .. }))
+            .count()
     }
 
     /// Asserts every `TaskDelta`/`TaskProgress` event recorded for
@@ -2065,10 +2112,23 @@ mod delta_streaming_e2e {
                 .unwrap();
             let infer_tasks = task_ids_of_kind(&events, TaskKind::Infer);
             let shell_tasks = task_ids_of_kind(&events, TaskKind::Shell);
+            let chat_tasks = task_ids_of_kind(&events, TaskKind::Chat);
+            // Waits for the LAST chat task's own terminal event, not just
+            // infer2's — chat.rs's `run_chat_turn_with_clock` appends
+            // infer2's `TaskCompleted` and THEN chat2's, so waiting only for
+            // infer2 leaves a real read-barrier gap: a straggler delta
+            // appended after infer2's terminal (which the "no delta after
+            // the terminal event" half of
+            // `assert_deltas_sit_between_started_and_terminal` needs to
+            // catch) might not have committed yet by the time this loop's
+            // `session_events` snapshot is taken. Chat2's own terminal event
+            // landing strictly after infer2's closes that gap for every
+            // task in this session.
             let ready = infer_tasks.len() >= 2
                 && shell_tasks.len() == 1
-                && has_terminal(&events, infer_tasks[1])
-                && has_terminal(&events, shell_tasks[0]);
+                && chat_tasks.len() >= 2
+                && has_terminal(&events, shell_tasks[0])
+                && has_terminal(&events, chat_tasks[1]);
             if ready {
                 break events;
             }
@@ -2080,12 +2140,22 @@ mod delta_streaming_e2e {
             tokio::time::sleep(Duration::from_millis(25)).await;
         };
 
-        for w in events.windows(2) {
-            assert!(
-                w[0].seq < w[1].seq,
-                "seq must increase strictly across the whole session log: {} then {}",
-                w[0].seq,
-                w[1].seq
+        // The session log must be contiguous, not merely strictly
+        // increasing: `roundhouse_store::session_events` already returns
+        // rows `ORDER BY seq ASC` from a table with `PRIMARY KEY (session_id,
+        // seq)`, so sorted-plus-unique (strictly increasing) holds by
+        // construction and would never catch a real regression. A
+        // contiguity check (every index's `seq` equals its position) does
+        // catch a real defect class instead: an append that mints a `seq` it
+        // never actually commits, or a dropped/duplicated append. Seq is
+        // 0-based per session (`EventWriter`'s own `COALESCE(MAX(seq), -1) +
+        // 1`), so index `i`'s event must carry `seq == i`.
+        for (i, e) in events.iter().enumerate() {
+            assert_eq!(
+                e.seq, i as u64,
+                "the session log must be contiguous with no gaps or duplicates: event at \
+                 index {i} has seq {}",
+                e.seq
             );
         }
 
@@ -2108,6 +2178,12 @@ mod delta_streaming_e2e {
         assert_deltas_sit_between_started_and_terminal(&events, infer1);
         assert_deltas_sit_between_started_and_terminal(&events, infer2);
         assert_deltas_sit_between_started_and_terminal(&events, shell_task);
+        assert!(
+            progress_count(&events, shell_task) > 0,
+            "the shell task must have produced at least one TaskProgress event — \
+             record_task_progress needs a real production caller, which this lane exists to \
+             prove"
+        );
 
         let infer1_text = concat_text_deltas(&events, infer1);
         assert_eq!(

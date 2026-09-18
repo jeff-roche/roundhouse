@@ -251,10 +251,10 @@ pub async fn resources_with_ctx(
 
 /// The shared body of [`real_resources`]/[`resources_with_isolate`]/
 /// [`resources_with_provider`] — the two axes those callers vary (which
-/// `Isolate`, which `Provider`) in one place, with the [`RequestCtx`] pinned
-/// to [`resources_with_ctx`]'s hard-coded default (`NoopTransport`), so the
-/// other `DaemonResources::new` arguments are constructed identically for
-/// all of them.
+/// `Isolate`, which `Provider`) in one place, calling [`resources_with_ctx`]
+/// with this function's own hard-coded default [`RequestCtx`]
+/// (`NoopTransport`), so the other `DaemonResources::new` arguments are
+/// constructed identically for all of them.
 pub async fn resources_with(
     dir: &Path,
     isolate: Arc<dyn Isolate>,
