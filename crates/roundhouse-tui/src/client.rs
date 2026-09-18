@@ -107,6 +107,19 @@ pub struct DaemonClient {
     /// `SessionCreated` handshake frame, and set immediately by
     /// [`connect_attach`], which already knew it from its caller.
     session_id: Option<SessionId>,
+    /// Set once a [`Self::recv`] call may have been dropped mid-read (Phase
+    /// 8, T19a Task 8) — currently only [`Self::close_session`]'s
+    /// `tokio::time::timeout`, which cancels its own `recv` loop on elapse.
+    /// `recv`'s own doc comment explains why that is not cancel-safe: a
+    /// dropped `read_until` can have already consumed bytes off the
+    /// underlying `BufReader` into a local buffer that is then discarded,
+    /// permanently losing them without ever un-consuming them from
+    /// `self.reader`. Once set, `recv` refuses to read again rather than let
+    /// a caller silently decode whatever bytes happen to follow as a
+    /// spurious `TuiError::Json` (or worse, a well-formed but wrong frame).
+    /// There is no way to clear it: a client in this state must be
+    /// discarded, not reused.
+    read_desynchronized: bool,
 }
 
 /// Connect to the daemon's Unix socket at `socket_path`, then immediately
@@ -125,6 +138,7 @@ pub async fn connect(socket_path: &Path, intent: ConnectIntent) -> Result<Daemon
         reader: BufReader::new(read_half),
         writer: write_half,
         session_id: None,
+        read_desynchronized: false,
     };
     client.send(&intent.into()).await?;
     Ok(client)
@@ -274,6 +288,14 @@ impl DaemonClient {
     /// connection open, so a refusal is observed here as a timeout, never as
     /// a distinct error naming the reason.
     ///
+    /// **A `TimedOut` error means this client must be discarded, not
+    /// retried.** The internal wait loop above cancels a `Self::recv` call
+    /// on timeout, which is not cancel-safe (see `recv`'s own doc comment);
+    /// this method marks the client unusable when that happens, so every
+    /// later call to [`Self::recv`] fails immediately with `ErrorKind::Other`
+    /// rather than risk decoding a truncated frame as a spurious
+    /// `TuiError::Json`, or worse, a well-formed but wrong one.
+    ///
     /// # Panics
     /// Panics under the same condition [`Self::session_id`] does: this
     /// client must have been created via [`connect_create`]/[`connect_attach`].
@@ -297,14 +319,22 @@ impl DaemonClient {
         };
         match tokio::time::timeout(CLOSE_SESSION_ACK_TIMEOUT, wait).await {
             Ok(result) => result,
-            Err(_elapsed) => Err(TuiError::Io(std::io::Error::new(
-                std::io::ErrorKind::TimedOut,
-                format!(
-                    "no Ack for CloseSession within {CLOSE_SESSION_ACK_TIMEOUT:?}; the daemon \
-                     may be silently refusing it (wrong connection, wrong session, or the \
-                     session is no longer live)"
-                ),
-            ))),
+            Err(_elapsed) => {
+                // The `wait` future above was dropped mid-`recv`, which may
+                // have already consumed (and now lost) bytes off the wire —
+                // see `read_desynchronized`'s own doc comment. Mark this
+                // client unusable rather than let a caller reuse it.
+                self.read_desynchronized = true;
+                Err(TuiError::Io(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    format!(
+                        "no Ack for CloseSession within {CLOSE_SESSION_ACK_TIMEOUT:?}; the \
+                         daemon may be silently refusing it (wrong connection, wrong session, or \
+                         the session is no longer live); this client must be discarded, not \
+                         reused"
+                    ),
+                )))
+            }
         }
     }
 
@@ -337,13 +367,31 @@ impl DaemonClient {
     /// `&mut self.reader`, not `self.reader` itself, so the next call starts
     /// from wherever this one left off, exactly as `read_line` already did.
     ///
+    /// # Cancel safety
+    /// Not cancel-safe: dropping this call's `Future` before it resolves can
+    /// lose bytes already pulled off `self.reader`'s underlying socket into
+    /// this call's own local buffer, desynchronizing this reader from the
+    /// wire with no way to recover the lost bytes. [`Self::close_session`] is
+    /// the one caller in this crate that cancels a `recv` on timeout, and it
+    /// marks the client unusable (`read_desynchronized`) when it does —
+    /// any other caller wrapping this in its own `tokio::time::timeout` (or
+    /// a `select!` branch) must do the same, or simply discard the client on
+    /// cancellation rather than call `recv` again.
+    ///
     /// # Returns
     /// - `Ok(Some(event))` if a complete message was read and parsed.
     /// - `Ok(None)` if EOF was reached (the connection closed gracefully)
     ///   before any bytes of a new frame arrived.
     /// - `Err(TuiError)` if I/O fails, the frame exceeds [`MAX_FRAME_BYTES`]
-    ///   with no `\n` found, or JSON is malformed.
+    ///   with no `\n` found, JSON is malformed, or this client was already
+    ///   marked `read_desynchronized` by an earlier cancelled `recv`.
     pub async fn recv(&mut self) -> Result<Option<ClientEvent>, TuiError> {
+        if self.read_desynchronized {
+            return Err(TuiError::Io(std::io::Error::other(
+                "this DaemonClient's reader may be desynchronized after a previous cancelled \
+                 recv (see close_session's doc comment); it must be discarded rather than reused",
+            )));
+        }
         let mut buf = Vec::new();
         // `MAX_FRAME_BYTES + 1`: reading exactly one byte past the cap is
         // what lets this method tell "a line that is exactly at the cap,

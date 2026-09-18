@@ -121,18 +121,37 @@ const SUBMIT_TURN_SYSTEM_PROMPT: &str =
     "You are Roundhouse, a careful coding agent. Use the provided tools when they help.";
 
 /// Bounds one `CloseSession` request's spawned `SessionActor::close` call
-/// (Phase 8, T19a Task 8, fix round 1) — the first client-triggered caller
-/// of that method. `SessionActor::close`'s own doc comment is explicit that
-/// its `wait_idle` step has no timeout of its own and that "a caller that
-/// needs a bound on how long it will wait must apply its own
+/// (Phase 8, T19a Task 8) — the first client-triggered caller of that
+/// method. `SessionActor::close`'s own doc comment is explicit that its
+/// `wait_idle` step has no timeout of its own and that "a caller that needs
+/// a bound on how long it will wait must apply its own
 /// `tokio::time::timeout` around the whole `close` call." Without this, one
 /// `WorkGuard` that outlives cancellation (an uninterruptible tool
 /// subprocess, or a future guard leak) means `wait_idle` never resolves:
 /// `close_task` (see `drive_established_session`) latches `Some` forever, no
-/// Ack is ever sent, the loop never breaks, the actor never reaches
-/// `Closed`, and `spawn_session_reaper` never fires — the isolate, MCP
-/// children, registry entry, and proxy token are retained for the daemon's
-/// whole remaining life with no route left to reclaim them.
+/// Ack is ever sent, and this connection hangs indefinitely.
+///
+/// **What elapsing here actually fixes, and what it does not.** This
+/// timeout only unlatches the CONNECTION side: it lets `close_task` resolve
+/// (to a failed close) so this loop can move on and report an error rather
+/// than hang forever. It does **not** close the underlying resource leak —
+/// dropping `SessionActor::close`'s future mid-flight abandons whatever step
+/// it was on without running the rest: if it was still waiting on `wait_idle`
+/// (step 4), the actor never reaches `Closed`, `spawn_session_reaper` never
+/// fires, and the isolate, MCP children, registry entry, and proxy token are
+/// retained for the daemon's whole remaining life with no route left to
+/// reclaim them. If it was instead inside step 5's cascade
+/// (`sub_agent_host().close_children`) — which every socket-created session
+/// has, since `drive_session`'s `CreateSession` branch always calls
+/// `wire_sub_agent_host` — the drop can additionally strand a descendant
+/// `close_children` had already `take`n out of `SubAgentSessions` with its
+/// reaper already aborted, exactly the "genuine, permanent leak of that one
+/// session" `session_manager`'s `SESSION_CLOSE_TIMEOUT` documents at length
+/// for the identical cascade shape. Either way the session itself is left
+/// stuck in `Cancelling` forever, not "closed" and not "still running":
+/// `admit_task` refuses everything against a `Cancelling` session except a
+/// trusted System finally step, so a client that retries `CloseSession`
+/// after this timeout gets the same outcome, not a fresh chance to succeed.
 ///
 /// A distinct constant from `session_manager`'s own `SESSION_CLOSE_TIMEOUT`
 /// (private to that module, so not reusable here directly) rather than a
@@ -141,11 +160,18 @@ const SUBMIT_TURN_SYSTEM_PROMPT: &str =
 /// call's own cancellation sequence has room to unwind normally, short
 /// enough that a genuinely wedged close does not leave this connection
 /// hanging indefinitely. Unlike `HeadlessSession::close_and_teardown`, an
-/// elapsed timeout here does **not** force a teardown: it only reports the
-/// close as failed (see the spawn site below), so `close_task` resets to
-/// `None` and this connection's client can retry, or simply keep the
-/// session running.
-const CLOSE_SESSION_TIMEOUT: Duration = Duration::from_secs(30);
+/// elapsed timeout here does **not** force a teardown of its own — it only
+/// reports the close as failed (see the spawn site below) and resets
+/// `close_task` to `None` so this connection can report the error and move
+/// on, not because the underlying close attempt was actually abandoned
+/// cleanly.
+///
+/// `pub` and `#[doc(hidden)]` for the same reason [`AcceptLimits`] is: a
+/// test seam, not a public API. `roundhouse-daemon`'s own integration tests
+/// (an external crate, like any other `tests/*.rs` file) need this exact
+/// value to drive `tokio::time::advance` past it deterministically.
+#[doc(hidden)]
+pub const CLOSE_SESSION_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Default ceiling on concurrent accepted connections one `accept_loop` will
 /// serve at once (security review Important 3 / ruling W1-R33). Bounds the
@@ -1298,10 +1324,10 @@ pub async fn drive_session(
         }
         // # Attach is authenticated, not authorized (security review
         // Important 5 / ruling W1-R35 — escalated to the operator, not a
-        // Task 3 defect) — the frozen design
-        // (`docs/architecture/03-security-and-sandboxing.md:174`) intends
-        // approvals to broadcast to every attached client, "first responder
-        // wins". `registry.attach(session_id)` is a bare, unauthenticated
+        // Task 3 defect) — the frozen design (`docs/architecture/03-security-
+        // and-sandboxing.md` §6.4 "Approvals") intends approvals to
+        // broadcast to every attached client, "first responder wins".
+        // `registry.attach(session_id)` is a bare, unauthenticated
         // map lookup: any local peer that learns a `SessionId` (a UUIDv4, so
         // not enumerable, but not secret either — `main.rs` logs it, and the
         // unredacted event stream that follows is not access-controlled
@@ -1619,13 +1645,13 @@ pub async fn drive_established_session(
                     // are handshake-only (matched above, as this
                     // connection's FIRST frame), and `is_creator` — decided
                     // once, there — is what every check below actually
-                    // gates: `docs/architecture/03-security-and-sandboxing.md:174`
-                    // ("approvals broadcast to every attached client, first
-                    // responder wins") governs what an attached client may
-                    // SEE, not what it may SEND, and defaulting the latter
-                    // open would make unauthenticated `Attach` an
-                    // approval-hijack primitive. Only the creating
-                    // connection's requests are ever honored.
+                    // gates: `docs/architecture/03-security-and-sandboxing.md`
+                    // §6.4 "Approvals" ("approvals broadcast to every
+                    // attached client, first responder wins") governs what an
+                    // attached client may SEE, not what it may SEND, and
+                    // defaulting the latter open would make unauthenticated
+                    // `Attach` an approval-hijack primitive. Only the
+                    // creating connection's requests are ever honored.
                     //
                     // **Known, deliberate limitation (W1-R52):** once the
                     // creating connection disconnects, this session has NO
@@ -1702,7 +1728,7 @@ pub async fn drive_established_session(
                                 "refusing SubmitTurn: a turn is already in flight on this \
                                  connection"
                             );
-                        } else if close_task.is_some() {
+                        } else if close_task.is_some() || close_ack_pending {
                             // A `CloseSession` this connection already
                             // spawned samples its outcome
                             // (`Completed`/`Cancelled`) from `turn_in_flight`/
@@ -1716,6 +1742,12 @@ pub async fn drive_established_session(
                             // from under it. Refusing here, honestly, at the
                             // boundary, is simpler and cheaper than trying to
                             // re-open that already-durable outcome decision.
+                            // `close_task.is_some()` alone would miss the
+                            // window after that close succeeds but before
+                            // its Ack has actually been reserved and sent
+                            // (`close_ack_pending`) — this connection is
+                            // already committed to ending during that
+                            // window too.
                             tracing::warn!(
                                 %session_id,
                                 "refusing SubmitTurn: a CloseSession is already in flight on \
@@ -1765,14 +1797,17 @@ pub async fn drive_established_session(
                     // creator-only/named-session refusal shape as
                     // `SubmitTurn` above, plus one refusal `SubmitTurn` has
                     // no analogue for: a second `CloseSession` arriving
-                    // while the first is still closing is refused outright
-                    // rather than queued — a successful close ends this
-                    // connection anyway, so there is nothing left for a
-                    // second one to do, and refusing it keeps this arm's
-                    // own work O(1) the same way `turn_in_flight` already
-                    // does for `SubmitTurn`. A client that wants to retry a
-                    // *failed* close (`close_task` already reset to `None`)
-                    // may send another one.
+                    // while the first is still closing (or has succeeded but
+                    // its Ack has not yet been sent — see
+                    // `close_task.is_some() || close_ack_pending` below) is
+                    // refused outright rather than queued — a successful
+                    // close ends this connection anyway, so there is nothing
+                    // left for a second one to do, and refusing it keeps
+                    // this arm's own work O(1) the same way `turn_in_flight`
+                    // already does for `SubmitTurn`. A client that wants to
+                    // retry a *failed* close (`close_task` reset to `None`
+                    // and `close_ack_pending` still `false`) may send
+                    // another one.
                     Some(ClientRequest::CloseSession { session_id: named }) => {
                         if !is_creator {
                             // W1-R37, the same read-only guard `SubmitTurn`
@@ -1789,7 +1824,15 @@ pub async fn drive_established_session(
                                 "refusing CloseSession naming a session other than the one \
                                  this connection established"
                             );
-                        } else if close_task.is_some() {
+                        } else if close_task.is_some() || close_ack_pending {
+                            // `close_task.is_some()` alone would miss the
+                            // window after a close has succeeded but before
+                            // its Ack permit has actually been reserved and
+                            // sent (see the `close_ack_pending` arm above) —
+                            // during that window `close_task` is already
+                            // `None`, but this connection is still
+                            // committed to ending on the pending Ack, not to
+                            // starting a second close.
                             tracing::warn!(
                                 %session_id,
                                 "refusing CloseSession: a close is already in flight on this \
@@ -1848,11 +1891,14 @@ pub async fn drive_established_session(
                                         // what keep that off the connection's
                                         // critical path.
                                         //
-                                        // Bounded by `CLOSE_SESSION_TIMEOUT` —
-                                        // see that constant's own doc comment for why
-                                        // an unbounded call here is a
-                                        // permanent-leak hazard, not merely a
-                                        // slow one.
+                                        // Bounded by `CLOSE_SESSION_TIMEOUT` so
+                                        // an unbounded call here cannot hang
+                                        // this connection forever — see that
+                                        // constant's own doc comment for what
+                                        // this bound does and does not fix: it
+                                        // unlatches this connection, it does
+                                        // not close the resource leak an
+                                        // elapsed timeout leaves behind.
                                         match tokio::time::timeout(
                                             CLOSE_SESSION_TIMEOUT,
                                             actor.close(outcome),
@@ -1882,9 +1928,11 @@ pub async fn drive_established_session(
                                                     %session_id,
                                                     timeout = ?CLOSE_SESSION_TIMEOUT,
                                                     "CloseSession did not durably append within \
-                                                     the timeout; leaving the session running \
-                                                     rather than forcing a teardown, the \
-                                                     connection stays open and no Ack is sent"
+                                                     the timeout; this does not force a \
+                                                     teardown, so the session is left stuck in \
+                                                     Cancelling rather than either closed or \
+                                                     running, the connection stays open and no \
+                                                     Ack is sent"
                                                 );
                                                 false
                                             }
