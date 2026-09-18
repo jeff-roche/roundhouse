@@ -95,8 +95,9 @@ pub(crate) use bounded::{BoundedPageSource, ConnectionRefusal, StoreConnection};
 /// only use of `roundhouse_proto` in the crate and `xtask/tests/
 /// exit_criterion.rs` asserts a required `roundhouse-web -> roundhouse-proto`
 /// Cargo edge. **That prediction is now fulfilled and the note is relaxed:**
-/// `sse::SessionUpdate` carries a `roundhouse_proto::ClientEvent` as the
-/// payload of every SSE frame, so the dependency is load-bearing on its own.
+/// `sse::encode` wraps every `roundhouse_store::StoredEvent` it streams in a
+/// `roundhouse_proto::ClientEvent::TaskEvent` before serialising it as an SSE
+/// frame's `data:` field, so the dependency is load-bearing on its own.
 /// This function stays because clients need to negotiate a wire version, not
 /// because deleting it would break a test.
 pub fn api_version() -> roundhouse_proto::ApiVersion {
