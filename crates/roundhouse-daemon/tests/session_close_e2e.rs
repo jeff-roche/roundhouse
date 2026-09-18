@@ -622,8 +622,9 @@ async fn a_creator_closing_after_a_completed_turn_durably_closes_and_reaps_the_s
 /// on an ordinary dev host, which is a real fixture-path gap but not this
 /// test's own problem to fix; a fixture wired to the real binary does exist,
 /// `roundhouse_daemon::test_support::available_isolate_with_real_bwrap`, but
-/// it is `pub(crate)` — invisible to `tests/`, which lives in a separate
-/// crate). It genuinely cannot work for what this test checks, for a more
+/// its enclosing `test_support` module is `#[cfg(test)]` — it does not exist
+/// at all in the library `tests/` links against, `pub(crate)` or not).
+/// It genuinely cannot work for what this test checks, for a more
 /// structural reason than that path gap: `bwrap` unshares the PID namespace
 /// (`--unshare-all`, per `bwrap.rs`'s `spawn_under_bwrap`), so the `$!` the
 /// script records is a namespace-relative pid (observed: `3`) with no path
@@ -636,11 +637,19 @@ async fn a_creator_closing_after_a_completed_turn_durably_closes_and_reaps_the_s
 /// thin decorator over the real isolate could have captured that one.) More
 /// fundamentally, this pid-namespace behavior means a real-bwrap run could
 /// never have distinguished a process-group kill from a single-pid kill
-/// anyway: the sandboxed script is namespace pid 1, and `--die-with-parent`
-/// plus the kernel's own PID-namespace teardown kills every process inside
-/// the namespace the moment that pid 1 dies — which is exactly the
-/// property (b) exists to isolate and prove is `Child::cancel`'s own doing,
-/// not a namespace side effect. So this test exercises the real
+/// anyway: without `--as-pid-1` (never passed by `spawn_under_bwrap`), bwrap
+/// installs itself as the new namespace's own pid 1 (a reaper), with the
+/// sandboxed script running underneath it as an ordinary descendant, not as
+/// it — consistent with the observed `$! == 3` (namespace pid 1 is bwrap's
+/// reaper, 2 is the script, 3 is the backgrounded `sleep`). `--die-with-parent`
+/// kills that whole chain once bwrap's own host-visible process dies
+/// (confirmed by hand: `kill -9` on that host pid tears down the entire
+/// namespace tree only when `--die-with-parent` is passed; without it, the
+/// tree survives, reparented). So a single-pid kill of the direct child
+/// (the host-visible `bwrap` process itself) would have looked identical to
+/// `Child::cancel`'s real group-wide kill — which is exactly the property
+/// (b) exists to isolate and prove is `Child::cancel`'s own doing, not a
+/// namespace side effect. So this test exercises the real
 /// `Child::cancel` group-signal (`signal_group`) and its
 /// `wait_for_empty_group` confirmation over a BARE spawned process
 /// (`TestIsolate`, copied from `roundhouse-engine`'s own
