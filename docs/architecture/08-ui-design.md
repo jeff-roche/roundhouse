@@ -131,6 +131,21 @@ LAN (over the internet, via a reverse proxy) is explicitly not this — that's t
 remote auth" tier this decision deliberately defers, and it should be revisited only if
 real demand for it shows up.
 
+**Amendment (Phase 8 Task 21, "publish committed events"):** the ring buffer above is
+retired; there is no in-memory replay copy of anything. Both transports serve replay
+straight from the store, by `seq`: a `roundhouse_store::SessionFollower` catches up from
+`events_after`/`session_head`, then waits on a `CommitFeed` — notified after every
+committed append, shared by every commit path in the daemon — for the next commit before
+re-reading. Because the store keeps every committed event forever, `resync_required` is
+now sent only when the client's cursor is invalid (its seq is ahead of the session's
+head), never merely because a subscriber fell behind. SSE keeps the same wire shape
+(`resume_from`/`oldest_retained`, still both numbers) so the shipped frontend bundle
+needs no rebuild — `oldest_retained` is repurposed to mean head+1, the next seq the
+store could actually serve. The TUI's Unix-socket connection follows the identical
+store-backed path and speaks the new `Resume` (request) and `Committed` (one committed
+event) wire variants (`roundhouse-proto`) instead of a hand-rolled replay: one resync
+contract, still two transports.
+
 ### 11.4 The hard interaction moments
 
 - **Batch approval.** The daemon computes a **decision signature** (tool + normalized

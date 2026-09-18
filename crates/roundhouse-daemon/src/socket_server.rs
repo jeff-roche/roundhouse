@@ -875,9 +875,11 @@ pub async fn accept_loop(
 /// fix it) and threads `limits.handshake_timeout` into [`drive_session`] to
 /// bound that first read. `SessionRegistry`'s own `max_sessions` and
 /// `max_subscribers_per_session` caps close the remaining two gaps the
-/// review named (unbounded sessions, and an unbounded per-event amplifier:
-/// then the registry's per-subscriber clone, since Phase 8 Task 21 one store
-/// follower per subscriber).
+/// review named: unbounded sessions, and an unbounded per-event amplifier.
+/// That amplifier used to be `SessionRegistry::publish`'s per-subscriber
+/// clone; since Phase 8 Task 21 each subscriber instead owns one
+/// store-backed `SessionFollower` (`roundhouse_store::follow`), so
+/// `max_subscribers_per_session` now bounds the follower count directly.
 ///
 /// # Errors
 /// Returns immediately if `expected_uid` is `Err` — this process's own uid
