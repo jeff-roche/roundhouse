@@ -3,27 +3,23 @@
 //! Unix socket, a real `accept_loop`, a real `create_real_session`, and
 //! `roundhouse_tui::DaemonClient::close_session` — exactly the shape
 //! `submit_turn_e2e.rs` already uses for the open half. The `Daemon`
-//! fixture, `wait_for_event`, and `ScriptedText/ToolCallProvider` below are
-//! copied from that file rather than shared: `tests/*.rs` files are each
-//! their own crate, and only `tests/common` is actually shared code.
+//! fixture and `ScriptedText/ToolCallProvider` below are copied from that
+//! file rather than shared: `tests/*.rs` files are each their own crate,
+//! and only `tests/common` is actually shared code.
 //!
 //! - `a_creator_closing_after_a_completed_turn_...`: (a-close) — a plain
 //!   text turn runs to completion, the creator closes, and the durable log,
 //!   the `tasks` view, and the daemon's own bookkeeping (registry entry,
-//!   egress-proxy token) all agree the session is gone.
+//!   egress-proxy token) all agree the session is gone. Uses the daemon's
+//!   real `BwrapLandlockIsolate` (via `start_daemon` ->
+//!   `common::resources_with_provider_and_rules`), since it never actually
+//!   dispatches a shell command.
 //! - `closing_while_a_shell_is_in_flight_...`: (b) — a real, in-flight shell
 //!   process is killed by the close, and the sweep's `TaskCancelled`
 //!   durably precedes the `SessionClosed{Cancelled}` terminator, which nothing
-//!   follows.
-//!
-//! Neither test uses the daemon's real `BwrapLandlockIsolate`: (b) needs a
-//! real OS process to kill, not real bwrap/Landlock sandboxing around it, and
-//! `roundhouse-engine`'s own test suite already draws that same line (see
-//! `agent_loop_dispatch.rs`'s `TestIsolate` doc comment — "the dedicated
-//! hard-prerequisite suite owns real bwrap/Landlock coverage; keeping this
-//! fixture host-independent prevents ordinary engine tests from failing on
-//! CI hosts that do not install bwrap"). `TestIsolate` below is that same
-//! fixture, copied for the identical reason.
+//!   follows. Uses a local `TestIsolate` rather than the real isolate — see
+//!   that test's own doc comment for why a real bwrap-wrapped attempt was
+//!   tried first and could not work for what this test checks.
 //!
 //! The break-it check (removing `SessionActor::close`'s own
 //! `writer.close_session` call, confirming (a-close) and
@@ -223,42 +219,22 @@ impl Provider for ScriptedSingleShellCallProvider {
     }
 }
 
-/// Polls this session's real, on-disk event log until `pred` matches one of
-/// its events, or the bound elapses. Copied from `submit_turn_e2e.rs`.
-async fn wait_for_event(
-    db_path: &std::path::Path,
-    session_id: SessionId,
-    what: &str,
-    pred: impl Fn(&EventPayload) -> bool,
-) -> Vec<StoredEvent> {
-    let deadline = std::time::Instant::now() + Duration::from_secs(20);
-    loop {
-        let store = open(db_path).await.unwrap();
-        let events = session_events(&store, session_id).await.unwrap();
-        if events.iter().any(|e| pred(&e.payload)) {
-            return events;
-        }
-        assert!(
-            std::time::Instant::now() < deadline,
-            "timed out waiting for {what} in session {session_id}'s event log; \
-             saw {} events",
-            events.len()
-        );
-        tokio::time::sleep(Duration::from_millis(25)).await;
-    }
-}
-
 /// Polls this session's own durable event log until a `TaskCreated { kind,
 /// .. }` matching `kind` has a corresponding `TaskStarted` for the SAME task
-/// id, then returns that task id. Adapted from `agent_loop_dispatch.rs`'s
-/// `wait_for_task_started` (same non-sleep-signal shape), returning the task
-/// id rather than discarding it: (b) needs it afterward to find that exact
-/// task's own `TaskCancelled` event, not just any `TaskCancelled` in the
-/// swept log.
-async fn wait_for_task_started(
+/// id, then waits for `matches_target` to hold for some event bearing that
+/// SAME task id, returning the task id once it does. Adapted from
+/// `agent_loop_dispatch.rs`'s `wait_for_task_started` (same non-sleep-signal
+/// shape: correlating on the specific task id this kind minted, not just
+/// "any event of the right shape anywhere in the log," matters whenever a
+/// session runs more than one task of different kinds concurrently — a
+/// `chat`/`infer` pair alongside a dispatched tool call, in every case this
+/// file uses it for).
+async fn wait_for_correlated_task_event(
     db_path: &std::path::Path,
     session_id: SessionId,
     kind: TaskKind,
+    what: &str,
+    matches_target: impl Fn(&EventPayload) -> bool,
 ) -> roundhouse_core::TaskId {
     let store = open(db_path).await.unwrap();
     let deadline = std::time::Instant::now() + Duration::from_secs(20);
@@ -269,20 +245,51 @@ async fn wait_for_task_started(
             _ => None,
         });
         if let Some(task_id) = target_task_id {
-            if events.iter().any(|e| {
-                e.task_id == Some(task_id) && matches!(&e.payload, EventPayload::TaskStarted { .. })
-            }) {
+            if events
+                .iter()
+                .any(|e| e.task_id == Some(task_id) && matches_target(&e.payload))
+            {
                 return task_id;
             }
         }
         assert!(
             std::time::Instant::now() < deadline,
-            "timed out waiting for a {kind:?} TaskStarted in session {session_id}'s event log; \
+            "timed out waiting for a {kind:?} {what} in session {session_id}'s event log; \
              saw {:?}",
             events.iter().map(|e| &e.payload).collect::<Vec<_>>()
         );
         tokio::task::yield_now().await;
     }
+}
+
+/// [`wait_for_correlated_task_event`], waiting for the `kind` task's own
+/// `TaskStarted`.
+async fn wait_for_task_started(
+    db_path: &std::path::Path,
+    session_id: SessionId,
+    kind: TaskKind,
+) -> roundhouse_core::TaskId {
+    wait_for_correlated_task_event(db_path, session_id, kind, "TaskStarted", |p| {
+        matches!(p, EventPayload::TaskStarted { .. })
+    })
+    .await
+}
+
+/// [`wait_for_correlated_task_event`], waiting for the `kind` task's own
+/// `TaskCompleted` — needed because `chat.rs`'s `run_chat_turn` appends an
+/// `infer` task's completion and the `chat` task's own completion as two
+/// separate durable events; waiting on "any `TaskCompleted`" risks observing
+/// the `infer` task's and closing mid-turn, before the `chat` task (and the
+/// turn as a whole) has actually finished.
+async fn wait_for_task_completed(
+    db_path: &std::path::Path,
+    session_id: SessionId,
+    kind: TaskKind,
+) -> roundhouse_core::TaskId {
+    wait_for_correlated_task_event(db_path, session_id, kind, "TaskCompleted", |p| {
+        matches!(p, EventPayload::TaskCompleted { .. })
+    })
+    .await
 }
 
 /// Fixture: a live daemon over a real socket, driven by `provider`. Copied
@@ -295,44 +302,19 @@ struct Daemon {
     resources: Arc<roundhouse_daemon::session_bootstrap::DaemonResources>,
 }
 
+/// A daemon fixture in the default workspace, driven by `provider`, with no
+/// operator policy rules — good enough for (a-close), which never dispatches
+/// a tool call that would need one. (b) needs its own workspace root and an
+/// `Allow` rule for its script, so it uses
+/// [`start_daemon_with_isolate_rules_at_root`] directly instead.
 async fn start_daemon(provider: Arc<dyn Provider>) -> Daemon {
-    start_daemon_with_rules(provider, no_policy_rules()).await
-}
-
-async fn start_daemon_with_rules(
-    provider: Arc<dyn Provider>,
-    policy_rules: PolicyRuleSource,
-) -> Daemon {
-    start_daemon_with_rules_at_root(provider, policy_rules, None, None).await
-}
-
-async fn start_daemon_with_rules_at_root(
-    provider: Arc<dyn Provider>,
-    policy_rules: PolicyRuleSource,
-    workspace_name: Option<&str>,
-    workspace_root: Option<&std::path::Path>,
-) -> Daemon {
     let dir = tempfile::tempdir().unwrap();
     let socket_path = dir.path().join("round.sock");
     let db_path = dir.path().join("events.db");
     let registry = Arc::new(roundhouse_daemon::session_registry::SessionRegistry::new());
     let listener = roundhouse_daemon::socket_server::bind_socket(&socket_path).unwrap();
     let resources =
-        common::resources_with_provider_and_rules(dir.path(), provider, policy_rules).await;
-    if let (Some(name), Some(root)) = (workspace_name, workspace_root) {
-        resources
-            .workspace_registry
-            .as_ref()
-            .unwrap()
-            .register(
-                roundhouse_daemon::workspace_registry::WorkspaceRegistration::new(
-                    name,
-                    root.to_path_buf(),
-                ),
-            )
-            .await
-            .unwrap();
-    }
+        common::resources_with_provider_and_rules(dir.path(), provider, no_policy_rules()).await;
     tokio::spawn(roundhouse_daemon::socket_server::accept_loop(
         listener,
         Arc::clone(&registry),
@@ -413,9 +395,11 @@ struct TasksRow {
 }
 
 async fn fetch_tasks_row(db_path: &std::path::Path, task_id: roundhouse_core::TaskId) -> TasksRow {
+    use rusqlite::OptionalExtension;
+
     let store = open(db_path).await.unwrap();
     let task_id_str = task_id.to_string();
-    store
+    let row = store
         .pool
         .get()
         .await
@@ -431,10 +415,18 @@ async fn fetch_tasks_row(db_path: &std::path::Path, task_id: roundhouse_core::Ta
                     })
                 },
             )
-            .unwrap()
+            .optional()
         })
         .await
         .unwrap()
+        .unwrap();
+    // Named explicitly rather than left to an inner `.unwrap()`: a missing
+    // row inside the `interact` closure would otherwise panic there and
+    // surface as an opaque `InteractError::Panic`, losing which task_id was
+    // actually missing.
+    row.unwrap_or_else(|| {
+        panic!("no `tasks` row for task_id {task_id} — every task_id here came from a TaskCreated")
+    })
 }
 
 /// (a-close): a creator submits an ordinary text turn, waits for it to
@@ -464,20 +456,13 @@ async fn a_creator_closing_after_a_completed_turn_durably_closes_and_reaps_the_s
         .await
         .unwrap();
 
-    wait_for_event(&daemon.db_path, session_id, "a completed chat task", |p| {
-        matches!(
-            p,
-            EventPayload::TaskCreated {
-                kind: TaskKind::Chat,
-                ..
-            }
-        )
-    })
-    .await;
-    wait_for_event(&daemon.db_path, session_id, "a completed chat task", |p| {
-        matches!(p, EventPayload::TaskCompleted { .. })
-    })
-    .await;
+    // Correlated on the `chat` task's own id, not "any `TaskCompleted`" —
+    // `chat.rs`'s `run_chat_turn` durably completes its `infer` task
+    // separately from (and before) the `chat` task itself, and closing in
+    // that window would sweep the still-open `chat` task, turning this
+    // test's own outcome into `Cancelled` for a reason unrelated to what it
+    // means to prove. See `wait_for_task_completed`'s own doc comment.
+    wait_for_task_completed(&daemon.db_path, session_id, TaskKind::Chat).await;
 
     // Captured BEFORE closing: the live actor's own state watch, which the
     // reaper this call's Ack races against will eventually tear the
@@ -488,6 +473,12 @@ async fn a_creator_closing_after_a_completed_turn_durably_closes_and_reaps_the_s
         .actor(session_id)
         .expect("the session must still be registered before it is ever closed");
     let mut state_rx = actor.subscribe();
+
+    // Sanity check on the later `== 0` assertion: this session's own token
+    // really is registered before the close, so that later check proves a
+    // real deregistration happened rather than vacuously observing a count
+    // that started at zero.
+    assert_eq!(daemon.resources.proxy.registered_count(), 1);
 
     creator
         .close_session()
@@ -557,12 +548,26 @@ async fn a_creator_closing_after_a_completed_turn_durably_closes_and_reaps_the_s
         assert_eq!(
             format!("{:?}", folded.kind),
             row.kind,
-            "fold_task's kind must agree with the tasks view for {task_id}"
+            "fold_task's kind must agree with the tasks view for {task_id} — the same rendering \
+             `tasks_view.rs`'s own task_kind_as_sql_str uses to populate this column"
         );
+
+        // The state comparison is anchored to `roundhouse_core::fold_task_state`
+        // (via `TaskState::as_sql_str`), not `fold_task`'s own narrower
+        // `roundhouse_store::TaskState` — `fold_task_state` is the ACTUAL
+        // function `tasks_view.rs::upsert_for_event` calls to populate this
+        // very row, so this is a genuine "the view agrees with what wrote
+        // it" check, not a coincidental match between two independently
+        // named enums whose `Debug` renderings currently happen to agree
+        // (and would silently stop doing so the moment either type's
+        // `Suspended` grew or lost a payload).
+        let payloads: Vec<EventPayload> = task_events.iter().map(|e| e.payload.clone()).collect();
+        let core_state = roundhouse_core::fold_task_state(&payloads)
+            .expect("every task_id came from a TaskCreated");
         assert_eq!(
-            format!("{:?}", folded.state),
+            core_state.as_sql_str(),
             row.state,
-            "fold_task's state must agree with the tasks view for {task_id}"
+            "fold_task_state's state must agree with the tasks view for {task_id}"
         );
     }
 
@@ -593,25 +598,49 @@ async fn a_creator_closing_after_a_completed_turn_durably_closes_and_reaps_the_s
 /// (b): a real, in-flight shell process is killed by a close, and the sweep
 /// durably precedes the terminator.
 ///
-/// The dispatched program is a small shell script rather than `sleep`
-/// directly (mirroring `roundhouse-engine`'s own
-/// `a_session_cancelled_shell_dispatch_is_recorded_as_task_cancelled_not_task_failed`):
-/// `roundhouse-tools`' executor execs `program`/`argv` directly with no
-/// shell in the loop, so writing a pid file needs a real `#!/bin/sh`
-/// interpreter, and this script `exec`s into `sleep` so the pid it records
-/// (its own, before the `exec`) is the one live process this session's
-/// close must kill — i.e. the whole (single-member) process group, not just
-/// a wrapper around it.
+/// The dispatched script backgrounds its own `sleep 30` and records THAT
+/// process's pid (`sleep 30 & echo $! > pidfile; wait`), rather than
+/// recording its own pid and `exec`ing into `sleep` — a degenerate,
+/// single-member group would pass unchanged even for an implementation
+/// that only `kill()`s the direct child, with no process-GROUP semantics
+/// at all. With a real grandchild, the assertion below is only reachable
+/// through `roundhouse-sandbox`'s `Child::cancel`, whose `signal_group`
+/// sends to `-pgid` (the whole group), never the direct child's own pid —
+/// the same shape `roundhouse-engine`'s own
+/// `execute_builtin_shell_is_bounded_even_when_a_backgrounded_grandchild_outlives_the_direct_child`
+/// uses to prove the identical property one layer down.
+///
+/// # Why this uses `TestIsolate`, not the real `BwrapLandlockIsolate`
+///
+/// A real bwrap-wrapped attempt was tried first (`BwrapLandlockIsolate::
+/// test_with_probe_and_bwrap_path`, which looks `bwrap` up on `PATH` rather
+/// than `common::available_isolate()`'s `test_with_probe`, hardcoded to the
+/// production install path `/usr/libexec/roundhouse/bwrap` — not installed
+/// on an ordinary dev host, which is a real fixture-path gap but not this
+/// test's own problem to fix). It genuinely cannot work for what this test
+/// checks: `bwrap` unshares the PID namespace (`--unshare-all`, per
+/// `bwrap.rs`'s `spawn_under_bwrap`), so the `$!` the script records is a
+/// namespace-relative pid (observed: `3`) that names nothing meaningful in
+/// `/proc` on the host this test itself runs on — there is no host-visible
+/// pid this test could poll for liveness at all. So this test exercises the
+/// real `Child::cancel` group-signal (`signal_group`) and its
+/// `wait_for_empty_group` confirmation over a BARE spawned process
+/// (`TestIsolate`, copied from `roundhouse-engine`'s own
+/// `agent_loop_dispatch.rs`); it does not, and structurally cannot from
+/// outside the sandbox, prove that a group-wide kill also reaches a
+/// workload running inside a real bwrap wrapper — that property is
+/// `roundhouse-sandbox`'s own `hard_prerequisites_integration.rs`-shaped
+/// concern, not this lane's.
 #[tokio::test]
 async fn closing_while_a_shell_is_in_flight_kills_it_and_orders_the_sweep_before_the_terminator() {
     let workspace_dir = tempfile::tempdir().unwrap();
     let workspace_root = workspace_dir.path().canonicalize().unwrap();
-    let pid_file = workspace_root.join("shell.pid");
+    let pid_file = workspace_root.join("grandchild.pid");
     let script_path = workspace_root.join("long_running.sh");
     std::fs::write(
         &script_path,
         format!(
-            "#!/bin/sh\necho $$ > {}\nexec sleep 30\n",
+            "#!/bin/sh\nsleep 30 &\necho $! > {}\nwait\n",
             pid_file.display()
         ),
     )
@@ -675,13 +704,14 @@ async fn closing_while_a_shell_is_in_flight_kills_it_and_orders_the_sweep_before
 
     let shell_task_id = wait_for_task_started(&daemon.db_path, session_id, TaskKind::Shell).await;
 
-    // The script only writes its pid AFTER TaskStarted has already been
-    // recorded (`run_shell_dispatch` appends `TaskStarted` once the real
-    // process is spawned, before this script has necessarily reached its
-    // own first line) — poll the pid file itself rather than assume it is
+    // The script only writes the grandchild's pid AFTER TaskStarted has
+    // already been recorded (`run_isolated_shell_dispatch` appends
+    // `TaskStarted` once the real process is spawned, before this script
+    // has necessarily reached its own first line, let alone forked and
+    // reported `$!`) — poll the pid file itself rather than assume it is
     // already there.
-    let shell_pid: i32 = {
-        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let grandchild_pid: i32 = {
+        let deadline = std::time::Instant::now() + Duration::from_secs(15);
         loop {
             if let Ok(contents) = std::fs::read_to_string(&pid_file) {
                 let trimmed = contents.trim();
@@ -691,15 +721,15 @@ async fn closing_while_a_shell_is_in_flight_kills_it_and_orders_the_sweep_before
             }
             assert!(
                 std::time::Instant::now() < deadline,
-                "the shell script never wrote its pid to {}",
+                "the shell script never wrote its backgrounded grandchild's pid to {}",
                 pid_file.display()
             );
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
     };
     assert!(
-        pid_running(shell_pid),
-        "the shell process must be running before this test cancels it"
+        pid_running(grandchild_pid),
+        "the backgrounded grandchild must be running before this test cancels it"
     );
 
     creator
@@ -707,16 +737,36 @@ async fn closing_while_a_shell_is_in_flight_kills_it_and_orders_the_sweep_before
         .await
         .expect("close_session must succeed: the sweep cancels the in-flight shell");
 
-    // By the time close_session's Ack has arrived, `SessionActor::close`'s
-    // own `wait_idle` has already resolved — which only happens once the
-    // shell dispatch's `WorkGuard` has dropped, which only happens after
-    // `roundhouse_tools::cancel_running_shell` has itself already confirmed
-    // the whole process group is dead (`run_shell_dispatch`'s own
-    // `select!`/cancellation path). No poll is needed here.
-    assert!(
-        !pid_running(shell_pid),
-        "the shell's process group must be dead once close_session's Ack has arrived"
-    );
+    // `close_session`'s Ack arriving is not, by itself, proof the grandchild
+    // is dead: `SessionActor::close`'s own doc comment is explicit that
+    // "`wait_idle` resolving is not a promise that every real process has
+    // exited." What DOES guarantee it here is `run_isolated_shell_dispatch`'s
+    // own error mapping — an unconfirmed `Child::cancel` (whose
+    // `signal_group`+`wait_for_empty_group` pair is what actually proves the
+    // whole process GROUP, not just the direct child, is gone) returns
+    // `Err`, which that function turns into `ToolDispatchError::Isolation`,
+    // not `ShellSessionCancelled` — so the `TaskCancelled{System,
+    // SessionClosed}` assertion further below could not hold at all unless
+    // the group-wide kill had already been confirmed. The poll here is only
+    // for the grandchild's OWN reaping (asynchronous, by whatever process
+    // subreaped it once its direct parent exited), which the confirmed
+    // group-kill does not itself wait out — `pid_running` already treats a
+    // zombie as dead, matching `roundhouse-engine`'s own
+    // `pid_is_dead_or_zombie`.
+    {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if !pid_running(grandchild_pid) {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the backgrounded grandchild (pid {grandchild_pid}) must be confirmed dead \
+                 once close_session's Ack has arrived"
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    }
 
     let store = open(&daemon.db_path).await.unwrap();
     let events = session_events(&store, session_id).await.unwrap();

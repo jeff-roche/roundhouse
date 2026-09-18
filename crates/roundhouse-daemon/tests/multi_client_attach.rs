@@ -356,13 +356,16 @@ async fn wait_for_event(
 /// creator-only guard, Task 8); a plain socket drop just runs
 /// `SessionRegistry::detach`, which touches only the subscriber list.
 ///
-/// Rather than sleep-then-assert to let the daemon notice the drop, this
-/// settles on a real signal: the creator submits an ordinary turn and waits
-/// for it to complete. That drives the runtime through however much
-/// scheduling the dropped viewer's own connection task needed to run its
-/// `detach` cleanup, and it also proves the session is genuinely still alive
-/// and undisturbed afterward — not merely "no assertion has failed yet
-/// because nothing has happened."
+/// Rather than sleep-then-assert, this settles on a real signal: the creator
+/// submits an ordinary turn and waits for it to complete. That does NOT
+/// prove the dropped viewer's own connection task has actually reached
+/// `detach` — `SessionRegistry` exposes no subscriber count or other cheap
+/// signal this test could poll for that specifically, so there is no direct
+/// way to observe it here. What it does prove is the assertion's own
+/// precondition: this session is genuinely still alive and processing real
+/// work after the drop, which is what makes "no `SessionClosed` was written"
+/// a meaningful negative rather than one that would hold just as well on an
+/// already-dead connection.
 #[tokio::test]
 async fn a_viewer_disconnecting_writes_no_session_closed() {
     let dir = tempfile::tempdir().unwrap();

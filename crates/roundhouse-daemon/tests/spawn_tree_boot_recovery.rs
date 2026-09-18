@@ -115,6 +115,16 @@ async fn boot_recovery_rebuilds_the_daemons_spawn_tree_from_the_store() {
     assert_eq!(tree.direct_children(parent), 1);
 }
 
+fn allow_agent_rules() -> PolicyRuleSource {
+    Arc::new(|| {
+        vec![CompiledRule::test_new(
+            Scope::Project,
+            Outcome::Allow,
+            Predicate::agent(None, None, Tier::None),
+        )]
+    })
+}
+
 /// Phase 8, T19a Task 9 (plan item (d)): unlike the hand-written events
 /// above, this drives the real production close path — `SessionActor::close`
 /// (this lane's own Task 4/7) cascading through `DaemonSubAgentHost::
@@ -128,16 +138,14 @@ async fn boot_recovery_rebuilds_the_daemons_spawn_tree_from_the_store() {
 /// retire_child`, never through a parent's own close): here the PARENT is
 /// what gets closed, and the child's own `SessionClosed` is a side effect of
 /// that close cascading down, not of anything called on the child directly.
-fn allow_agent_rules() -> PolicyRuleSource {
-    Arc::new(|| {
-        vec![CompiledRule::test_new(
-            Scope::Project,
-            Outcome::Allow,
-            Predicate::agent(None, None, Tier::None),
-        )]
-    })
-}
-
+///
+/// Reconciles into a throwaway tree BEFORE the close, asserting the edge IS
+/// present there — a positive control: without it, nothing shows the edge
+/// would ever have come back at all, so a regression in
+/// `persist_session_created` (no longer writing a parent-bearing
+/// `SessionCreated`) or in `reconcile_spawn_tree`'s own prefilter (no longer
+/// matching this child's row) would leave the post-close assertion
+/// vacuously true.
 #[tokio::test]
 async fn a_cascade_closed_sub_agent_childs_edge_is_not_restored_after_a_restart() {
     let dir = tempfile::tempdir().unwrap();
@@ -201,6 +209,21 @@ async fn a_cascade_closed_sub_agent_childs_edge_is_not_restored_after_a_restart(
         .into_iter()
         .next()
         .expect("exactly one real child was spawned");
+
+    // Positive control: reconcile into a throwaway tree BEFORE the close and
+    // confirm the live child's edge WOULD be restored — proving the
+    // post-close assertion below is actually exercising `reconcile_spawn_tree`'s
+    // exclusion filter, not merely observing that nothing was ever going to
+    // come back regardless.
+    let before_close = Arc::new(SpawnTree::new());
+    reconcile_spawn_tree_at_boot(&resources.store, &before_close)
+        .await
+        .unwrap();
+    assert_eq!(
+        before_close.descendants(parent),
+        vec![child],
+        "sanity: before the close, this still-live child's edge must be restorable at all"
+    );
 
     // The real close path: closing the PARENT must cascade down and close
     // the CHILD too (`close_children`), never called on the child directly.
