@@ -411,26 +411,45 @@ async fn build_headless_session(
 /// **What 30s actually promises, and what it does not.** It promises that
 /// ONE session's own close (a leaf, or a root with no tracked children)
 /// cannot block its caller longer than this, and that a root's cascade
-/// cannot either. It does **not** promise the whole cascade fits: only
-/// designed-in grace periods already make an ordinary serial cascade
-/// expensive. Each child's [`HeadlessSession::finish_teardown`] awaits
-/// [`McpHost::shutdown`], which walks its stdio transports serially at
-/// `roundhouse_mcp`'s own `GRACEFUL_EXIT_TIMEOUT` (3s) per server, and a
-/// child holding a SIGTERM-ignoring shell costs about 5.5s inside
+/// cannot either. It does **not** promise the whole cascade fits.
+///
+/// *Across a level, it now very nearly does.* `DaemonSubAgentHost::
+/// close_children` retires one pass's children concurrently (Phase 8, T19a,
+/// issue #91), so a level costs its SLOWEST child rather than the sum of
+/// its children. The per-child costs are unchanged and still real: each
+/// child's [`HeadlessSession::finish_teardown`] awaits
+/// [`McpHost::shutdown`], which walks that child's own stdio transports
+/// serially at `roundhouse_mcp`'s `GRACEFUL_EXIT_TIMEOUT` (3s) per server,
+/// and a child holding a SIGTERM-ignoring shell costs about 5.5s inside
 /// `roundhouse_sandbox`'s `Child::cancel` (a 5s SIGTERM grace, then up to
-/// 25 × 20ms of `wait_for_empty_group` confirmation). Eight direct children
-/// with MCP hosts is therefore already around 24s of ordinary, non-wedged
-/// serial work inside a 30s budget — and §7.7's `MAX_DEPTH` × `MAX_FAN_OUT`
-/// permits thousands of descendants. A cascade over a large tree WILL be
-/// abandoned at this bound. What [`nested_close_timeout`]'s per-level step
-/// buys is room for only ONE abandoned session per level, not the whole
-/// level: the first wedged session encountered along a chain is abandoned
-/// at its own level, where its `close_and_teardown` still runs
-/// `finish_teardown` — but a later sibling at that same level, or a chain
-/// whose earlier steps already spent the slack, is instead dropped by the
-/// enclosing bound with no teardown for that descendant. Still a real
-/// improvement over giving every level the same bound, which stranded all
-/// of them this way.
+/// 25 × 20ms of `wait_for_empty_group` confirmation) — but eight such
+/// children now cost about one child's worth of time rather than the ~24s
+/// they used to. What [`nested_close_timeout`]'s per-level step buys is
+/// therefore room for EVERY wedged session at a level, not just the first
+/// one reached: each is abandoned at its own level, where its
+/// `close_and_teardown_within` still runs `finish_teardown` and its
+/// ancestors still go on to write their own terminators.
+///
+/// *Down a chain, it still does not.* Levels are inherently sequential — a
+/// level's own close CONTAINS its children's — so the 5s step has to cover
+/// that level's own `cancel` grace, `wait_idle` and terminator append on
+/// top of everything below it. §7.7's `MAX_DEPTH` × `MAX_FAN_OUT` permits
+/// thousands of descendants, and a cascade over a deep enough tree WILL
+/// still be abandoned at this bound.
+///
+/// *And the top of the cascade still has only one step of slack.* A depth-1
+/// child arms its 25s bound only after the root's own `cancel`, `wait_idle`
+/// and first `children_of` snapshot have run. If those together consume
+/// more than `NESTED_CLOSE_TIMEOUT_STEP` — a root holding its own
+/// SIGTERM-ignoring shell spends about 5.5s in `cancel` alone — every
+/// child's deadline lands past this one, this bound fires first, and the
+/// whole pass is dropped mid-retirement with each child's `SubAgentSessions`
+/// record and `SpawnTree` edge already taken and its reaper already
+/// aborted. That is the one remaining shape in which a cascade strands
+/// descendants with no route left to reclaim them, and concurrency widens
+/// it from one child to a pass — in exchange for removing the far more
+/// reachable case where merely having a SECOND wedged sibling stranded one
+/// every time.
 pub(crate) const SESSION_CLOSE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// How much smaller each tracked level's close budget is than the level
@@ -453,9 +472,26 @@ const MIN_NESTED_CLOSE_TIMEOUT: Duration = Duration::from_secs(10);
 /// the whole point: a nested `tokio::time::timeout` is created strictly
 /// later than the one enclosing it, so it can only ever fire first if its
 /// bound is strictly smaller. With that ordering, a wedged descendant is
-/// abandoned at ITS own level — where `close_and_teardown` still runs
+/// abandoned at ITS own level — where `close_and_teardown_within` still runs
 /// `finish_teardown` and its ancestors still go on to write their own
 /// terminators — instead of stranding the whole cascade at the root.
+///
+/// **One bound per LEVEL, covering every sibling on it** (Phase 8, T19a,
+/// issue #91). The step is what a level has to fit in, not what one child
+/// has to fit in: `DaemonSubAgentHost::close_children` retires a level's
+/// children concurrently, so all of them arm this budget at essentially the
+/// same instant and all of them are caught by it. When that loop was
+/// serial, a second wedged sibling did not arm its own 25s bound until the
+/// first one's had already elapsed, which put its deadline past the
+/// enclosing 30s one and stranded it with no teardown. The step never had
+/// to grow to fix that; the level only had to stop costing the sum of its
+/// children.
+///
+/// What the step still cannot absorb is a level that is slow BEFORE it gets
+/// here — `cancel`'s SIGTERM grace, `wait_idle`, the `children_of` snapshot
+/// — since all of that is spent inside the enclosing budget before this one
+/// is armed at all. [`SESSION_CLOSE_TIMEOUT`]'s own doc comment carries that
+/// accounting.
 ///
 /// A tracked child's depth is `parent depth + 1`, so `depth` is never 0
 /// here (`LiveSubAgent::depth`, set by `DaemonSubAgentHost::

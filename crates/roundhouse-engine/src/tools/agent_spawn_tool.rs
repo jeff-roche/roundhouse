@@ -261,7 +261,11 @@ pub trait SubAgentHost: Send + Sync {
     /// existed) closes cleanly without having to implement child-closing
     /// itself. A real daemon-side implementor is expected to override this
     /// to walk `parent`'s edges in the shared `SpawnTree` and call `close`
-    /// on each child's own `SessionActor` in turn.
+    /// on each child's own `SessionActor`. Nothing here requires those
+    /// child closes to be sequential, and the real implementor
+    /// (`roundhouse-daemon`'s `DaemonSubAgentHost::close_children`) runs a
+    /// level's siblings concurrently so that a level costs its slowest
+    /// child rather than the sum of its children.
     ///
     /// # Implementor contract
     ///
