@@ -585,7 +585,6 @@ async fn a_request_over_the_pool_bound_is_shed_rather_than_left_to_queue() {
     let state = AppState {
         store: Some(BoundedStore::new(store(&dir).await)),
         api_pool_permits: roundhouse_web::ApiPoolPermits::new(0),
-        ..AppState::default()
     };
 
     let response = get(build_router(state, &BindConfig::loopback()), "/api/runs").await;
@@ -646,7 +645,6 @@ async fn a_second_request_is_shed_while_the_first_still_holds_a_connection() {
     let state = AppState {
         store: Some(BoundedStore::new(store.clone())),
         api_pool_permits: roundhouse_web::ApiPoolPermits::new(1),
-        ..AppState::default()
     };
     let first = tokio::spawn(get(
         build_router(state.clone(), &BindConfig::loopback()),
@@ -701,7 +699,6 @@ async fn a_store_less_router_names_the_missing_store_and_not_the_bound() {
     let state = AppState {
         store: None,
         api_pool_permits: roundhouse_web::ApiPoolPermits::new(0),
-        ..AppState::default()
     };
 
     let response = get(build_router(state, &BindConfig::loopback()), "/api/runs").await;
@@ -752,7 +749,6 @@ async fn a_permit_is_released_when_the_request_finishes() {
     let state = AppState {
         store: Some(BoundedStore::new(store(&dir).await)),
         api_pool_permits: roundhouse_web::ApiPoolPermits::new(1),
-        ..AppState::default()
     };
 
     for attempt in 1..=2 {

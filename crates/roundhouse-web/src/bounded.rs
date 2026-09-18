@@ -182,6 +182,21 @@ impl BoundedStore {
         Self { inner: pool }
     }
 
+    /// The store's shared [`roundhouse_store::CommitFeed`] — the signal
+    /// [`roundhouse_store::SessionFollower`] watches to learn when to re-read
+    /// after catching up.
+    ///
+    /// Unlike [`BoundedStore::connection`], this needs no permit and grants no
+    /// reach into `inner.pool`: a `CommitFeed` is an `Arc`-shared in-memory map
+    /// of generation counters, not a pooled connection, so handing back a
+    /// reference to it bypasses none of [`ApiPoolPermits`]' bound. It is read
+    /// here, in this leaf module, for the same reason every other reach into
+    /// `inner` is — see this module's own doc comment — even though this one
+    /// reach has nothing to do with the bound itself.
+    pub(crate) fn commit_feed(&self) -> &roundhouse_store::CommitFeed {
+        self.inner.commit_feed()
+    }
+
     /// A connection **and** the permit bounding it, in one act.
     ///
     /// Takes `permits` rather than an already-taken
@@ -411,5 +426,110 @@ impl StoreConnection {
         R: Send + 'static,
     {
         self.connection.interact(f).await
+    }
+}
+
+/// [`roundhouse_store::PageSource`] over a permit-bounded store — what
+/// `roundhouse-web`'s SSE route (Phase 8 Task 21, Task 5) builds a
+/// [`roundhouse_store::SessionFollower`] over.
+///
+/// # Why this wraps [`BoundedStore`] rather than implementing the trait on it
+/// directly
+///
+/// [`roundhouse_store::PageSource::read_after`]/`head` take no permit
+/// argument — `roundhouse-store`'s own `impl PageSource for StorePool`
+/// (`follow.rs`) has no bound to enforce, so its signature carries none. This
+/// crate's bound is [`ApiPoolPermits`], and it is deliberately **not** a field
+/// of [`BoundedStore`]: [`crate::AppState::store_connection`] already takes
+/// the store and the permits as two siblings, handed to
+/// [`BoundedStore::connection`] together at the point a connection is
+/// actually needed. Adding a permits field to `BoundedStore` itself would put
+/// this route's own bound onto the one store handle three other handlers
+/// (`runs::list_runs`, and any future one reached through
+/// [`crate::AppState::store_connection`]) share and hold no opinion about.
+/// This type is the same pairing `store_connection` already makes, just held
+/// long enough to hand to a long-lived [`roundhouse_store::SessionFollower`]
+/// instead of one request.
+///
+/// # Where the permit is actually taken and released
+///
+/// Each of [`Self::read_after`]/[`Self::head`] below acquires one connection
+/// — and with it, one permit, via [`BoundedStore::connection`] — for exactly
+/// the one query it runs, and drops both before returning. `SessionFollower::
+/// next` only calls either of these while it has a page to fetch; the rest of
+/// its time is spent awaiting `CommitFeed::changed()`, which never touches
+/// this type at all. So an SSE connection sitting idle between commits holds
+/// **zero**
+/// store connections and **zero** permits — the same bound every other `/api`
+/// handler observes, not a side channel around it for a stream that happens
+/// to be long-lived.
+#[derive(Clone)]
+pub(crate) struct BoundedPageSource {
+    store: BoundedStore,
+    permits: ApiPoolPermits,
+}
+
+impl BoundedPageSource {
+    pub(crate) fn new(store: BoundedStore, permits: ApiPoolPermits) -> Self {
+        Self { store, permits }
+    }
+}
+
+/// Turns a refused connection into a [`roundhouse_store::StoreError`] without
+/// naming a new variant — this crate cannot add one (`StoreError` is not
+/// `#[non_exhaustive]` and lives in another crate) and does not need to: both
+/// cases are exactly what `Interact` already exists for, an operational
+/// failure that is not a SQL error. The message never reaches a client: see
+/// [`crate::sse`]'s handling of a [`roundhouse_store::StoreError`] from a
+/// follower, which logs nothing of the underlying text either, for the same
+/// reason [`crate::runs::internal_error`] states.
+fn refusal_to_store_error(refusal: ConnectionRefusal) -> roundhouse_store::StoreError {
+    let message = match refusal {
+        ConnectionRefusal::AtBound => "the API's store-connection bound was reached",
+        ConnectionRefusal::PoolFailed => "failed acquiring a store connection",
+    };
+    roundhouse_store::StoreError::Interact(message.to_string())
+}
+
+impl roundhouse_store::PageSource for BoundedPageSource {
+    fn read_after(
+        &self,
+        session_id: roundhouse_core::SessionId,
+        after: Option<u64>,
+        limit: usize,
+    ) -> impl std::future::Future<
+        Output = Result<Vec<roundhouse_store::StoredEvent>, roundhouse_store::StoreError>,
+    > + Send {
+        let store = self.store.clone();
+        let permits = self.permits.clone();
+        async move {
+            let connection = store
+                .connection(&permits)
+                .await
+                .map_err(refusal_to_store_error)?;
+            connection
+                .interact(move |c| roundhouse_store::events_after(c, session_id, after, limit))
+                .await
+                .map_err(|e| roundhouse_store::StoreError::Interact(e.to_string()))?
+        }
+    }
+
+    fn head(
+        &self,
+        session_id: roundhouse_core::SessionId,
+    ) -> impl std::future::Future<Output = Result<Option<u64>, roundhouse_store::StoreError>> + Send
+    {
+        let store = self.store.clone();
+        let permits = self.permits.clone();
+        async move {
+            let connection = store
+                .connection(&permits)
+                .await
+                .map_err(refusal_to_store_error)?;
+            connection
+                .interact(move |c| roundhouse_store::session_head(c, session_id))
+                .await
+                .map_err(|e| roundhouse_store::StoreError::Interact(e.to_string()))?
+        }
     }
 }

@@ -123,12 +123,67 @@ fn mode_of(path: &Path) -> u32 {
 const LAN_ADDR: Ipv4Addr = Ipv4Addr::new(192, 168, 1, 40);
 
 /// Builds the LAN-gated router for `dir`'s token, plus the token's text.
-fn lan_router(dir: &Path) -> (axum::Router, String) {
-    let _umask = umask_guard();
-    let token = LanToken::load_or_create(dir).expect("a fresh 0700 dir yields a token");
-    let text = token_text(dir);
+///
+/// Async, and returns a [`TempDir`] the caller must keep alive for as long as
+/// it uses the router, for a reason that has nothing to do with the LAN gate
+/// this file is about: [`api_events`] is now backed by
+/// `roundhouse_store::StorePool` (Phase 8 Task 21) rather than the retired
+/// in-memory `SseHub`, so a gate test that wants `200` on the far side of a
+/// correct token needs a real, on-disk store behind it — a store-less
+/// `AppState::default()` answers `503` before the gate's own verdict would
+/// ever be interesting. The store lives in its own temp directory, separate
+/// from `dir` (the token's), so this file's token-permission tests are not
+/// coupled to an unrelated file appearing beside the token.
+///
+/// The `_umask` guard is scoped to just the token half, dropped before
+/// [`store_backed_state`] runs: that helper takes the same guard itself (see
+/// its own doc comment for why), and `UMASK` is a plain, non-reentrant
+/// `std::sync::Mutex` — the two halves run one after the other rather than
+/// under one held lock, so neither call re-enters it.
+async fn lan_router(dir: &Path) -> (axum::Router, String, TempDir) {
+    let (token, text) = {
+        let _umask = umask_guard();
+        let token = LanToken::load_or_create(dir).expect("a fresh 0700 dir yields a token");
+        let text = token_text(dir);
+        (token, text)
+    };
     let bind = BindConfig::lan(IpAddr::V4(LAN_ADDR), token);
-    (build_router(AppState::default(), &bind), text)
+    let (store_dir, state) = store_backed_state().await;
+    (build_router(state, &bind), text, store_dir)
+}
+
+/// An [`AppState`] whose `store` is a real, on-disk `roundhouse_store::StorePool`,
+/// so [`api_events`] — this file's one gated path — can actually answer `200`
+/// rather than `503`. The returned [`TempDir`] must outlive every use of the
+/// state's router: `roundhouse_store::StorePool` opens a fresh connection per
+/// checkout rather than holding one open, so a removed directory fails the
+/// *next* query, not merely a hypothetically-reopened one.
+///
+/// Takes [`umask_guard`] itself, for the same reason [`state_dir`]'s doc
+/// comment gives for the token file: `TempDir::new()` and
+/// `roundhouse_store::open` both create filesystem entries whose mode the
+/// umask masks, so without the guard a concurrently running hostile-umask
+/// test lands its umask on this call's temp dir instead, and
+/// `roundhouse_store::open` fails with sqlite's `CannotOpen` rather than the
+/// gate behaviour the caller meant to exercise — observed, not theoretical.
+/// `#[allow(clippy::await_holding_lock)]`: every caller here is a
+/// `#[tokio::test]` on its own single-threaded runtime (or `the_token_survives_
+/// a_restart_so_paired_devices_stay_paired`'s own hand-rolled `block_on`, same
+/// shape), so this task is the only one ever polling it — a `std::sync::
+/// MutexGuard` held across the `.await` below cannot starve another task on
+/// the same runtime, which is the hazard the lint exists to catch.
+#[allow(clippy::await_holding_lock)]
+async fn store_backed_state() -> (TempDir, AppState) {
+    let _umask = umask_guard();
+    let dir = TempDir::new().expect("a temp dir for the store is creatable");
+    let store = roundhouse_store::open(&dir.path().join("events.db"))
+        .await
+        .expect("a fresh sqlite store opens");
+    let state = AppState {
+        store: Some(roundhouse_web::BoundedStore::new(store)),
+        ..AppState::default()
+    };
+    (dir, state)
 }
 
 async fn status_of(router: axum::Router, request: Request<Body>) -> StatusCode {
@@ -226,11 +281,18 @@ fn debug_formatting_never_carries_the_token() {
 #[test]
 fn the_token_survives_a_restart_so_paired_devices_stay_paired() {
     let dir = state_dir();
-    let _umask = umask_guard();
-
-    let first = LanToken::load_or_create(dir.path()).expect("first load creates");
-    let text = token_text(dir.path());
-    let second = LanToken::load_or_create(dir.path()).expect("second load reads");
+    // Scoped tightly around the token creation, and dropped before
+    // `store_backed_state` runs below: that helper takes the same guard
+    // itself (for its own filesystem creation — see its doc comment), and
+    // `UMASK` is a plain, non-reentrant `std::sync::Mutex`, so holding this
+    // one across that call would deadlock this thread against itself.
+    let (first, text, second) = {
+        let _umask = umask_guard();
+        let first = LanToken::load_or_create(dir.path()).expect("first load creates");
+        let text = token_text(dir.path());
+        let second = LanToken::load_or_create(dir.path()).expect("second load reads");
+        (first, text, second)
+    };
 
     assert_eq!(
         text,
@@ -243,11 +305,20 @@ fn the_token_survives_a_restart_so_paired_devices_stay_paired() {
     // addresses it — the address is incidental to what this test is about.
     let bind_first = BindConfig::lan(IpAddr::V4(LAN_ADDR), first);
     let bind_second = BindConfig::lan(IpAddr::V4(LAN_ADDR), second);
-    for bind in [bind_first, bind_second] {
-        let router = build_router(AppState::default(), &bind);
-        let request = get_with_auth(&api_events(), &format!("Bearer {text}"));
-        assert_eq!(block_on(status_of(router, request)), StatusCode::OK);
-    }
+    // `api_events()` now needs a real store behind it to answer `200` — see
+    // `lan_router`'s doc comment. Store creation and every request against it
+    // run inside the SAME `block_on`/runtime: `deadpool-sqlite`'s pool binds
+    // to the Tokio runtime current at the moment it is built, and this test's
+    // `block_on` spins up a fresh one on every call — a store opened under one
+    // and then queried under another panics with "no reactor running".
+    block_on(async {
+        let (_store_dir, state) = store_backed_state().await;
+        for bind in [bind_first, bind_second] {
+            let router = build_router(state.clone(), &bind);
+            let request = get_with_auth(&api_events(), &format!("Bearer {text}"));
+            assert_eq!(status_of(router, request).await, StatusCode::OK);
+        }
+    });
 }
 
 /// A fresh token is 32 bytes of entropy rendered as 64 lowercase hex
@@ -469,11 +540,12 @@ fn a_symlink_in_place_of_the_token_file_is_not_followed() {
 
 /// P84 §B, and the reason this test exists rather than being assumed: with no
 /// configuration there is no gate at all, over `/api` or over the assets. The
-/// cost is stated in `lan_auth`'s module docs — an unauthenticated local reader
-/// gets the SSE ring's retained history.
+/// cost is stated in `lan_auth`'s module docs — an unauthenticated local
+/// reader is replayed a session's whole committed store history.
 #[tokio::test]
 async fn a_loopback_router_serves_both_surfaces_with_no_token() {
     let bind = BindConfig::loopback();
+    let (_store_dir, state) = store_backed_state().await;
 
     assert_eq!(
         status_of(
@@ -486,7 +558,7 @@ async fn a_loopback_router_serves_both_surfaces_with_no_token() {
     );
     assert_eq!(
         status_of(
-            build_router(AppState::default(), &bind),
+            build_router(state, &bind),
             get_from_host("127.0.0.1", &api_events())
         )
         .await,
@@ -498,7 +570,7 @@ async fn a_loopback_router_serves_both_surfaces_with_no_token() {
 #[tokio::test]
 async fn a_lan_router_rejects_a_request_with_no_token() {
     let dir = state_dir();
-    let (router, _) = lan_router(dir.path());
+    let (router, _, _store_dir) = lan_router(dir.path()).await;
 
     assert_eq!(
         status_of(router, get(&api_events())).await,
@@ -537,7 +609,7 @@ async fn the_gate_is_on_api_and_the_asset_surface_is_ungated() {
         ("/w/default/inbox", StatusCode::OK),
         ("/does-not-exist.js", StatusCode::NOT_FOUND),
     ] {
-        let (router, _) = lan_router(dir.path());
+        let (router, _, _store_dir) = lan_router(dir.path()).await;
         assert_eq!(
             status_of(router, get(uri)).await,
             expected,
@@ -576,7 +648,7 @@ async fn the_gate_is_on_api_and_the_asset_surface_is_ungated() {
         "/api//".to_string(),
         "/api/./runs".to_string(),
     ] {
-        let (router, _) = lan_router(dir.path());
+        let (router, _, _store_dir) = lan_router(dir.path()).await;
         assert_eq!(
             status_of(router, get(&uri)).await,
             StatusCode::UNAUTHORIZED,
@@ -599,7 +671,7 @@ async fn the_gate_is_on_api_and_the_asset_surface_is_ungated() {
     // nest" was one path short of true with nothing measuring the gap. Pinned
     // here, so the day `serve_asset` answers `/api/` with anything but a bare
     // 404 — a redirect, the SPA shell, a listing — this test says so.
-    let (router, _) = lan_router(dir.path());
+    let (router, _, _store_dir) = lan_router(dir.path()).await;
     assert_eq!(
         status_of(router, get("/api/")).await,
         StatusCode::NOT_FOUND,
@@ -610,7 +682,7 @@ async fn the_gate_is_on_api_and_the_asset_surface_is_ungated() {
 #[tokio::test]
 async fn a_lan_router_rejects_a_wrong_token() {
     let dir = state_dir();
-    let (router, text) = lan_router(dir.path());
+    let (router, text, _store_dir) = lan_router(dir.path()).await;
 
     // Same length and alphabet as the real one, differing in the last
     // character: a comparison that stopped early would still reject it, but a
@@ -631,7 +703,7 @@ async fn a_lan_router_rejects_a_wrong_token() {
 #[tokio::test]
 async fn a_lan_router_rejects_a_token_of_the_wrong_length() {
     let dir = state_dir();
-    let (router, text) = lan_router(dir.path());
+    let (router, text, _store_dir) = lan_router(dir.path()).await;
     let truncated = &text[..text.len() - 1];
 
     assert_eq!(
@@ -648,7 +720,7 @@ async fn a_lan_router_rejects_a_token_of_the_wrong_length() {
 #[tokio::test]
 async fn a_lan_router_accepts_the_token_in_an_authorization_bearer_header() {
     let dir = state_dir();
-    let (router, text) = lan_router(dir.path());
+    let (router, text, _store_dir) = lan_router(dir.path()).await;
 
     assert_eq!(
         status_of(
@@ -666,7 +738,7 @@ async fn a_lan_router_accepts_the_token_in_an_authorization_bearer_header() {
 #[tokio::test]
 async fn the_bearer_scheme_name_is_matched_case_insensitively() {
     let dir = state_dir();
-    let (router, text) = lan_router(dir.path());
+    let (router, text, _store_dir) = lan_router(dir.path()).await;
 
     assert_eq!(
         status_of(
@@ -685,7 +757,7 @@ async fn the_bearer_scheme_name_is_matched_case_insensitively() {
 #[tokio::test]
 async fn a_lan_router_accepts_the_token_in_the_query_parameter_for_event_source() {
     let dir = state_dir();
-    let (router, text) = lan_router(dir.path());
+    let (router, text, _store_dir) = lan_router(dir.path()).await;
 
     assert_eq!(
         status_of(
@@ -702,7 +774,7 @@ async fn a_lan_router_accepts_the_token_in_the_query_parameter_for_event_source(
 #[tokio::test]
 async fn the_query_parameter_is_found_among_others() {
     let dir = state_dir();
-    let (router, text) = lan_router(dir.path());
+    let (router, text, _store_dir) = lan_router(dir.path()).await;
 
     assert_eq!(
         status_of(
@@ -722,7 +794,7 @@ async fn the_query_parameter_is_found_among_others() {
 #[tokio::test]
 async fn a_parameter_whose_name_only_ends_with_the_real_one_is_not_the_token() {
     let dir = state_dir();
-    let (router, text) = lan_router(dir.path());
+    let (router, text, _store_dir) = lan_router(dir.path()).await;
 
     assert_eq!(
         status_of(
@@ -740,7 +812,7 @@ async fn a_parameter_whose_name_only_ends_with_the_real_one_is_not_the_token() {
 #[tokio::test]
 async fn a_non_bearer_authorization_header_does_not_authenticate() {
     let dir = state_dir();
-    let (router, text) = lan_router(dir.path());
+    let (router, text, _store_dir) = lan_router(dir.path()).await;
 
     assert_eq!(
         status_of(
@@ -758,7 +830,7 @@ async fn a_non_bearer_authorization_header_does_not_authenticate() {
 #[tokio::test]
 async fn the_rejection_carries_a_bearer_challenge() {
     let dir = state_dir();
-    let (router, _) = lan_router(dir.path());
+    let (router, _, _store_dir) = lan_router(dir.path()).await;
 
     let response = router
         .oneshot(get(&api_events()))
