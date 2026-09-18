@@ -164,9 +164,9 @@ pub enum AgentLoopError {
 /// ([`SessionActor::cancel_reason`]). Falls back to `CancelReason::User`
 /// with a loud warning if none was stored.
 ///
-/// That fallback is genuinely reachable rather than merely defensive:
-/// `cancel` is not the only writer of the session's state watch away from
-/// `Created`/`Running` — [`SessionActor::close`] publishes `Closed` to it
+/// That fallback is reachable by construction, though no caller does it
+/// today: `cancel` is not the only writer of the session's state watch away
+/// from `Created`/`Running` — [`SessionActor::close`] publishes `Closed` to it
 /// too, and an actor constructed with `initial_state: Closed` never went
 /// through `cancel` at all. `cancel` does always store a reason before
 /// flipping the state, so this loop observing a cancellation without one

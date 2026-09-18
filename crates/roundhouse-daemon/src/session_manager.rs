@@ -422,10 +422,15 @@ async fn build_headless_session(
 /// with MCP hosts is therefore already around 24s of ordinary, non-wedged
 /// serial work inside a 30s budget — and §7.7's `MAX_DEPTH` × `MAX_FAN_OUT`
 /// permits thousands of descendants. A cascade over a large tree WILL be
-/// abandoned at this bound; what [`nested_close_timeout`] guarantees is
-/// only that the abandonment happens at the deepest level still running,
-/// where a `close_and_teardown` that is abandoned still runs its own
-/// `finish_teardown`, rather than at the root, where nothing does.
+/// abandoned at this bound. What [`nested_close_timeout`]'s per-level step
+/// buys is room for only ONE abandoned session per level, not the whole
+/// level: the first wedged session encountered along a chain is abandoned
+/// at its own level, where its `close_and_teardown` still runs
+/// `finish_teardown` — but a later sibling at that same level, or a chain
+/// whose earlier steps already spent the slack, is instead dropped by the
+/// enclosing bound with no teardown for that descendant. Still a real
+/// improvement over giving every level the same bound, which stranded all
+/// of them this way.
 pub(crate) const SESSION_CLOSE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// How much smaller each tracked level's close budget is than the level
@@ -884,8 +889,11 @@ async fn release_claimed_resources(
         }
     });
     if let Err(err) = unwinding.await {
-        // Nothing aborts this handle, so this is a panic inside the
-        // teardown itself, never a cancellation.
+        // Nothing in this crate aborts this handle, so in ordinary
+        // operation this is a panic inside the teardown itself. A
+        // `JoinError` reporting `is_cancelled()` instead would mean the
+        // runtime itself shut down while this task was still running, not
+        // a panic — logged the same way here either way.
         tracing::error!(
             session_id = %session_id,
             error = %err,

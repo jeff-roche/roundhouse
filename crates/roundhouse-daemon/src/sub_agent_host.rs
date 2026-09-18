@@ -723,10 +723,14 @@ impl SubAgentHost for DaemonSubAgentHost {
     ///
     /// Each child's own nested close is bounded by
     /// `session_manager::nested_close_timeout`'s depth-derived budget,
-    /// strictly smaller than the level above it, so the innermost bound
-    /// always fires first and a wedged descendant is caught at its own
-    /// level rather than stranding the cascade at the root. What that
-    /// ordering does NOT buy is room for the whole cascade: `SESSION_CLOSE_
+    /// strictly smaller than the level above it. Because [`Self::
+    /// close_children`] retires children serially, that step buys room for
+    /// only the FIRST wedged child at a level: its nested bound fires
+    /// before the enclosing one, so it is caught at its own level and still
+    /// runs its own teardown. A later sibling at that level, or a chain
+    /// whose earlier steps already spent the slack, is instead caught by
+    /// the enclosing bound first, with no teardown of its own. What no
+    /// ordering here buys is room for the whole cascade: `SESSION_CLOSE_
     /// TIMEOUT`'s own doc comment works through why even a non-wedged
     /// eight-child tree with MCP hosts can exhaust a 30s budget on
     /// designed-in grace periods alone.
