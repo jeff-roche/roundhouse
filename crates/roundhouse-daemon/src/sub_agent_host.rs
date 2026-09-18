@@ -46,7 +46,9 @@ use roundhouse_net::proxy::LoopbackProxy;
 use tracing::Instrument;
 
 use crate::session_bootstrap::DaemonResources;
-use crate::session_manager::{create_headless_session, HeadlessSession, ReapAction};
+use crate::session_manager::{
+    create_headless_session, nested_close_timeout, HeadlessSession, ReapAction,
+};
 use crate::session_registry::SessionRegistry;
 
 /// The token ceiling a session starts with.
@@ -99,6 +101,21 @@ impl LiveSubAgent {
     /// propagate it — a caller freeing a fan-out slot has no way to report
     /// a per-child close failure onward either.
     ///
+    /// # Why the bound comes from this child's own depth
+    ///
+    /// Through [`crate::session_manager::HeadlessSession::
+    /// close_and_teardown_within`] with [`nested_close_timeout`]'s
+    /// depth-derived budget, never the plain `close_and_teardown`'s
+    /// outermost `SESSION_CLOSE_TIMEOUT`. A retirement driven by
+    /// [`DaemonSubAgentHost::close_children`] runs INSIDE an ancestor's own
+    /// close timeout, and a nested `tokio::time::timeout` created later with
+    /// an equal bound can never fire first — it is dropped, timer and all,
+    /// when the enclosing one elapses. A strictly smaller bound per level is
+    /// what makes a wedged descendant get abandoned at its own level, where
+    /// this call still runs the child's real teardown, rather than
+    /// stranding the whole cascade at the root. `SESSION_CLOSE_TIMEOUT`'s
+    /// own doc comment carries the full accounting.
+    ///
     /// Module-private, and it does not touch the spawn tree, because it is
     /// only half of ending a sub-agent — [`SubAgentSessions::retire_child`]
     /// is the whole of it and the only way in from outside. The one other
@@ -114,7 +131,7 @@ impl LiveSubAgent {
     ) {
         let _ = self
             .session
-            .close_and_teardown(outcome, registry, proxy)
+            .close_and_teardown_within(nested_close_timeout(self.depth), outcome, registry, proxy)
             .await;
     }
 }
@@ -238,8 +255,9 @@ impl SubAgentSessions {
     /// `JoinHandle` identifies, and for which both of those methods would
     /// self-abort.
     ///
-    /// Idempotent for the same reason [`Self::take`] is: a second call for
-    /// an already-taken child finds no record and returns `None`.
+    /// Idempotent for the same reason the private `take` it is built on is:
+    /// a second call for an already-taken child finds no record and returns
+    /// `None`.
     pub(crate) fn take_for_reap(
         &self,
         child: SessionId,
@@ -552,8 +570,8 @@ impl SubAgentHost for DaemonSubAgentHost {
         // `create_headless_session` stays armed and independently watching
         // this exact session across the whole `persist_session_created`
         // await above, sharing this session's `HeadlessSession::torn_down`
-        // flag (fix round 1) — so even if that reaper fires before this
-        // line runs, it is `finish_teardown`'s shared flag, not this
+        // flag — so even if that reaper fires before this line runs, it is
+        // `finish_teardown`'s shared flag, not this
         // ordering, that stops it from tearing the real resources down
         // twice, and the `RetireSubAgent` reaper rewired in here still
         // finds (and correctly un-tracks) the child the moment it is
@@ -626,7 +644,7 @@ impl SubAgentHost for DaemonSubAgentHost {
     /// `SubAgentHost` answers for exactly one session; acting on any other
     /// would be a mis-registration bug, not a legitimate call.
     ///
-    /// # A single snapshot can miss a child spawned during this very close (fix round 1)
+    /// # A single snapshot can miss a child spawned during this very close
     ///
     /// `parent`'s own [`SessionActor::wait_idle`] step (run just before this
     /// one) does not bound every way a NEW child can appear here:
@@ -680,22 +698,38 @@ impl SubAgentHost for DaemonSubAgentHost {
     /// currently-tracked session once before running out of un-retired
     /// children to find.
     ///
-    /// # `SESSION_CLOSE_TIMEOUT` bounds the WHOLE cascade this method drives, not one session (fix round 1)
+    /// # The enclosing timeout bounds the WHOLE cascade this method drives, not one session
     ///
-    /// This runs from inside `parent`'s own
-    /// `HeadlessSession::close_and_teardown`, wrapped in that caller's own
-    /// `tokio::time::timeout(SESSION_CLOSE_TIMEOUT, ..)` — see that
-    /// constant's own doc comment for the full accounting. The practical
-    /// consequence here: if that OUTER timeout elapses while this method is
-    /// mid-cascade, whatever child `retire_child` already `take`n out of
-    /// `SubAgentSessions` but not yet finished retiring is abandoned with
-    /// its reaper already aborted and its record already gone — nothing
-    /// will ever retire it again. Each child's own nested
-    /// `close_and_teardown` call applies the identical constant
-    /// independently to just that one session, so no single session in the
-    /// cascade can itself run long without being caught — the risk this
-    /// leaves open is specifically the SUM, across several slow-but-not-
-    /// wedged children, exceeding the parent's own outer budget.
+    /// This always runs inside some caller's `tokio::time::timeout` around
+    /// `parent`'s own close, and which one depends on how `parent` was
+    /// created:
+    ///
+    /// - A headless session (a scheduled delivery, a workflow `agent:`
+    ///   step's child) is closed through
+    ///   `HeadlessSession::close_and_teardown`, wrapped in
+    ///   `session_manager`'s `SESSION_CLOSE_TIMEOUT`.
+    /// - A session a client created over the socket has no `HeadlessSession`
+    ///   at all — `socket_server::drive_session`'s `CreateSession` branch
+    ///   spawns the reaper and discards the handle — so its close is wrapped
+    ///   in `socket_server`'s own `CLOSE_SESSION_TIMEOUT` instead. Same
+    ///   value as `SESSION_CLOSE_TIMEOUT` today, which is exactly why the
+    ///   two have to be named separately rather than assumed to be one.
+    ///
+    /// The practical consequence here: if that enclosing timeout elapses
+    /// while this method is mid-cascade, whatever child `retire_child`
+    /// already `take`n out of `SubAgentSessions` but not yet finished
+    /// retiring is abandoned with its reaper already aborted and its record
+    /// already gone — nothing will ever retire it again.
+    ///
+    /// Each child's own nested close is bounded by
+    /// `session_manager::nested_close_timeout`'s depth-derived budget,
+    /// strictly smaller than the level above it, so the innermost bound
+    /// always fires first and a wedged descendant is caught at its own
+    /// level rather than stranding the cascade at the root. What that
+    /// ordering does NOT buy is room for the whole cascade: `SESSION_CLOSE_
+    /// TIMEOUT`'s own doc comment works through why even a non-wedged
+    /// eight-child tree with MCP hosts can exhaust a 30s budget on
+    /// designed-in grace periods alone.
     async fn close_children(&self, parent: SessionId) {
         if parent != self.session {
             tracing::error!(
@@ -735,7 +769,7 @@ impl SubAgentHost for DaemonSubAgentHost {
                 // so an operator reading a failed-close log line emitted
                 // underneath — `close_and_teardown`'s own, which otherwise
                 // names only the child — can still tie it back to the
-                // cascade that caused it (fix round 1, M5).
+                // cascade that caused it.
                 let span = tracing::info_span!(
                     "close_children_retire",
                     parent = %parent,
@@ -1592,6 +1626,140 @@ mod tests {
         assert_eq!(actor.state(), SessionState::Closed);
     }
 
+    /// **A wedged tracked child is abandoned at ITS OWN depth-derived bound,
+    /// not at the bound of whatever close it runs inside** (Phase 8, T19a
+    /// Task 6).
+    ///
+    /// `LiveSubAgent::retire` hands `close_and_teardown_within`
+    /// `session_manager::nested_close_timeout(depth)` rather than the
+    /// outermost `SESSION_CLOSE_TIMEOUT`, because a nested
+    /// `tokio::time::timeout` is always created later than the one enclosing
+    /// it and so can only fire first if its bound is strictly smaller. Given
+    /// equal bounds the nested timer is dead code — dropped, timer included,
+    /// when the enclosing one elapses — and a permanently wedged descendant
+    /// would strand the whole cascade instead of only itself.
+    ///
+    /// The wedge is the real one `SESSION_CLOSE_TIMEOUT`'s own doc comment
+    /// names: a `WorkGuard` nothing ever drops, so `SessionActor::close`'s
+    /// `wait_idle` step never returns. Both retirements below go through the
+    /// real `retire_child` → `close_and_teardown_within` →
+    /// `SessionActor::close` chain over real spawned sessions.
+    ///
+    /// Nothing sleeps and no real time passes: the clock is paused only
+    /// AFTER the real spawns (whose own construction bounds should run
+    /// against real time), and the elapsed VIRTUAL time across each
+    /// retirement is exactly the budget whose timer fired — which is what
+    /// distinguishes the depth-1 bound from the depth-2 one, and both from
+    /// the root's.
+    #[tokio::test]
+    async fn a_wedged_child_is_abandoned_at_its_own_depth_derived_bound() {
+        let dir = tempfile::tempdir().unwrap();
+        let resources = resources_allowing_agent_spawns(dir.path()).await;
+        let registry = Arc::new(SessionRegistry::new());
+        let actor = parent_actor(dir.path()).await;
+        let parent = actor.session_id();
+        wire_sub_agent_host(&actor, &resources, &registry);
+        let host = actor.sub_agent_host().unwrap();
+
+        dispatch_agent(
+            &actor,
+            actor.writer(),
+            runner(),
+            Some(&host),
+            &agent_args(),
+            TaskId::new(),
+        )
+        .await
+        .expect("the parent must be able to spawn its child");
+        let child = resources.spawn_tree.descendants(parent)[0];
+        let child_actor = registry.actor(child).expect("a real, registered child");
+        let child_host = child_actor
+            .sub_agent_host()
+            .expect("a spawned child must itself be able to spawn");
+
+        dispatch_agent(
+            &child_actor,
+            child_actor.writer(),
+            runner(),
+            Some(&child_host),
+            &agent_args(),
+            TaskId::new(),
+        )
+        .await
+        .expect("the child must be able to spawn its own grandchild");
+        let grandchild = resources.spawn_tree.descendants(child)[0];
+        let grandchild_actor = registry
+            .actor(grandchild)
+            .expect("a real, registered grandchild");
+
+        // Everything real is built; from here the only thing that moves the
+        // clock is a close budget's own timer elapsing.
+        tokio::time::pause();
+
+        // The wedges: guards nothing ever drops, so neither session's own
+        // `close()` can get past `wait_idle`.
+        let _child_wedge = child_actor.begin_work();
+        let _grandchild_wedge = grandchild_actor.begin_work();
+
+        let started = tokio::time::Instant::now();
+        assert!(
+            resources
+                .sub_agents
+                .retire_child(
+                    grandchild,
+                    SessionOutcome::Cancelled,
+                    &resources.spawn_tree,
+                    &registry,
+                    &resources.proxy
+                )
+                .await,
+            "the wedged grandchild must still be tracked when it is retired"
+        );
+        let grandchild_elapsed = started.elapsed();
+        assert!(
+            grandchild_elapsed >= nested_close_timeout(2)
+                && grandchild_elapsed < nested_close_timeout(1),
+            "a depth-2 child's wedged close must be abandoned at the depth-2 budget ({:?}), \
+             strictly before the budget of the level enclosing it ({:?}) — at that enclosing \
+             budget this timer could never fire first at all; got {grandchild_elapsed:?}",
+            nested_close_timeout(2),
+            nested_close_timeout(1)
+        );
+
+        let started = tokio::time::Instant::now();
+        assert!(
+            resources
+                .sub_agents
+                .retire_child(
+                    child,
+                    SessionOutcome::Cancelled,
+                    &resources.spawn_tree,
+                    &registry,
+                    &resources.proxy
+                )
+                .await,
+            "the wedged child must still be tracked when it is retired"
+        );
+        let child_elapsed = started.elapsed();
+        assert!(
+            child_elapsed >= nested_close_timeout(1)
+                && child_elapsed < crate::session_manager::SESSION_CLOSE_TIMEOUT,
+            "a depth-1 child's wedged close must be abandoned at the depth-1 budget ({:?}), \
+             strictly before the outermost bound its cascade runs inside ({:?}); got \
+             {child_elapsed:?}",
+            nested_close_timeout(1),
+            crate::session_manager::SESSION_CLOSE_TIMEOUT
+        );
+
+        // Abandoning the close is not abandoning the session: both wedged
+        // sessions are still fully un-tracked and torn down.
+        assert!(resources.sub_agents.is_empty());
+        assert_eq!(resources.spawn_tree.direct_children(parent), 0);
+        assert_eq!(resources.spawn_tree.direct_children(child), 0);
+        assert!(registry.actor(child).is_none());
+        assert!(registry.actor(grandchild).is_none());
+    }
+
     /// **A duplicate retirement signal for one child never frees a
     /// still-live SIBLING's slot** (Phase 8, T19a Task 6) — the same
     /// invariant `a_retired_sub_agent_frees_exactly_one_of_its_parents_fan_out_slots`
@@ -1687,7 +1855,7 @@ mod tests {
     }
 
     /// **The production reaper-rewiring path itself, not the hand-wired
-    /// substitute** (Phase 8, T19a Task 6, fix round 1, M4).
+    /// substitute** (Phase 8, T19a Task 6).
     ///
     /// Every other test in this module that ends a tracked child calls
     /// `retire_child` directly. This one instead spawns a real child through
@@ -1763,7 +1931,7 @@ mod tests {
     }
 
     /// **`close_children`'s symmetric mismatch fence** (Phase 8, T19a Task
-    /// 6, fix round 1, M2): `create_child_session` already refuses to
+    /// 6): `create_child_session` already refuses to
     /// parent a child for a session other than the one it was registered
     /// on (`a_host_registered_on_the_wrong_session_refuses_to_parent_a_child`,
     /// below); `close_children` must refuse the same way for the same

@@ -70,8 +70,8 @@ impl CapturingWriter {
     }
 }
 
-/// **Ruling W1-R37, applied to `CloseSession`.** An attached (non-creating)
-/// connection is read-only, exactly as it already is for `SubmitTurn`: its
+/// **An attached (non-creating) connection is read-only for `CloseSession`
+/// too**, exactly as it already is for `SubmitTurn`: its
 /// `CloseSession` must be refused — no `Ack`, and the session itself must be
 /// left completely undisturbed.
 ///

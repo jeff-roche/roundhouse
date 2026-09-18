@@ -1,4 +1,4 @@
-//! Phase 8, T19a Task 4, fix round 2 (review finding N1): pins that
+//! Phase 8, T19a Task 4: pins that
 //! [`roundhouse_store::test_util::CloseGate`] never lets a stray wakeup cross generations.
 //!
 //! `CloseGate::release` is only ever meant to unblock the `hold()` it is paired with. A

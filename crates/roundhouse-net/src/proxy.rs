@@ -416,7 +416,9 @@ impl LoopbackProxy {
                     );
                     let event =
                         runner.record_note(session_id, 0, now_ts(), None, NoteLevel::Warn, text, 1);
-                    let _ = writer.append(event).await;
+                    if let Err(error) = writer.append(event).await {
+                        log_dropped_audit_note(session_id, "unreachable upstream", &error);
+                    }
                 }
             }
             GateResult::Deny { host, reason } => {
@@ -438,10 +440,37 @@ impl LoopbackProxy {
                 );
                 let event =
                     runner.record_note(session_id, 0, now_ts(), None, NoteLevel::Warn, text, 1);
-                let _ = writer.append(event).await;
+                if let Err(error) = writer.append(event).await {
+                    log_dropped_audit_note(session_id, "denied egress", &error);
+                }
             }
         }
     }
+}
+
+/// Reports a best-effort audit [`Note`](roundhouse_core::EventPayload::Note)
+/// that could not be appended, naming the session whose log is missing it.
+///
+/// These appends are best-effort by design — the access-control decision is
+/// already made and enforced before one is attempted, and a failed append
+/// never changes it — but "best-effort" had meant "silently discarded". The
+/// window is not hypothetical: `SessionActor::close` publishes a session's
+/// `SessionClosed` terminator before the reaper's own teardown deregisters
+/// that session's proxy token, so a request arriving in between is still
+/// authenticated, still correctly denied, and its `Note` is then rejected by
+/// the store's own tail guard. Without this line, an operator reading the
+/// event log would see neither the note nor any sign that one was attempted.
+fn log_dropped_audit_note(
+    session_id: roundhouse_core::SessionId,
+    what: &str,
+    error: &roundhouse_store::StoreError,
+) {
+    tracing::warn!(
+        session_id = %session_id,
+        error = %error,
+        "roundhouse-net: this session's egress audit note ({what}) could not be appended; the \
+         request was still refused, but its record is missing from the session's event log"
+    );
 }
 
 impl Default for LoopbackProxy {

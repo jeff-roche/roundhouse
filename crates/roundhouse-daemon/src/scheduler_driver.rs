@@ -171,6 +171,20 @@ const WORKFLOW_AGENT_SYSTEM_PROMPT: &str =
 const WORKFLOW_AGENT_MAX_TURNS: u32 = 6;
 const WORKFLOW_AGENT_MAX_TOOL_CALLS_PER_TURN: u32 = 16;
 
+/// The machine-stable category [`DeliveryExecutor::drive_workflow_agent_child`]
+/// records for an `agent:` step whose child's own `run_agent_loop` returned
+/// `Err` — on the parent's `TaskFailed.error.category`, and as the child's
+/// own `SessionClosed` reason.
+///
+/// Named once rather than spelled twice because the two uses have different
+/// safety properties and must not drift: the `TaskFailed` message beside it
+/// carries the error's full `Display` and passes through
+/// `roundhouse_store`'s `Redactor` on its way to the log, while
+/// `SessionClosed` has no redactor arm at all — so the terminator records
+/// this category and nothing else. See that method's own comment above the
+/// `child_session_outcome` mapping.
+const AGENT_LOOP_ERROR_CATEGORY: &str = "agent_loop_error";
+
 /// Boot-load failures that abort daemon startup.
 ///
 /// Deliberately static `Display` strings with the real cause carried as a
@@ -1797,11 +1811,11 @@ impl DeliveryExecutor {
             })
             .await;
             self.release(binding_id);
-            // Phase 8, T19a Task 7, fix round 1 (M7): routed through the
-            // same `session_outcome_for_terminal` every other terminal
-            // mapping uses, rather than hardcoding `SessionOutcome::
-            // Cancelled` here too — one function owns the `RunState` ->
-            // `SessionOutcome` mapping.
+            // Phase 8, T19a Task 7: routed through the same
+            // `session_outcome_for_terminal` every other terminal mapping
+            // uses, rather than hardcoding `SessionOutcome::Cancelled` here
+            // too — one function owns the `RunState` -> `SessionOutcome`
+            // mapping.
             self.close_and_retire(session, session_outcome_for_terminal(RunState::Cancelled))
                 .await;
             return outcome;
@@ -1815,7 +1829,12 @@ impl DeliveryExecutor {
                 })
                 .await;
                 self.release(binding_id);
-                self.close_and_retire(session, SessionOutcome::Completed)
+                // Routed through `session_outcome_for_terminal` like every
+                // other terminal mapping in this file rather than
+                // hardcoding `SessionOutcome::Completed`: one function owns
+                // the `RunState` -> `SessionOutcome` mapping, so a change
+                // there cannot leave this arm behind.
+                self.close_and_retire(session, session_outcome_for_terminal(RunState::Completed))
                     .await;
             }
             RunConclusion::Parked => {
@@ -1888,10 +1907,10 @@ impl DeliveryExecutor {
     ///
     /// This is [`Self::close_and_retire`]'s counterpart for every path that
     /// never reached a genuine `Ok(DrivenRun::Outcome(RunOutcome::Terminal
-    /// { .. }))`. Six call sites reach it, each for its own reason —
-    /// fix round 1 (I2) corrected an earlier version of this doc, which
-    /// claimed all four it then knew about "recreate a session under the
-    /// same `session_id` on a later attempt", true of only one of them:
+    /// { .. }))`. Six call sites reach it, each for its own reason — and
+    /// not, as an earlier version of this doc claimed, because they all
+    /// "recreate a session under the same `session_id` on a later attempt",
+    /// which is true of only one of them:
     ///
     /// - [`Self::run_claimed`]'s own `Err(DeliveryError)` branch (a pre-run
     ///   infra failure — workspace/job resolution, session construction, a
@@ -1930,7 +1949,7 @@ impl DeliveryExecutor {
     ///   the store's own tail guard (`StoreError::SessionClosed`) the
     ///   moment that redrive tried to append anything.
     /// - `dispatch_one_pending`'s `PendingKind::ChildRun` arm calls
-    ///   it twice more (fix round 1, C1), for a `call:` child whose own run
+    ///   it twice more, for a `call:` child whose own run
     ///   reached a terminal `RunState` but whose join back to the parent's
     ///   step did not: `join_terminal_child` returning `Ok(None)` (no
     ///   durable `WorkflowChildCall` row to join against) or `Err(_)` (a
@@ -3091,7 +3110,7 @@ impl DeliveryExecutor {
                 let joined = self
                     .join_terminal_child(child_run_id, state, self.now())
                     .await;
-                // Phase 8, T19a Task 7, fix round 1 (C1): only a join that
+                // Phase 8, T19a Task 7: only a join that
                 // actually succeeded gets the terminal-state mapping.
                 // `Ok(None)` (no durable `WorkflowChildCall` association —
                 // see `join_terminal_child`'s own doc comment) and `Err(_)`
@@ -3291,18 +3310,33 @@ impl DeliveryExecutor {
         // intact for the `match outcome` below, which builds this step's
         // `WorkDone`.
         //
-        // Fix round 1 (M9): `Ok(Ok(_)) => Completed` also covers a loop that
-        // itself succeeded while the STEP outcome built from its blocks
-        // failed (a declared `output_schema` the transcript did not satisfy,
-        // or a failed `record_workflow_task_completed` append, both handled
-        // below by the `match outcome` this borrow leaves intact) — that is
-        // the right reading, not a bug: this outcome describes the SESSION
-        // (did `run_agent_loop` itself finish without erroring?), not the
-        // step's own separate pass/fail.
+        // `Ok(Ok(_)) => Completed` also covers a loop that itself succeeded
+        // while the STEP outcome built from its blocks failed (a declared
+        // `output_schema` the transcript did not satisfy, or a failed
+        // `record_workflow_task_completed` append, both handled below by the
+        // `match outcome` this borrow leaves intact) — that is the right
+        // reading, not a bug: this outcome describes the SESSION (did
+        // `run_agent_loop` itself finish without erroring?), not the step's
+        // own separate pass/fail.
+        //
+        // The loop-error arm records the machine-stable category, NEVER
+        // `loop_err`'s own `Display` — the same discipline
+        // `session_outcome_for_terminal` follows with `RunState::wire_name`.
+        // That `Display` can carry a provider's `ProviderError::BadRequest`
+        // `body_snippet`, which routinely quotes the offending request back,
+        // so a prompt-injected model could steer a secret into it. This
+        // string goes straight into a `SessionClosed` payload, and
+        // `roundhouse_store`'s `Redactor::redact_event_payload` has no
+        // `SessionClosed` arm — while the very same text IS redacted on its
+        // way to `TaskFailed.error.message` through
+        // `record_workflow_task_failed` below. The `events` table rejects
+        // `UPDATE`/`DELETE`, so a leak here would be unrepairable. The
+        // operator-facing detail is not lost: it is exactly what that
+        // `record_workflow_task_failed` call records, through the redactor.
         let child_session_outcome = match &outcome {
             Ok(Ok(_)) => SessionOutcome::Completed,
-            Ok(Err(loop_err)) => SessionOutcome::Failed {
-                reason: format!("the spawned child's agent loop failed: {loop_err}"),
+            Ok(Err(_loop_err)) => SessionOutcome::Failed {
+                reason: AGENT_LOOP_ERROR_CATEGORY.to_string(),
             },
             Err(_elapsed) => SessionOutcome::Failed {
                 reason: format!(
@@ -3380,7 +3414,7 @@ impl DeliveryExecutor {
                 let recorded = record_workflow_task_failed(
                     parent_actor,
                     task_id,
-                    "agent_loop_error",
+                    AGENT_LOOP_ERROR_CATEGORY,
                     message.clone(),
                 )
                 .await;
@@ -6977,7 +7011,7 @@ mod child_run_tests {
             roundhouse_flow::durability::StepRunState::Completed,
             "the parent call receives the terminal child's result"
         );
-        // Phase 8, T19a Task 7, fix round 1 (C1): a `call:` child whose join
+        // Phase 8, T19a Task 7: a `call:` child whose join
         // back to its parent genuinely succeeded must close with the same
         // terminal-state mapping every other terminal path uses, not just
         // be torn down in memory.
@@ -7035,7 +7069,7 @@ mod child_run_tests {
         );
     }
 
-    /// Phase 8, T19a Task 7, fix round 1 (C1): a `call:` child whose OWN run
+    /// Phase 8, T19a Task 7: a `call:` child whose OWN run
     /// genuinely reaches a terminal `RunState`, but whose JOIN back to the
     /// parent's log fails (a store error inside `join_terminal_child`), must
     /// get NO `SessionClosed` terminator — `release_session`, not
@@ -7365,7 +7399,7 @@ mod child_run_tests {
             parent_spend_after_second_refund, parent_spend_before_second_refund,
             "a refused second refund must not change the parent ledger"
         );
-        // Phase 8, T19a Task 7, fix round 2 (3): a `call:` child reaching
+        // Phase 8, T19a Task 7: a `call:` child reaching
         // `Failed` closes with the same mapped terminator as any other
         // terminal path — coverage symmetry with the `Completed` case
         // `a_pending_child_run_drives_using_its_own_session` already pins.
@@ -7564,7 +7598,7 @@ mod child_run_tests {
             (child_step.first_task_seq, child_step.last_task_seq),
             (Some(parent_agent_bounds[0]), Some(parent_agent_bounds[1]))
         );
-        // Phase 8, T19a Task 7, fix round 2 (3): a `call:` child reaching
+        // Phase 8, T19a Task 7: a `call:` child reaching
         // `Cancelled` closes with the same mapped terminator as any other
         // terminal path — coverage symmetry with the `Completed`/`Failed`
         // cases pinned elsewhere in this module.
@@ -8005,17 +8039,123 @@ mod child_run_tests {
             "a driving FAILURE must still release the spawned child's fan-out slot, not just success"
         );
 
-        // Phase 8, T19a Task 7: a run loop error is `SessionOutcome::Failed`, naming what
-        // happened — not the placeholder `Cancelled` `retire_child` used to
-        // be handed unconditionally.
+        // Phase 8, T19a Task 7: a run loop error is `SessionOutcome::Failed`,
+        // naming the failure's machine-stable category — not the placeholder
+        // `Cancelled` `retire_child` used to be handed unconditionally, and
+        // not the loop error's own `Display` either (see
+        // `a_loop_errors_terminator_records_the_category_not_the_providers_echoed_body`).
         let parent_session_id = row.session_id.expect("reserve stamps a session id");
         let child_session_id = harness.only_other_session_id(parent_session_id).await;
         match harness.session_close_outcome(child_session_id).await {
-            Some(SessionOutcome::Failed { reason }) => assert!(
-                reason.contains("agent loop failed"),
-                "a run-loop failure must close its child Failed naming the loop error, got \
-                     {reason:?}"
+            Some(SessionOutcome::Failed { reason }) => assert_eq!(
+                reason, AGENT_LOOP_ERROR_CATEGORY,
+                "a run-loop failure must close its child Failed naming the loop-error category"
             ),
+            other => panic!("a run loop error must close its child Failed, got {other:?}"),
+        }
+    }
+
+    /// A `Provider` whose `stream_chat` fails with a 400 whose
+    /// `body_snippet` quotes the request back — the ordinary shape of a real
+    /// provider `BadRequest`, and the reason an `AgentLoopError`'s `Display`
+    /// is not safe to persist.
+    struct EchoingBadRequestProvider;
+
+    /// The marker this test's fake provider echoes back inside its 400
+    /// body, standing in for whatever a prompt-injected model managed to get
+    /// quoted there.
+    const ECHOED_SECRET: &str = "echoed-secret-from-the-request-body";
+
+    impl roundhouse_provider::Provider for EchoingBadRequestProvider {
+        fn capabilities(
+            &self,
+            _model: &roundhouse_provider::ModelId,
+        ) -> roundhouse_provider::Capabilities {
+            roundhouse_provider::Capabilities::default()
+        }
+        fn resolve(
+            &self,
+            _req: &roundhouse_provider::ChatRequest,
+        ) -> Result<roundhouse_provider::Plan, roundhouse_provider::ProviderError> {
+            Ok(roundhouse_provider::Plan {
+                endpoint: "fake".into(),
+            })
+        }
+        fn stream_chat<'a>(
+            &'a self,
+            _req: &'a roundhouse_provider::ChatRequest,
+            _ctx: &'a roundhouse_provider::RequestCtx,
+        ) -> roundhouse_provider::BoxFut<
+            'a,
+            Result<roundhouse_provider::ChatStream, roundhouse_provider::ProviderError>,
+        > {
+            Box::pin(async {
+                Err(roundhouse_provider::ProviderError::BadRequest {
+                    status: 400,
+                    body_snippet: format!("invalid request: {ECHOED_SECRET}"),
+                })
+            })
+        }
+        fn count_tokens<'a>(
+            &'a self,
+            _req: &'a roundhouse_provider::ChatRequest,
+            _ctx: &'a roundhouse_provider::RequestCtx,
+        ) -> roundhouse_provider::BoxFut<
+            'a,
+            Result<roundhouse_provider::TokenCount, roundhouse_provider::ProviderError>,
+        > {
+            Box::pin(async { Ok(roundhouse_provider::TokenCount::default()) })
+        }
+        fn list_models<'a>(
+            &'a self,
+            _ctx: &'a roundhouse_provider::RequestCtx,
+        ) -> roundhouse_provider::BoxFut<
+            'a,
+            Result<Vec<roundhouse_provider::ModelInfo>, roundhouse_provider::ProviderError>,
+        > {
+            Box::pin(async { Ok(Vec::new()) })
+        }
+    }
+
+    /// **An `agent:` step's child `SessionClosed` terminator must carry the
+    /// failure's category, never the loop error's own `Display`.**
+    ///
+    /// An `AgentLoopError` reaching `drive_workflow_agent_child` can wrap a
+    /// provider `BadRequest` whose `body_snippet` quotes the request back,
+    /// so its `Display` is model-steerable text. `SessionClosed` has no
+    /// `Redactor::redact_event_payload` arm, and the `events` table rejects
+    /// `UPDATE`/`DELETE`, so anything that reaches a terminator is
+    /// unredacted and permanent.
+    #[tokio::test]
+    async fn a_loop_errors_terminator_records_the_category_not_the_providers_echoed_body() {
+        let harness = harness_with_overlap_and_rules_and_provider(
+            agent_step_workflow(),
+            OverlapPolicy::Skip,
+            allow_agent_rules(),
+            Arc::new(EchoingBadRequestProvider) as Arc<dyn roundhouse_provider::Provider>,
+        )
+        .await;
+
+        harness
+            .executor
+            .claim_and_run(harness.delivery.clone(), harness.stored.clone())
+            .await;
+
+        let row = harness.delivery_row().await;
+        let parent_session_id = row.session_id.expect("reserve stamps a session id");
+        let child_session_id = harness.only_other_session_id(parent_session_id).await;
+        match harness.session_close_outcome(child_session_id).await {
+            Some(SessionOutcome::Failed { reason }) => {
+                assert!(
+                    !reason.contains(ECHOED_SECRET),
+                    "a child's SessionClosed terminator must never carry what the provider \
+                     echoed back out of the request, got {reason:?}"
+                );
+                assert_eq!(
+                    reason, AGENT_LOOP_ERROR_CATEGORY,
+                    "a loop failure's terminator must record the machine-stable category"
+                );
+            }
             other => panic!("a run loop error must close its child Failed, got {other:?}"),
         }
     }
@@ -9644,7 +9784,7 @@ mod child_run_tests {
         );
     }
 
-    /// Phase 8, T19a Task 7, fix round 1 (I3): a NON-vacuous proof that
+    /// Phase 8, T19a Task 7: a NON-vacuous proof that
     /// `release_session` itself writes no terminator. Every `release_session`
     /// call site `delivery_tests` pins hands it a session that was never
     /// constructed in the first place (`session: None`, a no-op regardless

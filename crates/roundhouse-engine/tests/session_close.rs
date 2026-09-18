@@ -170,9 +170,9 @@ fn shell_request() -> TaskCreateRequest {
 
 /// A `SubAgentHost` whose only real job is `close_children`: recording every call, together
 /// with whether `SessionClosed` had already been appended for `parent` at the moment it ran
-/// (fix round 1, review findings I2/I3 — nothing previously registered a host at all, so
-/// nothing pinned that `close()`'s step 4 is called, called with the right session, called
-/// exactly once even under two racing closers, or called BEFORE the terminator). Every other
+/// (nothing else in this file registers a host at all, so without this nothing pins that
+/// `close()`'s step 4 is called, called with the right session, called exactly once even
+/// under two racing closers, or called BEFORE the terminator). Every other
 /// `SubAgentHost` method is a real, `agent_tool_spawn.rs`-style implementation over a fresh
 /// `SpawnTree`/`TeamRegistry` — these tests never spawn a sub-agent, so `create_child_session`
 /// is deliberately unreachable.
@@ -235,8 +235,8 @@ impl SubAgentHost for RecordingHost {
     }
 }
 
-/// Fix round 1 (review finding I3): before this test, nothing anywhere registered a
-/// `SubAgentHost` on a `session_close.rs` actor, so nothing pinned that `close()`'s step 4
+/// Nothing else in this file registers a `SubAgentHost` on its actor, so without this
+/// test nothing pins that `close()`'s step 4
 /// (`close_children`) is called at all, called with the right session id, called exactly
 /// once, or called BEFORE the terminator is durably appended.
 #[tokio::test]
@@ -335,7 +335,7 @@ async fn close_transitions_cancelling_then_task_cancelled_then_session_closed_th
     );
 }
 
-/// Fix round 1 (review finding I2): the store's `close_session` is already idempotent
+/// The store's `close_session` is already idempotent
 /// inside its own `BEGIN IMMEDIATE` — the tail guard alone would still produce exactly one
 /// `SessionClosed` even with `close_lock` deleted (on the interleaving where both callers'
 /// `cancel()` win/lose against each other via `EventWriter::append`'s own retry, or lose
@@ -517,9 +517,9 @@ async fn admit_task_refuses_while_cancelling_and_after_closed() {
     // only ever needs the sender half — a `oneshot::Sender::send` succeeds and buffers its
     // value the moment the receiver exists, whether or not that receiver has started
     // awaiting it yet, so a `release()` that runs before `admit()` reaches its own `.await`
-    // is not lost (fix round 2, review finding N1 — see `CloseGate`'s own doc comment for
-    // why this is no longer built on `Notify`, whose stored-permit behavior did not have
-    // this guarantee across separate `hold()` generations).
+    // is not lost (see `CloseGate`'s own doc comment for why this is not built on
+    // `Notify`, whose stored-permit behavior did not have this guarantee across separate
+    // `hold()` generations).
     rx.changed().await.unwrap();
     assert_eq!(*rx.borrow(), SessionState::Cancelling);
 
@@ -540,7 +540,7 @@ async fn admit_task_refuses_while_cancelling_and_after_closed() {
         "expected SessionClosed once close() has finished, got {err:?}"
     );
 
-    // Fix round 1 (review finding I6), pinning a KNOWN, deliberately unaddressed gap: the
+    // Pins a KNOWN, deliberately unaddressed gap: the
     // trusted finally-step bypass arm is matched before `SessionState::Closed`, so a
     // System-origin finally step is still ADMITTED here even after this session has
     // genuinely closed — see `admit_task`'s and `close`'s own doc comments for the full

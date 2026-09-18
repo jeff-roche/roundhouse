@@ -530,15 +530,21 @@ async fn append_batch(
                     // batch, `next_seq_or_reject_closed` reads its tail and rejects the WHOLE
                     // batch (via `?`, out of this `BEGIN IMMEDIATE` transaction, so nothing
                     // commits) if that session's log already ends in `SessionClosed`. A
-                    // `session_id` already in `next_seq_by_session` has necessarily just been
-                    // appended to by an earlier item in THIS batch, and this crate mints no
-                    // `SessionClosed` events into `append_batch` today (its only production
-                    // caller, `recovery.rs`, only ever appends `TaskCancelled`), so re-checking
-                    // on every repeat within one batch would be pure overhead, not an
-                    // additional safety property.
+                    // `session_id` already in `next_seq_by_session` was appended to by an
+                    // earlier item in THIS batch, whose tail this loop therefore already
+                    // knows without re-reading it — including whether that earlier item WAS
+                    // the terminator. `closed_in_batch` is what carries that: the guard holds
+                    // for an intra-batch terminator structurally, rather than resting on
+                    // today's callers happening not to mint one into `append_batch`, which
+                    // this `pub` entry point cannot enforce.
+                    let mut closed_in_batch: std::collections::HashSet<String> =
+                        std::collections::HashSet::new();
                     for item in batch.iter() {
                         let next_seq = match next_seq_by_session.get(&item.session_id) {
-                            Some(&seq) => seq,
+                            Some(&seq) if !closed_in_batch.contains(&item.session_id) => seq,
+                            Some(_) => {
+                                return Err(StoreError::SessionClosed(item.session_id.clone()))
+                            }
                             None => next_seq_or_reject_closed(&tx, &item.session_id)?,
                         };
 
@@ -592,6 +598,14 @@ async fn append_batch(
                         }
 
                         next_seq_by_session.insert(item.session_id.clone(), next_seq + 1);
+                        // This session's log now ends in its terminator, so
+                        // every later item in this same batch for it is
+                        // rejected by the check above — the intra-batch half
+                        // of the tail guard `next_seq_or_reject_closed`
+                        // applies to what was already committed.
+                        if matches!(item.payload, EventPayload::SessionClosed { .. }) {
+                            closed_in_batch.insert(item.session_id.clone());
+                        }
                         seqs.push(next_seq as u64);
                     }
 

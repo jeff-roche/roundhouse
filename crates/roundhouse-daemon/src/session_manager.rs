@@ -336,8 +336,8 @@ async fn build_headless_session(
     crate::sub_agent_host::wire_sub_agent_host(&actor_for_reaper, resources, registry);
 
     // Shared with the reaper below and carried on the returned
-    // `HeadlessSession` (Phase 8, T19a Task 6, fix round 1): this is what
-    // makes "exactly one real teardown" structural regardless of which of
+    // `HeadlessSession` (Phase 8, T19a Task 6): this is what makes
+    // "exactly one real teardown" structural regardless of which of
     // the two independent routes — this reaper, or whatever this function's
     // caller eventually does with the handle it gets back — observes
     // `Closed` first. See `HeadlessSession::finish_teardown`'s own doc
@@ -367,10 +367,10 @@ async fn build_headless_session(
 
 /// How long [`HeadlessSession::close_and_teardown`] waits for
 /// [`SessionActor::close`] before abandoning it and tearing this session
-/// down anyway (Phase 8, T19a Task 5, fix round 1). `SessionActor::close`'s
-/// own doc comment is explicit that its `wait_idle` step has no timeout of
-/// its own and that a caller needing a bound must apply one itself — this is
-/// that bound. Chosen in the same tens-of-seconds range as
+/// down anyway (Phase 8, T19a Task 5). `SessionActor::close`'s own doc
+/// comment is explicit that its `wait_idle` step has no timeout of its own
+/// and that a caller needing a bound must apply one itself — this is that
+/// bound. Chosen in the same tens-of-seconds range as
 /// [`crate::socket_server::SESSION_CONSTRUCTION_TIMEOUT`] (30s) for the same
 /// kind of reason: long enough that a legitimate in-flight shell or provider
 /// call's own SIGTERM→SIGKILL-then-confirm cancellation sequence has room to
@@ -379,7 +379,7 @@ async fn build_headless_session(
 /// whatever caller is waiting on `close_and_teardown` — a socket connection
 /// answering a client's close request among them — indefinitely.
 ///
-/// # This now bounds a whole cascade, not one session (Phase 8, T19a Task 6, fix round 1)
+/// # This is the OUTERMOST bound of a cascade, not the bound of one session (Phase 8, T19a Task 6)
 ///
 /// Chosen back when [`SessionActor::close`]'s step 4
 /// (`sub_agent_host().close_children`) was a no-op default, so this
@@ -388,48 +388,89 @@ async fn build_headless_session(
 /// children: `close_and_teardown`'s `tokio::time::timeout` wraps
 /// `actor.close(outcome)`, and step 4 of THAT call recurses — through
 /// `DaemonSubAgentHost::close_children` → `SubAgentSessions::retire_child`
-/// → this session's own `close_and_teardown`, applied again to each
-/// child — into a SECOND, INDEPENDENT `tokio::time::timeout(
-/// SESSION_CLOSE_TIMEOUT, ..)` per child, nested entirely inside the first.
-/// Each individual session's own close is still bounded by exactly one
-/// `SESSION_CLOSE_TIMEOUT`, but the OUTERMOST caller's timeout now has to
-/// cover its own close PLUS however much of that nested work finishes
-/// before it elapses — so a parent with several genuinely (not
-/// pathologically, just non-trivially) slow-closing children can have its
-/// own outer timeout fire before the cascade would have finished on its
-/// own, even though no single session in it ever came close to exceeding
-/// `SESSION_CLOSE_TIMEOUT` by itself.
+/// → each child's own `close_and_teardown` — into a second, nested
+/// `tokio::time::timeout` per child, running entirely inside the first.
 ///
-/// **If the outer timeout wins that race, `tokio::time::timeout` drops the
-/// nested future — see `close_and_teardown`'s own doc comment ("An
-/// abandoned close may leave the event log without its terminator") for
-/// what dropping mid-close already meant for ONE session, and
-/// `close_children`'s own doc comment for what it now additionally means
-/// for every descendant `close_children` had already `take`n out of
-/// `SubAgentSessions` but not yet finished retiring: that descendant's
-/// reaper was already aborted (`close_and_teardown`'s own step 1) and its
-/// record is already gone from the map, so nothing will ever retire it
-/// again — a genuine, permanent leak of that one session, not merely a
-/// slow one.**
+/// **Nested closes therefore do NOT use this constant.** They use
+/// [`nested_close_timeout`], which is strictly smaller and shrinks with
+/// tracked depth, precisely so the innermost bound is always the first one
+/// to fire. Giving every level the same 30s would make the nested timers
+/// dead code: an enclosing timeout created at `t` has deadline `t + 30s`,
+/// while a nested one created at `t + ε` (after the enclosing close's
+/// `cancel`, `wait_idle` and `children_of` snapshot) has deadline
+/// `t + 30s + ε`, so the enclosing timeout always wins and DROPS the nested
+/// timer before it can fire. That inverts the severity ordering that makes
+/// this bound useful at all: one permanently wedged descendant (the
+/// unreleased-`WorkGuard` case) would not be caught at its own level, and
+/// instead of "the wedged child is abandoned, its ancestors still write
+/// their terminators" the whole cascade would be abandoned at the root —
+/// on the socket path, with no forced teardown behind it, retaining the
+/// root's isolate, MCP host, registry entry and proxy token for the
+/// daemon's life.
 ///
-/// **Not rescaled or restructured in this fix round.** A correct per-tree
-/// budget (e.g. giving the outermost call a bound that scales with how much
-/// of the tree it might have to wait for) would need either threading a
-/// remaining-budget value down through every nested `close_and_teardown`
-/// call or making `HeadlessSession`/`close_and_teardown` aware of
-/// `SubAgentSessions` at all — the latter is exactly the module-boundary
-/// `crate::sub_agent_host` was built to keep out of `session_manager`.
-/// Documented here as an accepted, known risk instead: in the ordinary
-/// case (nothing wedged anywhere) a cascade completes in milliseconds
-/// regardless of depth, since this bound only ever matters when something
-/// is ALREADY taking unusually long — the case this fix round leaves
-/// undefended is a parent whose tree has several such slow (not
-/// permanently wedged) children at once.
-const SESSION_CLOSE_TIMEOUT: Duration = Duration::from_secs(30);
+/// **What 30s actually promises, and what it does not.** It promises that
+/// ONE session's own close (a leaf, or a root with no tracked children)
+/// cannot block its caller longer than this, and that a root's cascade
+/// cannot either. It does **not** promise the whole cascade fits: only
+/// designed-in grace periods already make an ordinary serial cascade
+/// expensive. Each child's [`HeadlessSession::finish_teardown`] awaits
+/// [`McpHost::shutdown`], which walks its stdio transports serially at
+/// `roundhouse_mcp`'s own `GRACEFUL_EXIT_TIMEOUT` (3s) per server, and a
+/// child holding a SIGTERM-ignoring shell costs about 5.5s inside
+/// `roundhouse_sandbox`'s `Child::cancel` (a 5s SIGTERM grace, then up to
+/// 25 × 20ms of `wait_for_empty_group` confirmation). Eight direct children
+/// with MCP hosts is therefore already around 24s of ordinary, non-wedged
+/// serial work inside a 30s budget — and §7.7's `MAX_DEPTH` × `MAX_FAN_OUT`
+/// permits thousands of descendants. A cascade over a large tree WILL be
+/// abandoned at this bound; what [`nested_close_timeout`] guarantees is
+/// only that the abandonment happens at the deepest level still running,
+/// where a `close_and_teardown` that is abandoned still runs its own
+/// `finish_teardown`, rather than at the root, where nothing does.
+pub(crate) const SESSION_CLOSE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// How much smaller each tracked level's close budget is than the level
+/// above it (Phase 8, T19a Task 6). See [`nested_close_timeout`].
+const NESTED_CLOSE_TIMEOUT_STEP: Duration = Duration::from_secs(5);
+
+/// The floor [`nested_close_timeout`] never returns less than: enough for
+/// one child's own designed-in grace periods (`Child::cancel`'s ~5.5s plus
+/// an `McpHost::shutdown` walk) to unwind rather than being cut off
+/// mid-SIGTERM. Reached exactly at §7.7's `MAX_DEPTH`, so no legitimate
+/// tracked depth is ever clamped to it from further down.
+const MIN_NESTED_CLOSE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// The close budget for a tracked sub-agent child at `depth`, applied by
+/// `SubAgentSessions`' own retirement path instead of
+/// [`SESSION_CLOSE_TIMEOUT`] (Phase 8, T19a Task 6).
+///
+/// Strictly decreasing in `depth` across §7.7's legitimate range (1 through
+/// `MAX_DEPTH` = 4, giving 25s/20s/15s/10s against the root's 30s), which is
+/// the whole point: a nested `tokio::time::timeout` is created strictly
+/// later than the one enclosing it, so it can only ever fire first if its
+/// bound is strictly smaller. With that ordering, a wedged descendant is
+/// abandoned at ITS own level — where `close_and_teardown` still runs
+/// `finish_teardown` and its ancestors still go on to write their own
+/// terminators — instead of stranding the whole cascade at the root.
+///
+/// A tracked child's depth is `parent depth + 1`, so `depth` is never 0
+/// here (`LiveSubAgent::depth`, set by `DaemonSubAgentHost::
+/// create_child_session` from what §7.7 admitted the child at); a root
+/// session is not tracked in `SubAgentSessions` at all and keeps
+/// `SESSION_CLOSE_TIMEOUT`. Depths past `MAX_DEPTH` cannot be admitted, and
+/// clamp at [`MIN_NESTED_CLOSE_TIMEOUT`] rather than reaching zero.
+pub(crate) fn nested_close_timeout(depth: u8) -> Duration {
+    let shrink = NESTED_CLOSE_TIMEOUT_STEP.saturating_mul(u32::from(depth));
+    let budget = SESSION_CLOSE_TIMEOUT.saturating_sub(shrink);
+    if budget < MIN_NESTED_CLOSE_TIMEOUT {
+        MIN_NESTED_CLOSE_TIMEOUT
+    } else {
+        budget
+    }
+}
 
 /// Everything [`HeadlessSession::close_and_teardown`] can fail with — either
 /// [`SessionActor::close`]'s own [`StoreError`], or that call being
-/// abandoned after [`SESSION_CLOSE_TIMEOUT`] elapses. Both are logged at
+/// abandoned after the close budget it was given elapses. Both are logged at
 /// error level by `close_and_teardown` itself before being returned; this
 /// type exists so a caller that needs to report the failure onward (a
 /// socket connection answering its own client, for one) has something
@@ -438,8 +479,12 @@ const SESSION_CLOSE_TIMEOUT: Duration = Duration::from_secs(30);
 pub enum CloseAndTeardownError {
     #[error(transparent)]
     Store(#[from] StoreError),
-    #[error("closing this session did not finish within {SESSION_CLOSE_TIMEOUT:?}")]
-    Timeout,
+    /// Carries the budget that actually elapsed, which is
+    /// `SESSION_CLOSE_TIMEOUT` for a root close and
+    /// `nested_close_timeout`'s smaller, depth-derived value for a tracked
+    /// child retired inside a cascade.
+    #[error("closing this session did not finish within {0:?}")]
+    Timeout(Duration),
 }
 
 /// A live headless session, plus everything needed to retire it.
@@ -471,7 +516,7 @@ pub struct HeadlessSession {
     proxy_token: String,
     reaper: tokio::task::JoinHandle<()>,
     /// Claimed exactly once, by whichever of this session's teardown routes
-    /// gets there first (Phase 8, T19a Task 6, fix round 1) — see
+    /// gets there first (Phase 8, T19a Task 6) — see
     /// [`Self::finish_teardown`]'s own doc comment.
     torn_down: Arc<AtomicBool>,
 }
@@ -599,6 +644,12 @@ impl HeadlessSession {
     /// as opposed to a reaper merely reacting to a `Closed` it happened to
     /// observe.
     ///
+    /// This is the OUTERMOST form, for a session nothing else's close is
+    /// waiting on. A tracked sub-agent child retired from inside an
+    /// ancestor's cascade goes through [`Self::close_and_teardown_within`]
+    /// with [`nested_close_timeout`]'s smaller, depth-derived budget
+    /// instead, so the inner bound fires before the outer one can drop it.
+    ///
     /// 1. Abort the reaper. This call is about to durably close and tear the
     ///    session down itself, so the reaper's own redundant reap of the
     ///    same `Closed` transition must never run concurrently with it —
@@ -606,7 +657,7 @@ impl HeadlessSession {
     ///    actually retires that task rather than leaking it. This runs
     ///    BEFORE `close()`, never after: reordering it would reopen exactly
     ///    that window.
-    /// 2. [`SessionActor::close`], wrapped in [`SESSION_CLOSE_TIMEOUT`]. A
+    /// 2. [`SessionActor::close`], wrapped in this call's own close budget. A
     ///    failure — a durable store error, or the timeout elapsing — is
     ///    logged at error level and returned to the caller, never panicked
     ///    on: this method's caller decides whether/how to report it onward
@@ -649,28 +700,52 @@ impl HeadlessSession {
         registry: &SessionRegistry,
         proxy: &LoopbackProxy,
     ) -> Result<CloseReceipt, CloseAndTeardownError> {
+        self.close_and_teardown_within(SESSION_CLOSE_TIMEOUT, outcome, registry, proxy)
+            .await
+    }
+
+    /// [`Self::close_and_teardown`] with an explicit close budget, for a
+    /// caller whose close is itself running inside someone else's
+    /// (Phase 8, T19a Task 6).
+    ///
+    /// `budget` MUST be strictly smaller than the bound of every timeout
+    /// this call runs inside, or this one is dead code: `tokio::time::
+    /// timeout` fixes its deadline when it is created, and a nested timeout
+    /// is always created later than the one enclosing it, so an equal bound
+    /// always yields the later deadline and is dropped before it can fire.
+    /// [`nested_close_timeout`] is what the one production caller —
+    /// `SubAgentSessions`' retirement path, driven by
+    /// `DaemonSubAgentHost::close_children` — derives that budget from, and
+    /// [`SESSION_CLOSE_TIMEOUT`]'s own doc comment carries the full
+    /// accounting of what the resulting ordering does and does not promise.
+    pub(crate) async fn close_and_teardown_within(
+        self,
+        budget: Duration,
+        outcome: SessionOutcome,
+        registry: &SessionRegistry,
+        proxy: &LoopbackProxy,
+    ) -> Result<CloseReceipt, CloseAndTeardownError> {
         self.reaper.abort();
-        let outcome_result =
-            match tokio::time::timeout(SESSION_CLOSE_TIMEOUT, self.actor.close(outcome)).await {
-                Ok(Ok(receipt)) => Ok(receipt),
-                Ok(Err(err)) => {
-                    tracing::error!(
-                        session_id = %self.session_id,
-                        error = %err,
-                        "failed to durably close this session; tearing it down anyway"
-                    );
-                    Err(CloseAndTeardownError::Store(err))
-                }
-                Err(_elapsed) => {
-                    tracing::error!(
-                        session_id = %self.session_id,
-                        timeout = ?SESSION_CLOSE_TIMEOUT,
-                        "closing this session did not finish within the timeout; tearing it down \
-                         anyway — its event log may be left without a SessionClosed terminator"
-                    );
-                    Err(CloseAndTeardownError::Timeout)
-                }
-            };
+        let outcome_result = match tokio::time::timeout(budget, self.actor.close(outcome)).await {
+            Ok(Ok(receipt)) => Ok(receipt),
+            Ok(Err(err)) => {
+                tracing::error!(
+                    session_id = %self.session_id,
+                    error = %err,
+                    "failed to durably close this session; tearing it down anyway"
+                );
+                Err(CloseAndTeardownError::Store(err))
+            }
+            Err(_elapsed) => {
+                tracing::error!(
+                    session_id = %self.session_id,
+                    timeout = ?budget,
+                    "closing this session did not finish within the timeout; tearing it down \
+                     anyway — its event log may be left without a SessionClosed terminator"
+                );
+                Err(CloseAndTeardownError::Timeout(budget))
+            }
+        };
         self.finish_teardown(registry, proxy).await;
         outcome_result
     }
@@ -682,7 +757,7 @@ impl HeadlessSession {
     /// `JoinHandle` is each caller's own concern, not this one's — see
     /// their own doc comments for why they differ.
     ///
-    /// # Exactly one real teardown, however many routes reach this session (Phase 8, T19a Task 6, fix round 1)
+    /// # Exactly one real teardown, however many routes reach this session (Phase 8, T19a Task 6)
     ///
     /// This session can be torn down by more than one independent route at
     /// once: this handle's own owner calling [`Self::teardown`]/
@@ -711,6 +786,31 @@ impl HeadlessSession {
     /// reaching this method — those are unconditional, so a session that
     /// lost the flag race here is still fully un-tracked, just not
     /// re-torn-down.
+    ///
+    /// # The claimed body must also RUN to completion, not just be claimed
+    ///
+    /// The flag alone only made teardown exactly-one-CLAIM. Everything after
+    /// it used to run inline on the caller's own future, and this method is
+    /// reached from places where that future can be dropped underneath it:
+    /// [`Self::close_and_teardown`]'s own call to this runs after its inner
+    /// timeout, but a session being retired inside an ancestor's cascade is
+    /// still inside THAT ancestor's `tokio::time::timeout`, whose elapse
+    /// drops the whole nested future — awaits included. A drop landing
+    /// between the claim and the end of the body left `torn_down` reading
+    /// "done" over a half-unwound isolate, MCP children never shut down and
+    /// a still-valid session bearer token registered with
+    /// [`LoopbackProxy`]; every other route short-circuits on the claimed
+    /// flag, so nothing ever retried it.
+    ///
+    /// [`release_claimed_resources`] is what closes that: the two
+    /// synchronous revocations run before anything can yield, and the two
+    /// awaits run in a detached `tokio::spawn` whose `JoinHandle` this call
+    /// merely awaits. Dropping this future drops the handle, which does not
+    /// cancel the task, so the claim stays true regardless of when the drop
+    /// lands. The ordering guarantee this gives up in exchange is that
+    /// callers no longer see the isolate torn down synchronously with their
+    /// own return if they were dropped — which is exactly the case where
+    /// they no longer exist to observe it.
     async fn finish_teardown(&self, registry: &SessionRegistry, proxy: &LoopbackProxy) {
         if !claim_teardown(&self.torn_down) {
             tracing::debug!(
@@ -720,24 +820,84 @@ impl HeadlessSession {
             );
             return;
         }
-        registry.remove(self.session_id);
-        self.actor.teardown().await;
-        if let Some(host) = &self.mcp_host {
+        release_claimed_resources(
+            self.session_id,
+            registry,
+            &self.actor,
+            self.mcp_host.as_ref(),
+            proxy,
+            &self.proxy_token,
+        )
+        .await;
+    }
+}
+
+/// Releases one session's real resources once a caller has won
+/// [`claim_teardown`]: the registry entry, the egress-proxy token, the real
+/// isolation handle and any MCP host (Phase 8, T19a Task 6).
+///
+/// # Uncancellable by construction
+///
+/// Both of this session's claiming routes — [`HeadlessSession::
+/// finish_teardown`] and `spawn_session_reaper`'s [`ReapAction::Teardown`]
+/// arm — can have their future dropped mid-body: the first by an ancestor's
+/// close timeout elapsing around a cascade this session is inside of, the
+/// second by the `reaper.abort()` [`HeadlessSession::close_and_teardown`]
+/// and [`HeadlessSession::teardown`] both run. A drop landing between the
+/// claim and the last line would leave the flag claiming a teardown that
+/// never happened, and since every other route short-circuits on that flag,
+/// nothing would retry it.
+///
+/// So the body cannot live on the caller's future. The two synchronous
+/// revocations run first, before this function can yield at all — and
+/// revoking egress before unwinding isolation rather than after is the
+/// fail-closed order anyway, since a session whose teardown has started
+/// should not still be able to reach the network through a live token. The
+/// two awaits then run inside `tokio::spawn`: dropping a `JoinHandle`
+/// detaches its task rather than cancelling it, so awaiting the handle here
+/// keeps an ordinary caller's "teardown finished when this returned"
+/// guarantee while a dropped caller still leaves the work running to
+/// completion.
+async fn release_claimed_resources(
+    session_id: SessionId,
+    registry: &SessionRegistry,
+    actor: &Arc<SessionActor>,
+    mcp_host: Option<&Arc<McpHost>>,
+    proxy: &LoopbackProxy,
+    proxy_token: &str,
+) {
+    registry.remove(session_id);
+    proxy.deregister_session(proxy_token);
+
+    let actor = Arc::clone(actor);
+    let mcp_host = mcp_host.cloned();
+    let unwinding = tokio::spawn(async move {
+        actor.teardown().await;
+        if let Some(host) = mcp_host {
             if let Err(err) = host.shutdown().await {
                 tracing::warn!(
-                    session_id = %self.session_id,
+                    session_id = %session_id,
                     error = %err,
                     "failed to shut down this session's MCP host"
                 );
             }
         }
-        proxy.deregister_session(&self.proxy_token);
+    });
+    if let Err(err) = unwinding.await {
+        // Nothing aborts this handle, so this is a panic inside the
+        // teardown itself, never a cancellation.
+        tracing::error!(
+            session_id = %session_id,
+            error = %err,
+            "this session's real resource teardown panicked; its isolation handle and any MCP \
+             children may be left behind"
+        );
     }
 }
 
 /// Claims the right to run one session's real resource teardown: `true` only
 /// for the first caller to observe `flag` false, atomically marking it done
-/// for every caller after that (Phase 8, T19a Task 6, fix round 1). Shared by
+/// for every caller after that (Phase 8, T19a Task 6). Shared by
 /// [`HeadlessSession::finish_teardown`] and `spawn_session_reaper`'s
 /// [`ReapAction::Teardown`] arm — the one teardown path that tears real
 /// resources down without going through a `HeadlessSession` at all — so
@@ -822,7 +982,7 @@ pub(crate) enum ReapAction {
 /// observed — see [`ReapAction`]'s own doc comment for why a plain headless
 /// root session and a tracked sub-agent child need different endings.
 ///
-/// `torn_down` (Phase 8, T19a Task 6, fix round 1) is the SAME flag the
+/// `torn_down` (Phase 8, T19a Task 6) is the SAME flag the
 /// `HeadlessSession` for this exact session carries — see
 /// [`HeadlessSession::finish_teardown`]'s own doc comment for why a shared
 /// flag, not spawn-then-rewire ordering alone, is what makes this reap
@@ -856,23 +1016,25 @@ pub(crate) fn spawn_session_reaper(
                             );
                             return;
                         }
-                        // Clears the registry's own bookkeeping first, then
-                        // tears down the REAL resources behind it (a real
-                        // bwrap isolation handle, real MCP child processes,
-                        // the proxy's session-token map entry) — clearing
-                        // bookkeeping alone would leave those leaked.
-                        registry.remove(session_id);
-                        actor.teardown().await;
-                        if let Some(host) = &mcp_host {
-                            if let Err(err) = host.shutdown().await {
-                                tracing::warn!(
-                                    session_id = %session_id,
-                                    error = %err,
-                                    "failed to shut down this session's MCP host"
-                                );
-                            }
-                        }
-                        proxy.deregister_session(&proxy_token);
+                        // Clears the registry's own bookkeeping and revokes
+                        // egress first, then tears down the REAL resources
+                        // behind them (a real bwrap isolation handle, real
+                        // MCP child processes) — clearing bookkeeping alone
+                        // would leave those leaked. Shared with
+                        // `HeadlessSession::finish_teardown` precisely
+                        // because this task is abortable: see
+                        // `release_claimed_resources`'s own doc comment for
+                        // why a claimed teardown must not live on a
+                        // cancellable future.
+                        release_claimed_resources(
+                            session_id,
+                            &registry,
+                            &actor,
+                            mcp_host.as_ref(),
+                            &proxy,
+                            &proxy_token,
+                        )
+                        .await;
                     }
                     ReapAction::RetireSubAgent { sub_agents, tree } => {
                         // Idempotent: a second reap of the same child (there
@@ -1469,9 +1631,40 @@ mod tests {
         assert!(!proxy.is_registered(&token));
     }
 
+    /// **Nested closes must be bounded strictly more tightly than the close
+    /// they run inside**, or their own `tokio::time::timeout` is dead code:
+    /// it is created strictly later than the enclosing one, so an equal
+    /// bound always yields the later deadline and is dropped, timer
+    /// included, before it can fire (Phase 8, T19a Task 6).
+    ///
+    /// Pinned as a pure relationship between the constants, independent of
+    /// any one cascade: `sub_agent_host`'s own
+    /// `a_wedged_child_is_abandoned_at_its_own_depth_derived_bound` proves
+    /// the retirement path really applies these values to a real wedged
+    /// child.
+    #[test]
+    fn a_nested_close_budget_is_strictly_smaller_at_every_tracked_depth() {
+        let mut previous = SESSION_CLOSE_TIMEOUT;
+        for depth in 1..=roundhouse_bus::limits::MAX_DEPTH {
+            let budget = nested_close_timeout(depth);
+            assert!(
+                budget < previous,
+                "depth {depth}'s close budget ({budget:?}) must be strictly smaller than the \
+                 budget of the level enclosing it ({previous:?}), or its timeout can never \
+                 fire first"
+            );
+            assert!(
+                budget >= MIN_NESTED_CLOSE_TIMEOUT,
+                "depth {depth}'s close budget ({budget:?}) must still leave room for one \
+                 child's own designed-in grace periods to unwind"
+            );
+            previous = budget;
+        }
+    }
+
     /// [`HeadlessSession::close_and_teardown`]'s [`SESSION_CLOSE_TIMEOUT`]
-    /// bound on a wedged [`SessionActor::close`] (Phase 8, T19a Task 5, fix
-    /// round 1). `close()`'s own durable `close_session` append is routed
+    /// bound on a wedged [`SessionActor::close`] (Phase 8, T19a Task 5).
+    /// `close()`'s own durable `close_session` append is routed
     /// through a `roundhouse_store::test_util::CloseGate` held open and
     /// never released — the same real, deterministic hang-until-signalled
     /// mechanism `roundhouse-engine`'s own `tests/session_close.rs` uses,
@@ -1545,7 +1738,7 @@ mod tests {
             .await
             .expect("close_and_teardown's own task must not panic");
         assert!(
-            matches!(&result, Err(CloseAndTeardownError::Timeout)),
+            matches!(&result, Err(CloseAndTeardownError::Timeout(_))),
             "an abandoned close must report Timeout, got {result:?}"
         );
 
@@ -1562,6 +1755,176 @@ mod tests {
         assert!(
             !proxy.is_registered(&token),
             "close_and_teardown must still deregister the real egress token after a timeout"
+        );
+    }
+
+    /// An [`Isolate`] whose `teardown` parks until it is released, so a test
+    /// can drop the future awaiting it at a known point rather than guessing
+    /// when to.
+    struct GatedIsolate {
+        started: std::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+        release: std::sync::Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
+        finished: std::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+        teardown_calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl Isolate for GatedIsolate {
+        fn declared(&self) -> Tier {
+            Tier::Sandbox
+        }
+
+        async fn probe(&self) -> ProbeResult {
+            ProbeResult {
+                achieved: Tier::Sandbox,
+                degradations: vec![],
+            }
+        }
+
+        async fn prepare(&self, _spec: &SessionSpec) -> Result<Handle, IsolationError> {
+            Ok(Handle {
+                id: "gated-isolate".into(),
+            })
+        }
+
+        async fn spawn(&self, _h: &Handle, _cmd: CommandSpec) -> Result<Child, IsolationError> {
+            unreachable!("this module's close/reap tests never dispatch a real shell")
+        }
+
+        fn attest(&self, _h: &Handle) -> Attestation {
+            Attestation {
+                tier: Tier::Sandbox,
+                digest: "gated-isolate".into(),
+                net_enforced: false,
+            }
+        }
+
+        async fn teardown(&self, _h: Handle) -> Result<(), IsolationError> {
+            // Both taken before anything is awaited, so no lock is ever held
+            // across a suspension point.
+            let started = self.started.lock().unwrap().take();
+            let release = self.release.lock().unwrap().take();
+            if let Some(started) = started {
+                let _ = started.send(());
+            }
+            if let Some(release) = release {
+                let _ = release.await;
+            }
+            self.teardown_calls.fetch_add(1, Ordering::SeqCst);
+            if let Some(finished) = self.finished.lock().unwrap().take() {
+                let _ = finished.send(());
+            }
+            Ok(())
+        }
+    }
+
+    /// **A claimed teardown that is dropped mid-body must still release
+    /// everything the claim says it released** (Phase 8, T19a Task 6).
+    ///
+    /// [`claim_teardown`] only ever made teardown exactly-one-CLAIM. The
+    /// body behind it awaits real isolation and MCP work, and
+    /// [`HeadlessSession::finish_teardown`] is reached from places whose
+    /// future can be dropped underneath it — a descendant being retired
+    /// inside an ancestor's cascade sits inside that ancestor's own close
+    /// timeout, and `tokio::time::timeout` drops what it bounds. A drop
+    /// between the claim and the end of the body used to leave `torn_down`
+    /// reading "done" over a half-unwound isolate and a still-registered
+    /// egress token, with every other route short-circuiting on the flag, so
+    /// nothing retried it.
+    ///
+    /// The drop here is exact rather than timed: [`GatedIsolate`] signals
+    /// when its `teardown` has been entered and then parks, and this test
+    /// drops the `finish_teardown` future at precisely that point. Nothing
+    /// sleeps; the one `tokio::time::timeout` below is a deterministic
+    /// failure bound on a paused clock, not a wait.
+    #[tokio::test(start_paused = true)]
+    async fn a_dropped_finish_teardown_still_releases_everything_it_claimed() {
+        let dir = tempfile::tempdir().unwrap();
+        let teardown_calls = Arc::new(AtomicUsize::new(0));
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let (finished_tx, finished_rx) = tokio::sync::oneshot::channel();
+        let isolate: Arc<dyn Isolate> = Arc::new(GatedIsolate {
+            started: std::sync::Mutex::new(Some(started_tx)),
+            release: std::sync::Mutex::new(Some(release_rx)),
+            finished: std::sync::Mutex::new(Some(finished_tx)),
+            teardown_calls: Arc::clone(&teardown_calls),
+        });
+
+        let actor = actor_with_isolate(dir.path(), isolate).await;
+        let registry = Arc::new(SessionRegistry::new());
+        let session_id = registry
+            .register_headless(actor.clone(), None, None)
+            .expect("registering against a fresh, non-full registry must succeed");
+        let (proxy, token) = real_proxy_with_registered_token(dir.path()).await;
+
+        let torn_down = Arc::new(AtomicBool::new(false));
+        let reaper = spawn_session_reaper(
+            registry.clone(),
+            session_id,
+            actor.clone(),
+            None,
+            proxy.clone(),
+            token.clone(),
+            ReapAction::Teardown,
+            Arc::clone(&torn_down),
+        );
+        let headless = HeadlessSession {
+            session_id,
+            actor: actor.clone(),
+            mcp_host: None,
+            proxy_token: token.clone(),
+            reaper,
+            torn_down: Arc::clone(&torn_down),
+        };
+
+        let mut tearing_down = Box::pin(headless.finish_teardown(&registry, &proxy));
+        tokio::select! {
+            _ = &mut tearing_down => panic!(
+                "finish_teardown must not resolve while the isolate's own teardown is parked"
+            ),
+            started = started_rx => started.expect(
+                "the isolate's teardown must have been entered before this test drops anything"
+            ),
+        }
+
+        // The cancellation: the caller awaiting the claimed body goes away
+        // with the isolate mid-unwind.
+        drop(tearing_down);
+
+        assert!(
+            torn_down.load(Ordering::SeqCst),
+            "sanity: the teardown really was claimed before the drop"
+        );
+        assert!(
+            registry.actor(session_id).is_none(),
+            "a claimed teardown that was dropped must still have removed the registry entry"
+        );
+        assert!(
+            !proxy.is_registered(&token),
+            "a claimed teardown that was dropped must still have revoked this session's egress \
+             token; leaving it registered hands a session that no longer exists a valid bearer \
+             token for the life of the daemon"
+        );
+
+        // Releasing the isolate proves the rest of the body outlived the
+        // dropped caller rather than being truncated with it.
+        release_tx
+            .send(())
+            .expect("the isolate's teardown must still be parked, not gone");
+        tokio::time::timeout(Duration::from_secs(5), finished_rx)
+            .await
+            .expect(
+                "a claimed teardown must run to completion after its caller is dropped; nothing \
+                 else will ever retry it, since every other route short-circuits on the claimed \
+                 flag",
+            )
+            .expect("the isolate's teardown must not be dropped mid-way");
+        assert_eq!(
+            teardown_calls.load(Ordering::SeqCst),
+            1,
+            "the real isolation handle must be torn down exactly once, by the detached body of \
+             the claim the dropped caller made"
         );
     }
 
@@ -1643,15 +2006,17 @@ mod tests {
 
         // No real-clock wait: `close()` already published `Closed` to the
         // state watch above, so the reaper is already woken; `yield_now`
-        // just lets it actually run. Polls on the LAST thing
-        // `finish_teardown` does (deregistering the proxy token), not on
-        // `sub_agents.is_empty()` — that goes true the moment
-        // `take_for_reap` runs, before `SpawnTree::remove_child`, the real
-        // isolation teardown, or this deregistration have happened, so it
-        // would let this loop break (and the assertions below run) while
-        // `teardown_from_reaper` is still genuinely in flight.
+        // just lets it actually run. Polls on the LAST thing this session's
+        // teardown does — the real isolation teardown that
+        // `release_claimed_resources` runs in its detached task, with no MCP
+        // host behind it here — not on `sub_agents.is_empty()`, which goes
+        // true the moment `take_for_reap` runs, before
+        // `SpawnTree::remove_child` or any real resource release has
+        // happened, so it would let this loop break (and the assertions
+        // below run) while `teardown_from_reaper` is still genuinely in
+        // flight.
         for _ in 0..1000 {
-            if !proxy.is_registered(&token) {
+            if teardown_calls.load(Ordering::SeqCst) == 1 {
                 break;
             }
             tokio::task::yield_now().await;
@@ -1683,7 +2048,7 @@ mod tests {
     }
 
     /// **A child spawned during a parent's own close is still retired**
-    /// (Phase 8, T19a Task 6, fix round 1) — `DaemonSubAgentHost::
+    /// (Phase 8, T19a Task 6) — `DaemonSubAgentHost::
     /// close_children`'s single `children_of(parent)` snapshot could
     /// otherwise miss a child admitted after that snapshot but before the
     /// parent's own close finishes (`wait_idle` does not cover this: a

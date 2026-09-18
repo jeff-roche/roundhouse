@@ -802,7 +802,7 @@ fn workspace_contained_script(
 
 /// Polls this session's own durable event log until a `TaskCreated { kind,
 /// .. }` matching `kind` has a corresponding `TaskStarted` for the SAME
-/// task id, then returns — the explicit, non-sleep signal fix round 1's
+/// task id, then returns — the explicit, non-sleep signal this file's
 /// cancellation tests drive their `cancel()` call on. Filtering by `kind`
 /// (not just "any `TaskStarted`") matters: `run_chat_turn` mints its own
 /// `chat`/`infer` tasks and appends the `chat` task's `TaskStarted` almost
@@ -4593,7 +4593,7 @@ async fn wait_idle_resolves_only_after_the_last_work_guard_drops() {
 }
 
 // =======================================================================================
-// Fix round 1 — Finding 1 (security): non-shell builtin dispatch
+// Phase 8, T19a Task 3 (security): non-shell builtin dispatch
 // (`read`/`write`/`edit`/`find`) had no cancellation mechanism at all, so a
 // model-steered `read` of an indefinitely-blocking path (a FIFO with no
 // writer, most concretely) pinned `run_agent_loop`'s own `WorkGuard`

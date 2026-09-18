@@ -1148,7 +1148,7 @@ async fn an_unresolvable_job_fails_the_delivery_rather_than_the_driver() {
     // through `release_session`, writing no terminator — this failure is
     // reached before any workflow ever ran.
     //
-    // Fix round 1 (I3): like the redrive-continuation test's first boot,
+    // Like the redrive-continuation test's first boot,
     // this assertion is vacuous by itself — an unresolvable job fails
     // resolution before `*session` is ever set, so `release_session`
     // receives `None` here too, and `None` can't distinguish
@@ -3043,7 +3043,7 @@ mod recovery_tests {
     /// Phase 8, T19a Task 7: `release_session` (no terminator) must not
     /// poison a `session_id` for a LATER, successful redrive.
     ///
-    /// Fix round 1 (I3): the FIRST boot's own "no terminator" assertion
+    /// The FIRST boot's own "no terminator" assertion
     /// below is vacuous by itself — `rebuild_and_drive_recovered_run`
     /// returns every `DeliveryError` (including `NoWorkspaceRegistry`,
     /// forced here) BEFORE `*session` is ever set, so `release_session`

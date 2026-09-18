@@ -162,11 +162,17 @@ pub enum AgentLoopError {
 /// The reason `actor`'s owning session was cancelled, per
 /// [`SessionActor::cancel`]'s own typed storage
 /// ([`SessionActor::cancel_reason`]). Falls back to `CancelReason::User`
-/// with a loud warning if none was stored — `cancel` is the only writer of
-/// the session's state watch away from `Created`/`Running`, and it always
-/// stores a reason before flipping it, so a caller reaching this fallback
-/// means that invariant broke elsewhere, not that cancellation itself is in
-/// doubt.
+/// with a loud warning if none was stored.
+///
+/// That fallback is genuinely reachable rather than merely defensive:
+/// `cancel` is not the only writer of the session's state watch away from
+/// `Created`/`Running` — [`SessionActor::close`] publishes `Closed` to it
+/// too, and an actor constructed with `initial_state: Closed` never went
+/// through `cancel` at all. `cancel` does always store a reason before
+/// flipping the state, so this loop observing a cancellation without one
+/// would still mean a broken invariant; a session that reached a terminal
+/// state some other way just has no reason to report, and `User` is the
+/// documented stand-in.
 fn stored_cancel_reason(actor: &SessionActor) -> CancelReason {
     actor.cancel_reason().unwrap_or_else(|| {
         tracing::warn!(
@@ -1428,7 +1434,7 @@ async fn dispatch_mcp(
 /// `TaskFailed` pair, so the "no silent non-event" guarantee above covers
 /// containment rejections too, not only policy denials.
 ///
-/// # Cancellation during execution (Phase 8, T19a Task 3, fix round 1)
+/// # Cancellation during execution (Phase 8, T19a Task 3)
 ///
 /// After `TaskStarted`, the real executor call
 /// ([`crate::tool_dispatch::execute_builtin`]) is handled two different

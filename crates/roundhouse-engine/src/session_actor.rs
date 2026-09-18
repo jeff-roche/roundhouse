@@ -948,12 +948,20 @@ impl SessionActor {
 
     /// The `CancelReason` stored by the most recent [`Self::cancel`] call,
     /// or `None` if `cancel` has never been called for this session (or its
-    /// lock is poisoned — see that method's own doc comment). A caller
-    /// reacting to this session having left `Created`/`Running` should treat
-    /// `None` as unreachable by construction (`cancel` is the only writer of
-    /// `state_tx` away from its initial value, and it always stores a reason
-    /// first) and fall back to a documented default — `CancelReason::User`,
-    /// logged loudly — rather than panicking or silently guessing.
+    /// lock is poisoned — see that method's own doc comment).
+    ///
+    /// A caller reacting to this session having left `Created`/`Running`
+    /// should fall back to a documented default — `CancelReason::User`,
+    /// logged loudly — rather than panicking or silently guessing, because
+    /// `None` here is **reachable**, not merely defensive. [`Self::cancel`]
+    /// is not the only writer of `state_tx`: [`Self::close`] publishes
+    /// `SessionState::Closed` to the same watch, and a `cancel`-free path to
+    /// it exists — an actor constructed with `initial_state: Closed` is
+    /// already past `Created`/`Running` with nothing ever having stored a
+    /// reason. `cancel` itself does always store a reason before flipping
+    /// the state, so a `None` observed after a real `cancel` would still be
+    /// a broken invariant; the fallback covers the other route, not that
+    /// one.
     pub fn cancel_reason(&self) -> Option<CancelReason> {
         self.cancel_reason
             .read()

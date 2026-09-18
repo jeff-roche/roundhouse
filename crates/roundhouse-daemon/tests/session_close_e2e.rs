@@ -656,7 +656,7 @@ async fn a_creator_closing_after_a_completed_turn_durably_closes_and_reaps_the_s
 /// `agent_loop_dispatch.rs`); it does not, and structurally cannot from
 /// outside the sandbox, prove that a group-wide kill also reaches a
 /// workload running inside a real bwrap wrapper — that property is
-/// `roundhouse-sandbox`'s own `hard_prerequisites_integration.rs`-shaped
+/// `roundhouse-engine`'s own `hard_prerequisites_integration.rs`-shaped
 /// concern, not this lane's.
 #[tokio::test]
 async fn closing_while_a_shell_is_in_flight_kills_it_and_orders_the_sweep_before_the_terminator() {

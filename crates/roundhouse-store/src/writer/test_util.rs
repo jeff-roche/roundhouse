@@ -46,9 +46,9 @@ pub struct CloseGate {
     /// Waiting` carries, if any. Deliberately a separate `Mutex` from `state`: `admit` takes
     /// the receiver out of `state` (and flips `state` back to `Open`) before it has actually
     /// been fired, so `release` — which only ever needs `tx`, never `state` — must still be
-    /// able to reach it after that happens. See [`Self::hold`]/[`Self::release`] for why this
-    /// generational replacement, rather than `Notify`, is what closes the fix round 2
-    /// (review finding N1) hazard.
+    /// able to reach it after that happens. See [`Self::hold`]/[`Self::release`] for why a
+    /// fresh generation per hold, rather than `Notify`, is what closes the stray-wakeup
+    /// hazard.
     tx: Mutex<Option<oneshot::Sender<()>>>,
 }
 
@@ -98,7 +98,7 @@ impl CloseGate {
 
     /// Releases a `close_session` call currently blocked by [`Self::hold`].
     ///
-    /// Fix round 2 (review finding N1): the earlier `Notify`-based version gated
+    /// An earlier `Notify`-based version gated
     /// `notify_one` on "is a hold genuinely active right now," but `Notify::notify_one`
     /// still stores a permit for the next `notified().await` even when that check passes
     /// only because nothing is *currently* waiting — so a `release()` racing ahead of the
@@ -162,7 +162,7 @@ impl CloseGate {
 /// [`close_session`], against the real `store`, with the real redaction and tail-guard
 /// behavior — this is a gate in front of a real close, never a fake one.
 ///
-/// **Fix round 1 (review finding M1):** an earlier version of this function spawned each
+/// **Why a gated close stalls this loop:** an earlier version of this function spawned each
 /// `close_session` call off onto its own task rather than awaiting `gate.admit()` inline in
 /// this loop, so that a `CloseGate::hold`-paused close could not stall this task's ability
 /// to keep servicing ordinary `Append`/`AppendBatch` commands meanwhile. That let a gated
@@ -204,7 +204,7 @@ pub async fn spawn_gated_writer(store: StorePool, gate: Arc<CloseGate>) -> Event
                     reply,
                 } => {
                     // Awaited inline, same as `Append`/`AppendBatch` above — see this
-                    // function's own doc comment (fix round 1, M1) for why a held gate is
+                    // function's own doc comment for why a held gate is
                     // allowed to stall this loop rather than being spawned off.
                     let redactor = redactor_for_task.load_full();
                     let result = match gate.admit().await {
