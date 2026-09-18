@@ -144,20 +144,31 @@ const SUBMIT_TURN_SYSTEM_PROMPT: &str =
 /// clears whatever wedged it and a retry succeeds (see below). If it was
 /// instead inside step 4's cascade (`sub_agent_host().close_children`) —
 /// which every socket-created session has, since `drive_session`'s
-/// `CreateSession` branch always calls `wire_sub_agent_host` — the drop
-/// costs strictly less, because that cascade does not live on the dropped
-/// future. `close_children` retires one level's children concurrently and
-/// drives each retirement on its own `tokio::spawn`ed task (Phase 8, T19a,
-/// issue #91), so this timeout elapsing releases THIS connection while every
-/// descendant already being retired goes on to `finish_teardown` and gives
-/// its isolate, MCP children, registry entry and egress token back. What the
-/// drop does still cost there is the terminators: this session's own
-/// `SessionClosed` is never appended (step 5 is never reached), and neither
-/// is that of any descendant abandoned at its own depth-derived bound. A
+/// `CreateSession` branch always calls `wire_sub_agent_host` — the
+/// DESCENDANTS cost strictly less, because that cascade does not live on the
+/// dropped future. `close_children` retires one level's children
+/// concurrently and drives each retirement on its own `tokio::spawn`ed task
+/// (Phase 8, T19a, issue #91), so this timeout elapsing releases THIS
+/// connection while every descendant already being retired goes on to
+/// `finish_teardown` and gives its isolate, MCP children, registry entry and
+/// egress token back. What the drop does still cost among them is the
+/// terminators — this session's own `SessionClosed` is never appended (step
+/// 5 is never reached), and neither is that of any descendant abandoned at
+/// its own depth-derived bound, which additionally strands that descendant's
+/// OWN tracked subtree (`DaemonSubAgentHost::close_children`'s "What a
+/// dropped cascade still does not give you" section has that accounting). A
 /// later successful retry of this session's close writes its own terminator
-/// but cannot retroactively write a descendant's. Either way, immediately
-/// after the timeout the session itself is left in `Cancelling`, not
-/// "closed" and not "still running".
+/// but cannot retroactively write a descendant's.
+///
+/// THIS session's own resources, though, are no better off than in the
+/// step-3 case. Step 5 never running means step 6 never publishes `Closed`,
+/// so `spawn_session_reaper` never fires here either — and a socket-created
+/// session has no `HeadlessSession` behind it to run `finish_teardown`
+/// regardless — so its isolate, MCP children, registry entry and proxy token
+/// are retained on exactly the same terms, until something later clears
+/// whatever wedged it and a retry succeeds. Either way, immediately after
+/// the timeout the session itself is left in `Cancelling`, not "closed" and
+/// not "still running".
 ///
 /// **A retry can still succeed, unlike either leak above might suggest.**
 /// `SessionActor::close`'s own doc comment is explicit that a retry re-runs

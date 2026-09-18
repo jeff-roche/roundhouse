@@ -846,24 +846,68 @@ impl SubAgentHost for DaemonSubAgentHost {
     ///
     /// # What a dropped cascade still does not give you
     ///
-    /// Detaching reclaims RESOURCES; it does not finish a close.
+    /// Detaching reclaims the resources of every session a retirement
+    /// actually REACHES. It does not finish a close, and the residuals below
+    /// are not all terminators: one of them is a retained-resource hole this
+    /// method does not close.
     ///
-    /// - **`parent`'s own terminator is still not written.** The drop lands
-    ///   inside step 4 of
+    /// - **`parent`'s own terminator is still not written, and `parent`
+    ///   never reaches `Closed`.** The drop lands inside step 4 of
     ///   [`SessionActor::close`](roundhouse_engine::SessionActor::close),
     ///   before step 5's `EventWriter::close_session`, so the durable log can
     ///   end up recording a still-open `parent` over descendants that have
-    ///   genuinely been torn down. A retry of `parent`'s close is what fixes
-    ///   that, and it is cheap: step 2 is skipped once `cancel_recorded` is
-    ///   set, and this method is idempotent.
-    /// - **A child wedged past its own bound gets no terminator either.**
-    ///   `close_and_teardown_within` abandons the child's `close` at the
-    ///   depth-derived budget and runs `finish_teardown` anyway, so the
-    ///   resources come back but that child's log has no `SessionClosed`.
+    ///   genuinely been torn down — and step 6's `state_tx` publish is never
+    ///   reached either, so `session_manager::spawn_session_reaper`, which
+    ///   fires only on `SessionState::Closed`, never fires for `parent`.
+    ///   For a `HeadlessSession` `parent` that costs nothing:
+    ///   `close_and_teardown_within` runs `finish_teardown` unconditionally
+    ///   after its own timeout, so `parent`'s resources come back with or
+    ///   without its reaper. For the outermost socket-created root it is not
+    ///   free — there is no `HeadlessSession` behind one, so its isolate, MCP
+    ///   children, registry entry and proxy token are retained until a retry
+    ///   of its close succeeds (`socket_server::CLOSE_SESSION_TIMEOUT`'s own
+    ///   doc comment carries that case). A retry of `parent`'s close is what
+    ///   fixes both, and it is cheap: step 2 is skipped once
+    ///   `cancel_recorded` is set, and this method is idempotent.
+    /// - **A child wedged past its own bound gets no terminator, and its own
+    ///   subtree gets nothing at all.** `close_and_teardown_within` abandons
+    ///   the child's `close` at the depth-derived budget and runs
+    ///   `finish_teardown` anyway, so THAT child's own isolate, MCP host,
+    ///   registry entry and egress token do come back; only its
+    ///   `SessionClosed` is missing. What does not come back is anything
+    ///   BELOW it, whenever the wedge is in step 3 —
+    ///   `SessionActor::wait_idle` has no bound of its own and returns only
+    ///   once every `WorkGuard` has dropped, which is the unreleased-guard
+    ///   case, so the depth-derived budget fires INSIDE `wait_idle`. That
+    ///   child's own `close_children` is then never called, not one of its
+    ///   own tracked children is ever `take`n, and `finish_teardown` drops
+    ///   the `HeadlessSession` that was the only handle able to retry them.
+    ///   (A wedge in step 5 instead — a slow terminator append — costs only
+    ///   the terminator, since step 4 has already run.) Each
+    ///   orphan is left in [`SubAgentSessions`] with a `parent` naming a
+    ///   session that no longer exists, still in `SpawnTree`, still in the
+    ///   `SessionRegistry`, still holding a live proxy bearer token — and no
+    ///   reclaim route survives: the dead parent's `close_children` can never
+    ///   run again, an orphan's own `ReapAction::RetireSubAgent` reaper fires
+    ///   only when ITS OWN actor reaches `Closed` and nothing closes it, and
+    ///   `workflow_host::reconcile_spawn_tree` runs only at boot. That hole
+    ///   predates the detached retirement and is untouched by it — closing it
+    ///   is a separate follow-up, and this section deliberately does not
+    ///   claim it is handled.
     /// - **Later re-poll passes never happen.** A dropped pass is the last
-    ///   one, so a child admitted after the drop stays tracked — with its
-    ///   record, edge and reaper intact, which is exactly the recoverable
-    ///   shape.
+    ///   one, so a child admitted after the drop stays tracked, with its
+    ///   record, edge and reaper intact. That is the recoverable shape, but
+    ///   only while something can still retry `parent`'s close: a
+    ///   socket-created root's client can send `CloseSession` again, whereas
+    ///   a `HeadlessSession` `parent` is consumed by the
+    ///   `close_and_teardown_within` call that just dropped this cascade and
+    ///   is deregistered by its `finish_teardown`, so nothing is left holding
+    ///   it and that child is orphaned on the same terms as the bullet above.
+    /// - **A retirement that PANICS is outside all of this.** "Uncancellable
+    ///   by construction" is about drops, not panics, and a panic is the one
+    ///   way a spawned retirement still fails to reach `finish_teardown` —
+    ///   see the `retiring.await` error arm in this method's body for what
+    ///   that leaves behind.
     /// - **Runtime shutdown still wins.** Detached tasks are dropped when the
     ///   runtime goes away; this buys nothing against the daemon exiting
     ///   mid-cascade.
@@ -887,7 +931,13 @@ impl SubAgentHost for DaemonSubAgentHost {
     /// 8 + 64 + 512 + 4096 = 4680 retirements in flight. Dropping a pass
     /// also drops its accounting, not its tasks — retirements detached by an
     /// earlier drop are still running and are not counted against a retry's
-    /// bound.
+    /// bound. That cannot grow without limit, because
+    /// `SubAgentSessions::take` succeeds exactly once per child ever: a
+    /// retry's `children_of` snapshot can never re-include a child an earlier
+    /// pass already took, so detached retirements are disjoint, each finishes
+    /// within its own depth-derived bound plus its `finish_teardown`, and the
+    /// live ones are bounded by the live tracked sessions — which §7.7's
+    /// `MAX_DEPTH`/`MAX_FAN_OUT` already bound.
     async fn close_children(&self, parent: SessionId) {
         if parent != self.session {
             tracing::error!(
@@ -911,7 +961,7 @@ impl SubAgentHost for DaemonSubAgentHost {
                 return;
             }
             // Concurrently, not one at a time — see this method's own
-            // "The enclosing timeout bounds the WHOLE cascade" section.
+            // "Siblings concurrently, levels sequentially" section.
             // `ancestors` is shared by reference across the join rather
             // than re-derived per child: it is the ONE snapshot this call
             // refuses, exactly as it was when this loop was serial.

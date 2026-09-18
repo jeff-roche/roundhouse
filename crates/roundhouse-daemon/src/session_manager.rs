@@ -475,10 +475,13 @@ async fn build_headless_session(
 /// What that costs is now bounded: the pass is detached rather than
 /// stranded, so every retirement it had already started still runs to
 /// `finish_teardown` and gives back its isolate, MCP host, registry entry
-/// and egress token. What is still lost is the terminator — this session's
+/// and egress token. What is still lost is the terminators — this session's
 /// own `SessionClosed` (step 5 is never reached) and that of any descendant
-/// abandoned at its own bound. `close_children`'s own doc comment lists the
-/// rest.
+/// abandoned at its own bound — plus, for such a descendant, its own tracked
+/// subtree, which the `close` abandoned inside `wait_idle` never reached at
+/// all. `close_children`'s own "What a dropped cascade still does not give
+/// you" section carries that accounting, and names the subtree hole as a
+/// separate, still-open one.
 pub(crate) const SESSION_CLOSE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// How much smaller each tracked level's close budget is than the level
@@ -864,15 +867,27 @@ impl HeadlessSession {
     /// # The claimed body must also RUN to completion, not just be claimed
     ///
     /// The flag alone only made teardown exactly-one-CLAIM. Everything after
-    /// it used to run inline on the caller's own future, and this method is
-    /// reached from places where that future can be dropped underneath it.
-    /// [`Self::close_and_teardown`]'s own call to this runs after its inner
-    /// timeout, so that one cannot cut it short — but its CALLER's future
-    /// can be dropped at any point (`scheduler_driver`'s `close_and_retire`
-    /// runs inside a delivery task the daemon can drop at shutdown), and
-    /// `spawn_session_reaper`'s own arm is dropped outright by the
-    /// `reaper.abort()` that [`Self::teardown`] and
-    /// [`Self::close_and_teardown`] both run. A drop landing
+    /// it used to run inline on whichever future reached it, and the claim is
+    /// SHARED with `spawn_session_reaper`'s [`ReapAction::Teardown`] arm, so
+    /// a drop on either route poisons the other.
+    ///
+    /// The reaper's arm is what makes this load-bearing outside shutdown. It
+    /// calls [`release_claimed_resources`] directly, and
+    /// [`Self::close_and_teardown_within`] (and therefore
+    /// [`Self::close_and_teardown`]) and [`Self::teardown`] all open with
+    /// `self.reaper.abort()` — so every explicit close can drop a claimed
+    /// teardown part-way through its body, with nothing shutting down.
+    ///
+    /// This method's own route is the weaker of the two, and is not what
+    /// justifies the spawn.
+    /// [`Self::close_and_teardown`]'s call to this runs after its inner
+    /// timeout, so that one cannot cut it short, and the caller behind it
+    /// that this doc names is shutdown-only: `scheduler_driver`'s
+    /// `close_and_retire` is reached from `DeliveryExecutor::run_claimed`,
+    /// which `dispatch_ready_deliveries` runs in a `tokio::spawn`ed task
+    /// whose `JoinHandle` it discards, and a detached task is dropped only
+    /// when the runtime goes away — exactly the case a spawn cannot defend
+    /// against anyway. A drop landing
     /// between the claim and the end of the body left `torn_down` reading
     /// "done" over a half-unwound isolate, MCP children never shut down and
     /// a still-valid session bearer token registered with
