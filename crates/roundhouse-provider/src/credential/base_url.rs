@@ -57,24 +57,34 @@ use super::{host_only::record_base_url_override, CredentialError};
 ///
 /// **This opt-in alone does NOT make the GPU-box scenario work end to end
 /// today (fix round 3, Ruling R39) — say so precisely, don't imply it
-/// does.** Setting the env var clears *this gate*, nothing more. The
-/// daemon's actual transport (`ReqwestTransport::new()`,
-/// `roundhouse-daemon/src/main.rs`) sets `https_only(true)`
-/// (`reqwest_transport.rs`), which rejects a plain `http://` request
-/// independently of anything this function decides — so an insecure base
-/// URL that passes this gate still fails one layer down, at the transport.
-/// `ReqwestTransport::allowing_plaintext_http()` already exists
-/// (`reqwest_transport.rs`) with only test callers today; **when plaintext
-/// HTTP must actually reach a local-runtime provider, the fix is
-/// per-provider transport selection driven by this SAME
-/// `ROUNDHOUSE_<PROVIDER>_ALLOW_INSECURE_BASE_URL` signal — NOT wiring the
-/// daemon to `allowing_plaintext_http()` globally.** A global switch
-/// removes `https_only` for every provider at once, silently widening the
-/// exact control this gate exists to tighten, for every provider whether
-/// or not its operator ever opted in. Recorded here, not only in a
-/// gitignored ledger, because an operator who follows this gate's error
-/// message, sets the env var, and still fails will go looking — and
-/// `allowing_plaintext_http()` is one grep away and already written.
+/// does.** Setting the env var clears *this gate*, nothing more. None of the
+/// profile-driven providers this function serves (the local-runtime family
+/// `resolve_base_url`'s own doc names above — Ollama, llama.cpp, and
+/// friends) is wired into `roundhouse-daemon`'s `main` yet, so there is no
+/// transport selection at all for them there to fail on top of.
+///
+/// **`ReqwestTransport::allowing_plaintext_http()` is no longer test-only
+/// (Phase 8, Task 8 — correcting this paragraph's earlier claim): it now has
+/// one real, non-test caller, `roundhouse-daemon`'s `main`, for the
+/// unrelated `AnthropicMessagesProvider`.** That selection is per-provider
+/// and loopback-only by construction — `main` picks
+/// `allowing_plaintext_http()` only for a `ROUNDHOUSE_ANTHROPIC_BASE_URL`
+/// that `anthropic_provider::parse_anthropic_base_url` has itself already
+/// validated as `AnthropicBaseUrlTransport::HttpLoopback` (`http://` against
+/// a loopback host, nothing else) — never a blanket switch for every
+/// provider. It is exactly the shape this paragraph's warning already
+/// called for: **when plaintext HTTP must actually reach a local-runtime
+/// provider, the fix is the same per-provider, gated transport selection —
+/// driven by this function's own `ROUNDHOUSE_<PROVIDER>_ALLOW_INSECURE_BASE_URL`
+/// signal for THAT provider — never wiring the daemon to
+/// `allowing_plaintext_http()` globally.** A global switch would remove
+/// `https_only` for every provider at once, silently widening the exact
+/// control this gate exists to tighten, for every provider whether or not
+/// its operator ever opted in. Recorded here, not only in a gitignored
+/// ledger, because an operator who follows this gate's error message, sets
+/// the env var, and still fails will go looking — and
+/// `allowing_plaintext_http()` is one grep away and already written, with a
+/// real caller now to point at as the pattern to copy.
 pub fn resolve_base_url(
     provider_id: &str,
     profile_default: &str,

@@ -70,9 +70,16 @@ impl ReqwestTransport {
     ///
     /// **`https_only(true)`** stops the same credential from ever going out in
     /// cleartext if a base URL is misconfigured — `AnthropicMessagesProvider`'s
-    /// `base_url` is a public field, documented as where §9.9's future
-    /// `ROUNDHOUSE_<PROVIDER>_BASE_URL` override will land, so an
-    /// environment-controlled `http://` value has to fail closed.
+    /// `base_url` is a public field, and §9.9's `ROUNDHOUSE_ANTHROPIC_BASE_URL`
+    /// override has landed (`parse_anthropic_base_url`, `anthropic_provider`),
+    /// so an environment-controlled value really can reach this field. This
+    /// is still the constructor `roundhouse-daemon`'s `main` picks for that
+    /// value whenever it validates as `AnthropicBaseUrlTransport::Https`; only
+    /// a value that validates as `AnthropicBaseUrlTransport::HttpLoopback`
+    /// (`http://` against a loopback host, and nothing else) gets
+    /// [`allowing_plaintext_http`](Self::allowing_plaintext_http) instead, so
+    /// a non-loopback `http://` value still fails closed exactly as this
+    /// paragraph describes.
     ///
     /// Panics only if the TLS backend cannot initialize at all, which is a
     /// process-startup environment failure and matches `Client::new()`'s own
@@ -90,11 +97,14 @@ impl ReqwestTransport {
     /// Same as [`new`](Self::new) in every respect except that plaintext
     /// `http://` is permitted.
     ///
-    /// Exists because two legitimate callers cannot use HTTPS: this crate's own
+    /// Exists because legitimate callers cannot use HTTPS: this crate's own
     /// hermetic round-trip test, whose local TCP responder would need a
-    /// generated certificate chain to speak TLS, and Phase 6's local providers
-    /// (Ollama, llama.cpp and friends bind plaintext `http://127.0.0.1`).
-    /// Deliberately a separate, named constructor rather than a flag on
+    /// generated certificate chain to speak TLS; Phase 6's local providers
+    /// (Ollama, llama.cpp and friends bind plaintext `http://127.0.0.1`); and,
+    /// as of Phase 8 Task 8, `roundhouse-daemon`'s `main`, for an operator's
+    /// `ROUNDHOUSE_ANTHROPIC_BASE_URL` that validated as
+    /// `AnthropicBaseUrlTransport::HttpLoopback` — the one real, non-test
+    /// production call site today. Deliberately a separate, named constructor rather than a flag on
     /// [`new`](Self::new): the safe configuration stays the one you get by
     /// default, and every caller that gives up HTTPS has to say so at its own
     /// call site, where a reviewer will see it.
