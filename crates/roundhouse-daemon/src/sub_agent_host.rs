@@ -43,6 +43,10 @@ use roundhouse_engine::tools::agent_spawn_tool::{
 };
 use roundhouse_engine::SessionActor;
 use roundhouse_net::proxy::LoopbackProxy;
+// `for_each_concurrent`, for `DaemonSubAgentHost::close_children`'s bounded
+// concurrent join over one pass's children. `futures` is already a direct
+// dependency of this crate.
+use futures::StreamExt as _;
 use tracing::Instrument;
 
 use crate::session_bootstrap::DaemonResources;
@@ -181,10 +185,13 @@ impl SubAgentSessions {
     /// other direction from [`Self::parent_of`] (Phase 8, T19a Task 6).
     ///
     /// A snapshot `Vec`, not a live view: `DaemonSubAgentHost::close_children`
-    /// retires each one in turn, and retiring a child awaits real teardown
-    /// work — holding `self.live`'s lock across that would block every other
-    /// caller of this map for as long as one child's isolation/MCP/proxy
-    /// teardown takes.
+    /// retires the whole snapshot concurrently, and retiring a child awaits
+    /// real teardown work — holding `self.live`'s lock across that would
+    /// block every other caller of this map for as long as one child's
+    /// isolation/MCP/proxy teardown takes. That the snapshot can also be
+    /// INCOMPLETE (a child admitted after it was taken) is why
+    /// `close_children` re-polls rather than trusting one call; see its own
+    /// doc comment.
     pub(crate) fn children_of(&self, parent: SessionId) -> Vec<SessionId> {
         self.live
             .lock()
@@ -342,6 +349,25 @@ impl SubAgentSessions {
 
     pub fn is_empty(&self) -> bool {
         self.len() == 0
+    }
+
+    /// The egress-proxy bearer token a tracked child is currently
+    /// registered under, if it is still tracked (Phase 8, T19a).
+    ///
+    /// Test-only, and only so a cascade test can name the token of EACH
+    /// child it is about to close and then prove each one was really
+    /// deregistered. `LoopbackProxy::registered_count` can prove a total
+    /// dropped to zero but cannot say which sibling's token survived, and
+    /// nothing in production reads a tracked child's token back —
+    /// `HeadlessSession::finish_teardown` is the only thing that uses it,
+    /// from inside the record this map owns.
+    #[cfg(test)]
+    pub(crate) fn proxy_token_of_for_test(&self, child: SessionId) -> Option<String> {
+        self.live
+            .lock()
+            .ok()?
+            .get(&child)
+            .map(|record| record.session.proxy_token_for_test().to_string())
     }
 
     /// Test-only direct insertion (Phase 8, T19a Task 5). The real path that
@@ -623,20 +649,41 @@ impl SubAgentHost for DaemonSubAgentHost {
     }
 
     /// Retires every session tracked in [`SubAgentSessions`] as a direct
-    /// child of `parent`, depth-first, with [`SessionOutcome::Cancelled`]
-    /// (Phase 8, T19a Task 6).
+    /// child of `parent` with [`SessionOutcome::Cancelled`] (Phase 8, T19a
+    /// Task 6).
     ///
     /// Called by [`SessionActor::close`](roundhouse_engine::SessionActor::close)'s
     /// own step 4, from INSIDE `parent`'s own close — so this must return
     /// without deadlocking against it. It does, structurally: each child in
     /// [`SubAgentSessions::children_of`] is retired via
     /// [`SubAgentSessions::retire_child`], which durably closes that child's
-    /// own actor before this call returns — and closing a child that itself
-    /// has children recurses into THAT child's own registered host's
+    /// own actor before that retirement returns — and closing a child that
+    /// itself has children recurses into THAT child's own registered host's
     /// `close_children`, driven by that child's own `SessionActor::close`,
-    /// never by this method calling itself. This is what makes the walk
-    /// depth-first: a child's whole subtree is retired before its next
-    /// sibling is even looked at.
+    /// never by this method calling itself.
+    ///
+    /// # Siblings concurrently, levels sequentially (Phase 8, T19a, issue #91)
+    ///
+    /// One pass's children are retired concurrently, bounded at
+    /// [`roundhouse_bus::limits::MAX_FAN_OUT`] — the same ceiling §7.7
+    /// already caps a parent's direct children at, so in a legitimate tree
+    /// that bound never binds and a pass's whole snapshot runs at once. A
+    /// LEVEL therefore costs its slowest child rather than the sum of its
+    /// children, which is what makes each child's own
+    /// `session_manager::nested_close_timeout` bound reachable for EVERY
+    /// sibling at that level rather than only the first one it got to — see
+    /// the timeout
+    /// section below, and `session_manager::SESSION_CLOSE_TIMEOUT`'s own doc
+    /// comment for the full accounting.
+    ///
+    /// DEPTH stays sequential, and is not something this flattens: a
+    /// child's subtree is retired by that child's own
+    /// `SessionActor::close`, which `retire_child` awaits, so a child's
+    /// whole subtree is still finished before that child's retirement
+    /// returns. What is no longer true is that a child's subtree finishes
+    /// before its SIBLINGS are looked at — sibling subtrees now interleave,
+    /// and the only thing separating their log lines is the `child` field
+    /// on the per-retirement span below.
     ///
     /// A no-op — logged, never panicking — if `parent` is not the session
     /// this host was registered on: the symmetric fence
@@ -698,6 +745,25 @@ impl SubAgentHost for DaemonSubAgentHost {
     /// currently-tracked session once before running out of un-retired
     /// children to find.
     ///
+    /// **Retiring siblings concurrently cannot turn a corrupted graph into
+    /// a `close_lock` deadlock** (Phase 8, T19a, issue #91). The guard is
+    /// still ONE `ancestors_of(parent)` snapshot per call, shared by the
+    /// whole pass rather than re-derived per child, so what this call
+    /// refuses is exactly what it refused when the loop was serial. What
+    /// rules out a cycle between two concurrent retirements is
+    /// `SubAgentSessions::take`: a retirement only ever reaches
+    /// [`SessionActor::close`](roundhouse_engine::SessionActor::close) — and
+    /// therefore only ever waits on a session's `close_lock` — if it won
+    /// that session's `take`, a single `remove` under one
+    /// `std::sync::Mutex`. Exactly one task can win a given session, and the
+    /// loser returns `false` without touching a lock at all. A deadlock
+    /// would need task A holding X's lock and waiting on Y while task B
+    /// holds Y's and waits on X; A can only wait on Y by having won Y, in
+    /// which case B never held it. Nothing here holds that mutex across an
+    /// `.await` either — `take` is synchronous, and `retire_child`'s only
+    /// suspension point is `LiveSubAgent::retire`, after the record is
+    /// already out of the map.
+    ///
     /// # The enclosing timeout bounds the WHOLE cascade this method drives, not one session
     ///
     /// This always runs inside some caller's `tokio::time::timeout` around
@@ -716,24 +782,39 @@ impl SubAgentHost for DaemonSubAgentHost {
     ///   two have to be named separately rather than assumed to be one.
     ///
     /// The practical consequence here: if that enclosing timeout elapses
-    /// while this method is mid-cascade, whatever child `retire_child`
+    /// while this method is mid-cascade, EVERY child `retire_child` has
     /// already `take`n out of `SubAgentSessions` but not yet finished
     /// retiring is abandoned with its reaper already aborted and its record
-    /// already gone — nothing will ever retire it again.
+    /// already gone — nothing will ever retire any of them again. Retiring
+    /// a pass's children concurrently means that is a whole pass at once
+    /// rather than the single child a serial loop had in flight; what it
+    /// buys in exchange is that reaching that case at all now takes a slow
+    /// ROOT rather than merely a second wedged sibling (last paragraph).
     ///
     /// Each child's own nested close is bounded by
     /// `session_manager::nested_close_timeout`'s depth-derived budget,
-    /// strictly smaller than the level above it. Because [`Self::
-    /// close_children`] retires children serially, that step buys room for
-    /// only the FIRST wedged child at a level: its nested bound fires
-    /// before the enclosing one, so it is caught at its own level and still
-    /// runs its own teardown. A later sibling at that level, or a chain
-    /// whose earlier steps already spent the slack, is instead caught by
-    /// the enclosing bound first, with no teardown of its own. What no
-    /// ordering here buys is room for the whole cascade: `SESSION_CLOSE_
-    /// TIMEOUT`'s own doc comment works through why even a non-wedged
-    /// eight-child tree with MCP hosts can exhaust a 30s budget on
-    /// designed-in grace periods alone.
+    /// strictly smaller than the level above it. Because a pass's children
+    /// are retired concurrently, they all arm that smaller bound at
+    /// essentially the same instant, so EVERY wedged sibling at a level
+    /// fires its own bound before the enclosing one and is caught at its
+    /// own level, where `close_and_teardown_within` still runs
+    /// `finish_teardown`. Before Phase 8, T19a (issue #91) this loop was
+    /// serial, and the step bought room for only the FIRST wedged child at
+    /// a level: a later sibling was started only once the first one's 25s
+    /// bound had already elapsed, so its own deadline landed past the
+    /// root's 30s one and it was dropped with no teardown at all.
+    ///
+    /// **Two things this still does not buy.** Room for the whole cascade:
+    /// `session_manager::SESSION_CLOSE_TIMEOUT`'s own doc comment works
+    /// through why a deep enough tree exhausts a 30s budget on designed-in
+    /// grace periods alone, sibling concurrency or not. And room for a root
+    /// that is itself slow to get here: a child arms its 25s bound only
+    /// after `parent`'s own `cancel`, `wait_idle` and first `children_of`
+    /// snapshot have run, so if those together consume more than the 5s of
+    /// slack between the two bounds — a root holding its own
+    /// SIGTERM-ignoring shell spends about 5.5s inside `cancel` alone — the
+    /// enclosing bound wins and that whole pass is stranded exactly as
+    /// described above.
     async fn close_children(&self, parent: SessionId) {
         if parent != self.session {
             tracing::error!(
@@ -756,41 +837,55 @@ impl SubAgentHost for DaemonSubAgentHost {
             if children.is_empty() {
                 return;
             }
-            for child in children {
-                if ancestors.contains(&child) {
-                    tracing::error!(
-                        parent = %parent,
-                        child = %child,
-                        "skipping a tracked sub-agent edge that would revisit an ancestor while \
-                         cascading a session close; the spawn tree is expected to be acyclic, \
-                         so this indicates corrupted tracked state rather than a real spawn \
-                         chain"
-                    );
-                    continue;
-                }
-                // A span carrying `parent` (and `child`, redundantly with
-                // whatever field a failure inside logs under its own name)
-                // so an operator reading a failed-close log line emitted
-                // underneath — `close_and_teardown`'s own, which otherwise
-                // names only the child — can still tie it back to the
-                // cascade that caused it.
-                let span = tracing::info_span!(
-                    "close_children_retire",
-                    parent = %parent,
-                    child = %child
-                );
-                self.resources
-                    .sub_agents
-                    .retire_child(
-                        child,
-                        SessionOutcome::Cancelled,
-                        &self.resources.spawn_tree,
-                        &self.registry,
-                        &self.resources.proxy,
-                    )
-                    .instrument(span)
-                    .await;
-            }
+            // Concurrently, not one at a time — see this method's own
+            // "The enclosing timeout bounds the WHOLE cascade" section.
+            // `ancestors` is shared by reference across the join rather
+            // than re-derived per child: it is the ONE snapshot this call
+            // refuses, exactly as it was when this loop was serial.
+            let ancestors = &ancestors;
+            futures::stream::iter(children)
+                .for_each_concurrent(
+                    roundhouse_bus::limits::MAX_FAN_OUT as usize,
+                    |child| async move {
+                        if ancestors.contains(&child) {
+                            tracing::error!(
+                                parent = %parent,
+                                child = %child,
+                                "skipping a tracked sub-agent edge that would revisit an ancestor \
+                                 while cascading a session close; the spawn tree is expected to be \
+                                 acyclic, so this indicates corrupted tracked state rather than a \
+                                 real spawn chain"
+                            );
+                            return;
+                        }
+                        // A span carrying `parent` (and `child`, redundantly with
+                        // whatever field a failure inside logs under its own name)
+                        // so an operator reading a failed-close log line emitted
+                        // underneath — `close_and_teardown`'s own, which otherwise
+                        // names only the child — can still tie it back to the
+                        // cascade that caused it. Concurrency makes this strictly
+                        // more load-bearing: sibling retirements now interleave,
+                        // so the `child` field is the only thing separating their
+                        // log lines.
+                        let span = tracing::info_span!(
+                            "close_children_retire",
+                            parent = %parent,
+                            child = %child
+                        );
+                        self.resources
+                            .sub_agents
+                            .retire_child(
+                                child,
+                                SessionOutcome::Cancelled,
+                                &self.resources.spawn_tree,
+                                &self.registry,
+                                &self.resources.proxy,
+                            )
+                            .instrument(span)
+                            .await;
+                    },
+                )
+                .await;
         }
 
         let still_appearing = self.resources.sub_agents.children_of(parent);
@@ -1762,6 +1857,277 @@ mod tests {
         assert_eq!(resources.spawn_tree.direct_children(child), 0);
         assert!(registry.actor(child).is_none());
         assert!(registry.actor(grandchild).is_none());
+    }
+
+    /// An [`Isolate`](roundhouse_sandbox::Isolate) that mints a DISTINCT
+    /// handle per session and records which handles were torn down, rather
+    /// than only how many teardowns happened (Phase 8, T19a).
+    ///
+    /// `session_manager`'s `CountingIsolate` counts; a cascade test over
+    /// several sibling sessions needs to name them — "sibling A's isolate
+    /// was released and sibling B's was leaked" is the whole finding, and a
+    /// count of 1 cannot say which. Handles are minted `recording-isolate-N`
+    /// in `prepare` order, which a test correlates with its own sessions by
+    /// [`Self::handle_minted_for_nth_session`].
+    struct PerSessionRecordingIsolate {
+        next_handle: std::sync::atomic::AtomicUsize,
+        torn_down: Mutex<Vec<String>>,
+    }
+
+    impl PerSessionRecordingIsolate {
+        fn new() -> Self {
+            Self {
+                next_handle: std::sync::atomic::AtomicUsize::new(0),
+                torn_down: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn was_torn_down(&self, handle_id: &str) -> bool {
+            self.torn_down
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|id| id == handle_id)
+        }
+
+        /// Every handle id this isolate has minted so far — one per session
+        /// built over it, since `create_real_session` calls `prepare`
+        /// exactly once per session.
+        ///
+        /// Deliberately a SET rather than a session-keyed lookup: nothing
+        /// hands a `SessionId` to `Isolate::prepare` (a `SessionSpec`
+        /// carries the PARENT's id, never the new session's own), and
+        /// correlating by mint order against `SpawnTree::descendants` is
+        /// wrong — `descendants` pops a stack, so it hands back a parent's
+        /// direct children in reverse insertion order. A test that gives
+        /// this isolate to exactly N sessions and requires all N minted
+        /// handles to be torn down asserts the same thing without the
+        /// correlation.
+        fn handles_minted(&self) -> Vec<String> {
+            (0..self.next_handle.load(std::sync::atomic::Ordering::SeqCst))
+                .map(|n| format!("recording-isolate-{n}"))
+                .collect()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl roundhouse_sandbox::Isolate for PerSessionRecordingIsolate {
+        fn declared(&self) -> Tier {
+            Tier::Sandbox
+        }
+
+        async fn probe(&self) -> roundhouse_sandbox::ProbeResult {
+            roundhouse_sandbox::ProbeResult {
+                achieved: Tier::Sandbox,
+                degradations: vec![],
+            }
+        }
+
+        async fn prepare(
+            &self,
+            _spec: &SessionSpec,
+        ) -> Result<roundhouse_sandbox::Handle, roundhouse_sandbox::IsolationError> {
+            let n = self
+                .next_handle
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(roundhouse_sandbox::Handle {
+                id: format!("recording-isolate-{n}"),
+            })
+        }
+
+        async fn spawn(
+            &self,
+            _h: &roundhouse_sandbox::Handle,
+            _cmd: roundhouse_sandbox::CommandSpec,
+        ) -> Result<roundhouse_sandbox::Child, roundhouse_sandbox::IsolationError> {
+            unreachable!("this module's cascade tests never dispatch a real shell")
+        }
+
+        fn attest(&self, h: &roundhouse_sandbox::Handle) -> roundhouse_sandbox::Attestation {
+            roundhouse_sandbox::Attestation {
+                tier: Tier::Sandbox,
+                digest: h.id.clone(),
+                net_enforced: false,
+            }
+        }
+
+        async fn teardown(
+            &self,
+            h: roundhouse_sandbox::Handle,
+        ) -> Result<(), roundhouse_sandbox::IsolationError> {
+            // A real yield point, for the same reason `CountingIsolate`'s
+            // own teardown has one: without a genuine suspension the
+            // runtime never gets to poll any other task before this call
+            // returns, which would hide an ordering bug from a caller that
+            // only checks the record right after `.await` resolves.
+            tokio::task::yield_now().await;
+            self.torn_down.lock().unwrap().push(h.id);
+            Ok(())
+        }
+    }
+
+    /// **EVERY wedged sibling at one level gets its own teardown, not just
+    /// whichever one a pass happened to reach first** (Phase 8, T19a,
+    /// issue #91).
+    ///
+    /// The leak this pins: `close_children` used to retire a pass's
+    /// children one at a time. Each child's own nested bound is
+    /// `session_manager::nested_close_timeout(1)` = 25s against the root's
+    /// `SESSION_CLOSE_TIMEOUT` of 30s, so the 5s of slack covered exactly
+    /// ONE wedged child per level. The first wedged sibling was abandoned
+    /// at t≈25 at its own level, where `close_and_teardown_within` still
+    /// runs `finish_teardown`; the second was only then started, with a
+    /// deadline of t≈50 that the root's t=30 bound cut short. Its
+    /// `SubAgentSessions` record and `SpawnTree` edge had already been
+    /// taken by `retire_child` and its reaper already aborted by
+    /// `close_and_teardown_within`, so no route was left to retire it — it
+    /// kept its isolate, its registry entry and a LIVE proxy bearer token
+    /// for the daemon's lifetime.
+    ///
+    /// Both siblings are real children spawned through the real `agent`
+    /// dispatcher, wedged the real way `SESSION_CLOSE_TIMEOUT`'s own doc
+    /// comment names (a `WorkGuard` nothing ever drops, so
+    /// `SessionActor::close`'s `wait_idle` never returns), and closed by a
+    /// real root `SessionActor::close` wrapped in the real root bound — the
+    /// same wrapping `socket_server`'s `CLOSE_SESSION_TIMEOUT` and
+    /// `HeadlessSession::close_and_teardown` both apply in production.
+    ///
+    /// Nothing sleeps: the clock is paused after the real construction
+    /// work, and from there only a close budget's own timer moves it.
+    #[tokio::test]
+    async fn every_wedged_sibling_at_one_level_is_torn_down_not_just_the_first() {
+        let dir = tempfile::tempdir().unwrap();
+        let isolate = Arc::new(PerSessionRecordingIsolate::new());
+        let resources = Arc::new(
+            crate::test_support::daemon_resources_with_rules_and_isolate(
+                dir.path(),
+                None,
+                allow_agent_rules(),
+                Arc::clone(&isolate) as Arc<dyn roundhouse_sandbox::Isolate>,
+                Arc::new(crate::test_support::NoopProvider),
+            )
+            .await,
+        );
+        let registry = Arc::new(SessionRegistry::new());
+        let actor = parent_actor(dir.path()).await;
+        let parent = actor.session_id();
+        wire_sub_agent_host(&actor, &resources, &registry);
+        let host = actor.sub_agent_host().unwrap();
+
+        for _ in 0..2 {
+            dispatch_agent(
+                &actor,
+                actor.writer(),
+                runner(),
+                Some(&host),
+                &agent_args(),
+                TaskId::new(),
+            )
+            .await
+            .expect("both siblings must spawn");
+        }
+        let siblings = resources.spawn_tree.descendants(parent);
+        assert_eq!(siblings.len(), 2, "two siblings at one level");
+
+        // One isolation handle per sibling and no others: this isolate was
+        // given to `resources` alone, and the root actor above builds its
+        // own, so every handle minted here belongs to one of these two.
+        let handles = isolate.handles_minted();
+        assert_eq!(
+            handles.len(),
+            siblings.len(),
+            "sanity: exactly one isolation handle minted per sibling"
+        );
+
+        // What each sibling holds, captured while both are still live and
+        // still tracked — after the close there is nothing left to read it
+        // from.
+        let held: Vec<(SessionId, String, Arc<SessionActor>)> = siblings
+            .iter()
+            .map(|child| {
+                let child_actor = registry.actor(*child).expect("a real, registered child");
+                let token = resources
+                    .sub_agents
+                    .proxy_token_of_for_test(*child)
+                    .expect("a tracked child's egress token");
+                assert!(
+                    resources.proxy.is_registered(&token),
+                    "sanity: a live child's egress token is registered before anything closes"
+                );
+                (*child, token, child_actor)
+            })
+            .collect();
+        for handle_id in &handles {
+            assert!(
+                !isolate.was_torn_down(handle_id),
+                "sanity: a live child's isolation handle is not torn down before anything closes"
+            );
+        }
+
+        // Everything real is built; from here the only thing that moves the
+        // clock is a close budget's own timer elapsing.
+        tokio::time::pause();
+
+        // The wedges: guards nothing ever drops, so NEITHER sibling's own
+        // `close()` can get past `wait_idle`. Held for the rest of the test.
+        let _wedges: Vec<_> = held
+            .iter()
+            .map(|(_, _, child_actor)| child_actor.begin_work())
+            .collect();
+
+        let closing = {
+            let actor = Arc::clone(&actor);
+            tokio::spawn(async move {
+                tokio::time::timeout(
+                    crate::session_manager::SESSION_CLOSE_TIMEOUT,
+                    actor.close(SessionOutcome::Completed),
+                )
+                .await
+            })
+        };
+        let closed = closing.await.expect("the root's close task must not panic");
+
+        // Collected rather than asserted one at a time: the finding here is
+        // WHICH siblings kept WHICH resources, and a per-assertion panic
+        // would report only the first one and hide the rest.
+        let mut leaked: Vec<String> = Vec::new();
+        for (child, token, _) in &held {
+            if registry.actor(*child).is_some() {
+                leaked.push(format!("sibling {child} is still in the session registry"));
+            }
+            if resources.proxy.is_registered(token) {
+                leaked.push(format!(
+                    "sibling {child} still holds a live egress bearer token"
+                ));
+            }
+        }
+        for handle_id in &handles {
+            if !isolate.was_torn_down(handle_id) {
+                leaked.push(format!("isolation handle {handle_id} was never torn down"));
+            }
+        }
+        assert!(
+            leaked.is_empty(),
+            "every wedged sibling must be abandoned at its OWN depth-derived bound, where its \
+             `close_and_teardown_within` still runs `finish_teardown`; these were instead \
+             dropped by the root's bound with their record and spawn-tree edge already taken \
+             and their reaper already aborted, so nothing will ever retire them: {leaked:#?}"
+        );
+
+        assert!(
+            resources.sub_agents.is_empty(),
+            "no sibling may be left tracked"
+        );
+        assert_eq!(
+            resources.spawn_tree.direct_children(parent),
+            0,
+            "both fan-out slots must be freed"
+        );
+        assert!(
+            matches!(closed, Ok(Ok(_))),
+            "with every sibling caught at its own bound, the root's own close finishes inside \
+             its budget and still writes its terminator; got {closed:?}"
+        );
     }
 
     /// **A duplicate retirement signal for one child never frees a
