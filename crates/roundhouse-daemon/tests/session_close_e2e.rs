@@ -11,9 +11,10 @@
 //!   text turn runs to completion, the creator closes, and the durable log,
 //!   the `tasks` view, and the daemon's own bookkeeping (registry entry,
 //!   egress-proxy token) all agree the session is gone. Uses the daemon's
-//!   real `BwrapLandlockIsolate` (via `start_daemon` ->
-//!   `common::resources_with_provider_and_rules`), since it never actually
-//!   dispatches a shell command.
+//!   real `BwrapLandlockIsolate` — via `start_daemon` ->
+//!   `common::resources_with_provider_and_rules` -> `available_isolate()`'s
+//!   non-spawning `test_with_probe` variant, which is fine here because
+//!   this test never actually dispatches a shell command.
 //! - `closing_while_a_shell_is_in_flight_...`: (b) — a real, in-flight shell
 //!   process is killed by the close, and the sweep's `TaskCancelled`
 //!   durably precedes the `SessionClosed{Cancelled}` terminator, which nothing
@@ -606,9 +607,11 @@ async fn a_creator_closing_after_a_completed_turn_durably_closes_and_reaps_the_s
 /// at all. With a real grandchild, the assertion below is only reachable
 /// through `roundhouse-sandbox`'s `Child::cancel`, whose `signal_group`
 /// sends to `-pgid` (the whole group), never the direct child's own pid —
-/// the same shape `roundhouse-engine`'s own
+/// the same script shape `roundhouse-engine`'s own
 /// `execute_builtin_shell_is_bounded_even_when_a_backgrounded_grandchild_outlives_the_direct_child`
-/// uses to prove the identical property one layer down.
+/// uses, against `roundhouse-tools`' own cancel path
+/// (`spawn_cancellable`/`cancel_running_shell`) — a sibling kill
+/// implementation to `Child::cancel`/`signal_group`, not a layer beneath it.
 ///
 /// # Why this uses `TestIsolate`, not the real `BwrapLandlockIsolate`
 ///
@@ -617,13 +620,28 @@ async fn a_creator_closing_after_a_completed_turn_durably_closes_and_reaps_the_s
 /// than `common::available_isolate()`'s `test_with_probe`, hardcoded to the
 /// production install path `/usr/libexec/roundhouse/bwrap` — not installed
 /// on an ordinary dev host, which is a real fixture-path gap but not this
-/// test's own problem to fix). It genuinely cannot work for what this test
-/// checks: `bwrap` unshares the PID namespace (`--unshare-all`, per
-/// `bwrap.rs`'s `spawn_under_bwrap`), so the `$!` the script records is a
-/// namespace-relative pid (observed: `3`) that names nothing meaningful in
-/// `/proc` on the host this test itself runs on — there is no host-visible
-/// pid this test could poll for liveness at all. So this test exercises the
-/// real `Child::cancel` group-signal (`signal_group`) and its
+/// test's own problem to fix; a fixture wired to the real binary does exist,
+/// `roundhouse_daemon::test_support::available_isolate_with_real_bwrap`, but
+/// it is `pub(crate)` — invisible to `tests/`, which lives in a separate
+/// crate). It genuinely cannot work for what this test checks, for a more
+/// structural reason than that path gap: `bwrap` unshares the PID namespace
+/// (`--unshare-all`, per `bwrap.rs`'s `spawn_under_bwrap`), so the `$!` the
+/// script records is a namespace-relative pid (observed: `3`) with no path
+/// from that pid file back to a host pid this test could check against
+/// `/proc`. (The narrower, accurate claim: it's the pid the *script itself*
+/// records that is unusable this way, not that no host-visible pid could
+/// ever exist here — `Isolate::spawn` returns a `Child` whose own `pid()`
+/// *is* the real host pid of the bwrap process, which is exactly what
+/// `roundhouse-sandbox`'s own bwrap tests poll `/proc/{child.pid}` for; a
+/// thin decorator over the real isolate could have captured that one.) More
+/// fundamentally, this pid-namespace behavior means a real-bwrap run could
+/// never have distinguished a process-group kill from a single-pid kill
+/// anyway: the sandboxed script is namespace pid 1, and `--die-with-parent`
+/// plus the kernel's own PID-namespace teardown kills every process inside
+/// the namespace the moment that pid 1 dies — which is exactly the
+/// property (b) exists to isolate and prove is `Child::cancel`'s own doing,
+/// not a namespace side effect. So this test exercises the real
+/// `Child::cancel` group-signal (`signal_group`) and its
 /// `wait_for_empty_group` confirmation over a BARE spawned process
 /// (`TestIsolate`, copied from `roundhouse-engine`'s own
 /// `agent_loop_dispatch.rs`); it does not, and structurally cannot from
@@ -747,12 +765,15 @@ async fn closing_while_a_shell_is_in_flight_kills_it_and_orders_the_sweep_before
     // `Err`, which that function turns into `ToolDispatchError::Isolation`,
     // not `ShellSessionCancelled` — so the `TaskCancelled{System,
     // SessionClosed}` assertion further below could not hold at all unless
-    // the group-wide kill had already been confirmed. The poll here is only
-    // for the grandchild's OWN reaping (asynchronous, by whatever process
-    // subreaped it once its direct parent exited), which the confirmed
-    // group-kill does not itself wait out — `pid_running` already treats a
-    // zombie as dead, matching `roundhouse-engine`'s own
-    // `pid_is_dead_or_zombie`.
+    // the group-wide kill had already been confirmed. The poll below is
+    // belt-and-braces, not load-bearing: `wait_for_empty_group`'s own
+    // `group_is_empty` check is `kill(-pgid, 0) == ESRCH`, and a zombie
+    // still answers `kill()` successfully, so that check cannot return true
+    // until every member of the group — zombies included — has actually
+    // been reaped. `Child::cancel` returning `Ok` therefore already implies
+    // `pid_running(grandchild_pid)` is false, so this loop normally breaks
+    // on its first iteration; `pid_running` treats a zombie as dead too,
+    // matching `roundhouse-engine`'s own `pid_is_dead_or_zombie`.
     {
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
         loop {
