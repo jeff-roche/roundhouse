@@ -1064,6 +1064,10 @@ impl SubAgentHost for DaemonSubAgentHost {
 impl DaemonSubAgentHost {
     /// Appends the child's `SessionCreated` event — carrying
     /// `spec.parent = Some(parent)` — in its own immediate transaction.
+    ///
+    /// A direct-commit path (Phase 8 Task 21, Task 2): this transaction is this function's
+    /// own, not `spawn_writer`'s, so `child`'s followers are woken only because this method
+    /// calls `CommitFeed::notify_appended` itself, once `txn.commit()` returns `Ok`.
     async fn persist_session_created(
         &self,
         child: SessionId,
@@ -1076,6 +1080,7 @@ impl DaemonSubAgentHost {
             Box::new(spec),
             1,
         );
+        let commit_feed = self.resources.store.commit_feed().clone();
         let conn = self
             .resources
             .store
@@ -1093,12 +1098,13 @@ impl DaemonSubAgentHost {
             // carries a workspace id, a generated `agent-xxxxxxxx` handle, a
             // tier and a parent id — no secret values, and no session-scoped
             // redactor exists on this path to consult anyway.
-            roundhouse_store::append_event_in_transaction(
+            let appended = roundhouse_store::append_event_in_transaction(
                 &txn,
                 &event,
                 &roundhouse_store::redact::Redactor::build(&[]),
             )?;
             txn.commit()?;
+            commit_feed.notify_appended(&[appended]);
             Ok::<(), roundhouse_store::StoreError>(())
         })
         .await

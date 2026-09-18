@@ -14,11 +14,31 @@
 //! generation is purely a wake signal: "something committed since you last looked," never
 //! "here is what committed."
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
 use roundhouse_core::SessionId;
 use tokio::sync::watch;
+
+/// A receipt from one successful [`crate::append_event_in_transaction`] call, inside a
+/// transaction the caller — not this crate's writer task — owns and commits. Phase 8 Task
+/// 21, Task 2: every caller that appends this way (`scheduler_driver.rs`, `sub_agent_host.
+/// rs`, `workflow_host.rs`, all in `roundhouse-daemon`) bypasses `spawn_writer`'s own
+/// after-commit `CommitFeed::notify`, so each one must hand its receipts to
+/// [`CommitFeed::notify_appended`] itself, once its own `txn.commit()` returns `Ok`.
+///
+/// `#[must_use]`: dropping this value silently — a bare `append_event_in_transaction(...)?;`
+/// statement — is exactly the bug this type exists to catch. With `#[must_use]` in place,
+/// that statement becomes an `unused_must_use` warning, which `-D warnings` turns into a
+/// build failure; a caller that means to defer the notify (never silence it outright) must
+/// still visibly collect the value into something it later hands to `notify_appended`.
+#[must_use = "an event appended inside a caller-owned transaction must be handed to \
+              CommitFeed::notify_appended after that transaction commits"]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AppendedEvent {
+    pub session_id: SessionId,
+    pub seq: u64,
+}
 
 /// A handle to every session's commit-notification channel. Cheap to clone (an `Arc`
 /// around the map) — `StorePool::commit_feed`/`with_commit_feed` are how callers share
@@ -75,6 +95,25 @@ impl CommitFeed {
         tx.send_modify(|generation| *generation = generation.wrapping_add(1));
         if tx.receiver_count() == 0 {
             senders.remove(&session_id);
+        }
+    }
+
+    /// [`Self::notify`], for a caller holding one or more [`AppendedEvent`] receipts from a
+    /// transaction it committed itself (Phase 8 Task 21, Task 2) rather than one routed
+    /// through `spawn_writer`. **Must be called only AFTER the commit that produced
+    /// `appended` returned `Ok`** — same contract as `notify`.
+    ///
+    /// Deduplicates by `session_id` before calling `notify` (mirroring `spawn_writer`'s own
+    /// `AppendBatch`/`AppendBatchWithBlobs` handling, which notifies each distinct session
+    /// exactly once per batch): a caller that appended more than one event to the same
+    /// session inside one transaction (`scheduler_driver.rs`'s `flush_task_events`, e.g.)
+    /// must not wake that session's watchers once per event.
+    pub fn notify_appended(&self, appended: &[AppendedEvent]) {
+        let mut touched = HashSet::new();
+        for event in appended {
+            if touched.insert(event.session_id) {
+                self.notify(event.session_id);
+            }
         }
     }
 

@@ -78,8 +78,10 @@ pub use session_events::session_events;
 
 // Phase 8 Task 21, Task 1 exports: the store-side commit feed a follower watches
 // (`CommitFeed`/`CommitWatch`), and the sync, paged reads it re-reads with
-// (`events_after`/`session_head`).
-pub use commit_feed::{CommitFeed, CommitWatch};
+// (`events_after`/`session_head`). Task 2 adds `AppendedEvent`, the receipt a caller that
+// appends through its own transaction (bypassing `spawn_writer`) hands to
+// `CommitFeed::notify_appended`.
+pub use commit_feed::{AppendedEvent, CommitFeed, CommitWatch};
 pub use session_events::{events_after, session_head};
 
 // CQRS read-model exports (storage replay / fold)

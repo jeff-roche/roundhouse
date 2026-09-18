@@ -436,7 +436,15 @@ async fn main() -> color_eyre::Result<()> {
     let daemon_binary = std::fs::canonicalize(std::env::current_exe()?)?;
 
     let store_path = runtime_dir.join("events.db");
-    let session_store = roundhouse_store::open(&store_path).await?;
+    // Phase 8 Task 21, Task 2: one `CommitFeed` for the whole daemon process, shared across
+    // every `StorePool` opened over `store_path` below (`with_commit_feed`) — `open` builds
+    // a fresh, empty feed per call, and a `notify()`/`notify_appended()` on one pool's own
+    // feed would never wake a `watch()` taken from a different pool's, even though both
+    // point at the same file on disk. Built once, here, before any of them.
+    let commit_feed = roundhouse_store::CommitFeed::default();
+    let session_store = roundhouse_store::open(&store_path)
+        .await?
+        .with_commit_feed(commit_feed.clone());
     let workspace_registry = Arc::new(
         WorkspaceRegistry::open_with_protected_paths(
             session_store.clone(),
@@ -465,9 +473,13 @@ async fn main() -> color_eyre::Result<()> {
     // were always correctly sitting in the database. Runs once, here, between
     // opening the store and starting the accept loop — on a fresh
     // `store_path` this is a cheap no-op scan over an empty `tasks` table.
-    let recovery_store = roundhouse_store::open(&store_path).await?;
+    let recovery_store = roundhouse_store::open(&store_path)
+        .await?
+        .with_commit_feed(commit_feed.clone());
     let recovery_writer = roundhouse_store::spawn_writer(recovery_store).await;
-    let recovery_pool_for_scan = roundhouse_store::open(&store_path).await?;
+    let recovery_pool_for_scan = roundhouse_store::open(&store_path)
+        .await?
+        .with_commit_feed(commit_feed.clone());
     let approval_registry = roundhouse_policy::registry::ApprovalRegistry::new();
     let boot_report = roundhouse_daemon::boot::run_boot_sequence(
         &recovery_pool_for_scan,
@@ -511,7 +523,9 @@ async fn main() -> color_eyre::Result<()> {
     // `session_bootstrap::create_real_session`) exists, per
     // `create_session_with_egress`'s own doc comment.
     let proxy = Arc::new(LoopbackProxy::new());
-    let proxy_store = roundhouse_store::open(&store_path).await?;
+    let proxy_store = roundhouse_store::open(&store_path)
+        .await?
+        .with_commit_feed(commit_feed.clone());
     let proxy_writer = roundhouse_store::spawn_writer(proxy_store).await;
     proxy.clone().serve(runner, proxy_writer.clone()).await?;
 

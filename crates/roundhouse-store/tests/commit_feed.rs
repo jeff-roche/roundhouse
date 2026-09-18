@@ -19,7 +19,9 @@ use std::time::Duration;
 
 use futures::FutureExt;
 use roundhouse_core::{NoteLevel, SessionId, SessionOutcome, Timestamp};
-use roundhouse_store::{events_after, open, session_head, spawn_writer, CommitFeed, StoreError};
+use roundhouse_store::{
+    events_after, open, session_head, spawn_writer, AppendedEvent, CommitFeed, StoreError,
+};
 
 static RUNNER: once_cell::sync::Lazy<roundhouse_core::TaskRunner> =
     once_cell::sync::Lazy::new(roundhouse_core::TaskRunner::bootstrap);
@@ -67,6 +69,51 @@ async fn notify_before_mark_seen_does_not_leave_a_stale_wake() {
     assert!(
         watch.changed().now_or_never().is_none(),
         "a notify consumed by mark_seen must not leave changed() already resolved"
+    );
+}
+
+/// `notify_appended` (Phase 8 Task 21, Task 2) — the primitive a caller that appends
+/// through its own transaction (bypassing `spawn_writer`) hands its receipts to — must
+/// dedupe by session before waking, exactly like the batch writer's own per-session-once
+/// guarantee (`append_batch_notifies_each_session_once_per_batch`, below): two receipts
+/// naming the same session wake it once, and a receipt naming a different session wakes
+/// that one too.
+#[tokio::test]
+async fn notify_appended_wakes_each_distinct_session_exactly_once() {
+    let feed = CommitFeed::default();
+    let session_a = SessionId::new();
+    let session_b = SessionId::new();
+
+    let mut watch_a = feed.watch(session_a);
+    let mut watch_b = feed.watch(session_b);
+    watch_a.mark_seen();
+    watch_b.mark_seen();
+
+    feed.notify_appended(&[
+        AppendedEvent {
+            session_id: session_a,
+            seq: 0,
+        },
+        AppendedEvent {
+            session_id: session_a,
+            seq: 1,
+        },
+        AppendedEvent {
+            session_id: session_b,
+            seq: 0,
+        },
+    ]);
+
+    tokio::time::timeout(Duration::from_secs(1), watch_a.changed())
+        .await
+        .expect("session_a must be woken for its two receipts");
+    tokio::time::timeout(Duration::from_secs(1), watch_b.changed())
+        .await
+        .expect("session_b must be woken for its one receipt");
+
+    assert!(
+        watch_a.changed().now_or_never().is_none(),
+        "session_a must be woken exactly once for its two receipts, not twice"
     );
 }
 
