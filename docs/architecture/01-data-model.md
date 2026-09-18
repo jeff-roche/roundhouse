@@ -192,7 +192,26 @@ Three known failure modes of a literal "everything is a task" model, and the ans
   `handle` (pty/process id), the task stays `Running`, deltas keep arriving, and it is
   terminated by an explicit `TaskCancelled` or session close. The agent gets a
   `read_output`/`kill` affordance rather than blocking. Sessions cannot close with
-  live handles without an explicit disposition.
+  live handles without an explicit disposition. **Amendment (Phase 8 T19a, "session
+  close"):** `SessionClosed` is the event log's terminator, not merely another
+  lifecycle event — folding a session's state (`fold_session_state`, in
+  `roundhouse-core`) treats `Closed` as absorbing: once reached, every later event in
+  the slice is folded away and the result stays `Closed`. `roundhouse-store`'s
+  `EventWriter::close_session` is the sole writer of it, and it runs as one
+  transaction: it first sweeps every task of that session still
+  `Created`/`Decided`/`Running`/`Suspended` into `TaskCancelled { by: System, reason:
+  CancelReason::SessionClosed }` — this is the explicit disposition every live handle
+  gets, so none is left dangling — and only then appends `SessionClosed { outcome }`
+  as the transaction's last event. Closing an already-closed session is a no-op read
+  (`CloseReceipt::AlreadyClosed`); a genuine close reports `CloseReceipt::Closed
+  { swept }`, the count of tasks it cancelled. A tail guard enforces the terminator at
+  the store boundary too: any later `append`/`append_batch`/`append_batch_with_blobs`
+  for that session is rejected with `StoreError::SessionClosed` rather than silently
+  accepted after the log has already ended. That last one is the streaming shell-output
+  flush path described in §4.5's amendments below ("Shell output's mime convention" and
+  the gap-marker paragraph beside it); it is covered because every append path assigns
+  sequence numbers through the same guarded `next_seq_or_reject_closed`, not because
+  each one carries a check of its own.
 
 ### 4.4 Identity and provenance
 

@@ -8,6 +8,7 @@
 //! frames rather than a daemon-pre-summarized shape.
 
 use std::path::Path;
+use std::time::Duration;
 
 use roundhouse_core::{EventPayload, SessionId};
 use roundhouse_proto::{ClientEvent, ClientRequest};
@@ -38,6 +39,21 @@ use crate::protocol::TuiError;
 /// `workspace_name`), while still bounding the worst case to a fixed
 /// multiple of this client's own buffering.
 const MAX_FRAME_BYTES: usize = 1024 * 1024;
+
+/// Bounds [`DaemonClient::close_session`]'s wait for the `Ack`. Every
+/// refusal path `roundhouse_daemon::socket_server::
+/// drive_established_session` designs for `CloseSession` (wrong connection,
+/// wrong session, a close already in flight, the session no longer being
+/// live, or a failed durable append) is deliberately silent on the wire —
+/// no frame at all, connection kept open, retryable — so without a bound
+/// here, a well-formed `CloseSession` sent from a connection that can never
+/// have it honored (e.g. one built via `connect_attach`, not
+/// `connect_create`) hangs this call forever. Chosen with margin over the
+/// daemon's own close budget (`roundhouse_daemon::socket_server::
+/// CLOSE_SESSION_TIMEOUT`, 30s — not reusable directly, since this crate
+/// does not depend on `roundhouse-daemon`) so a close that is genuinely
+/// progressing, just slowly, is not mistaken for a silently refused one.
+const CLOSE_SESSION_ACK_TIMEOUT: Duration = Duration::from_secs(40);
 
 /// What `connect` should announce itself as on a fresh handshake: mint a new
 /// session, or attach to one that already exists.
@@ -91,6 +107,28 @@ pub struct DaemonClient {
     /// `SessionCreated` handshake frame, and set immediately by
     /// [`connect_attach`], which already knew it from its caller.
     session_id: Option<SessionId>,
+    /// Set once a [`Self::recv`] call may have been dropped mid-read (Phase
+    /// 8, T19a Task 8) — currently only [`Self::close_session`]'s
+    /// `tokio::time::timeout`, which cancels its own `recv` loop on elapse.
+    /// `recv`'s own doc comment explains why that is not cancel-safe: a
+    /// dropped `read_until` can have already consumed bytes off the
+    /// underlying `BufReader` into a local buffer that is then discarded,
+    /// permanently losing them without ever un-consuming them from
+    /// `self.reader`. Once set, `recv` refuses to read again rather than let
+    /// a caller silently decode whatever bytes happen to follow as a
+    /// spurious `TuiError::Json` (or worse, a well-formed but wrong frame).
+    /// There is no way to clear it: a client in this state must be
+    /// discarded, not reused.
+    ///
+    /// Read this field's name as "unreadable," not "bytes were definitely
+    /// lost": it is set unconditionally on every `close_session` timeout,
+    /// including the common silent-refusal case where the cancelled `recv`
+    /// was still waiting for the first byte of a fresh line and nothing was
+    /// actually consumed. There is no cheap way to tell, after the fact,
+    /// which case occurred, so this errs conservative and burns the client
+    /// either way rather than risk the rare case silently. It says nothing
+    /// about `self.writer` — the write half is entirely unaffected.
+    read_desynchronized: bool,
 }
 
 /// Connect to the daemon's Unix socket at `socket_path`, then immediately
@@ -109,6 +147,7 @@ pub async fn connect(socket_path: &Path, intent: ConnectIntent) -> Result<Daemon
         reader: BufReader::new(read_half),
         writer: write_half,
         session_id: None,
+        read_desynchronized: false,
     };
     client.send(&intent.into()).await?;
     Ok(client)
@@ -224,6 +263,98 @@ impl DaemonClient {
         )
     }
 
+    /// Sends `ClientRequest::CloseSession` for this client's own session,
+    /// then waits for the daemon's `Ack` confirming the durable close,
+    /// skipping any other frame that arrives first — the same "wait for the
+    /// specific reply, not just any frame" shape [`connect_attach`] already
+    /// uses for its own `Ack`. `Some(_) => continue` below discards every
+    /// non-`Ack` frame while waiting, which will matter once a parallel lane
+    /// starts publishing real deltas over this same connection — a task
+    /// delta arriving while a close is in flight is silently dropped by
+    /// this call, not buffered for a later `recv`.
+    ///
+    /// # No wire NAK exists
+    ///
+    /// A refusal on the daemon side (see `# Errors` below) produces no frame
+    /// at all — a distinct wire-level NAK variant would be the durable fix,
+    /// but adding one is a frozen-contract (`roundhouse-proto`) change
+    /// outside this lane's scope, so this call can only ever distinguish
+    /// "the daemon is silently refusing this" from "the close is genuinely
+    /// still in progress" by timing out, not by reading an explicit answer.
+    ///
+    /// # Errors
+    /// Returns whatever [`Self::send`]/[`Self::recv`] returns. Returns
+    /// `TuiError::Io` (`ErrorKind::UnexpectedEof`) if the daemon closes the
+    /// connection without ever sending an `Ack`. Returns `TuiError::Io`
+    /// (`ErrorKind::TimedOut`) if no `Ack` arrives within
+    /// [`CLOSE_SESSION_ACK_TIMEOUT`] — the case that actually matters in
+    /// practice: every refusal `roundhouse_daemon::socket_server::
+    /// drive_established_session` designs for `CloseSession` (wrong
+    /// connection — e.g. this client having been built via
+    /// [`connect_attach`] rather than [`connect_create`] — wrong session, a
+    /// close already in flight, the session no longer being live, or a
+    /// failed durable append) sends **no frame at all** and leaves the
+    /// connection open, so a refusal is observed here as a timeout, never as
+    /// a distinct error naming the reason.
+    ///
+    /// **A `TimedOut` error means this client must be discarded, not
+    /// retried.** The internal wait loop above cancels a `Self::recv` call
+    /// on timeout, which is not cancel-safe (see `recv`'s own doc comment);
+    /// this method marks the client unusable when that happens, so every
+    /// later call to [`Self::recv`] fails immediately with `ErrorKind::Other`
+    /// rather than risk decoding a truncated frame as a spurious
+    /// `TuiError::Json`, or worse, a well-formed but wrong one.
+    ///
+    /// **This call itself must not be cancelled from the outside** (wrapped
+    /// in a caller's own `tokio::time::timeout`, raced in a `select!`
+    /// branch, or otherwise dropped before it resolves). Doing so drops this
+    /// method's own internal `recv` wait without ever reaching the code
+    /// above that marks the client unusable — the safeguard this method
+    /// provides for its own internal timeout does not extend to a cancel
+    /// imposed on the whole call from outside it.
+    ///
+    /// # Panics
+    /// Panics under the same condition [`Self::session_id`] does: this
+    /// client must have been created via [`connect_create`]/[`connect_attach`].
+    pub async fn close_session(&mut self) -> Result<(), TuiError> {
+        let session_id = self.session_id();
+        self.send(&ClientRequest::CloseSession { session_id })
+            .await?;
+        let wait = async {
+            loop {
+                match self.recv().await? {
+                    Some(ClientEvent::Ack { .. }) => return Ok(()),
+                    Some(_) => continue,
+                    None => {
+                        return Err(TuiError::Io(std::io::Error::new(
+                            std::io::ErrorKind::UnexpectedEof,
+                            "daemon closed the connection instead of acknowledging CloseSession",
+                        )));
+                    }
+                }
+            }
+        };
+        match tokio::time::timeout(CLOSE_SESSION_ACK_TIMEOUT, wait).await {
+            Ok(result) => result,
+            Err(_elapsed) => {
+                // The `wait` future above was dropped mid-`recv`, which may
+                // have already consumed (and now lost) bytes off the wire —
+                // see `read_desynchronized`'s own doc comment. Mark this
+                // client unusable rather than let a caller reuse it.
+                self.read_desynchronized = true;
+                Err(TuiError::Io(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    format!(
+                        "no Ack for CloseSession within {CLOSE_SESSION_ACK_TIMEOUT:?}; the \
+                         daemon may be silently refusing it (wrong connection, wrong session, or \
+                         the session is no longer live); this client must be discarded, not \
+                         reused"
+                    ),
+                )))
+            }
+        }
+    }
+
     /// Sends one `ClientRequest` as a single NDJSON line.
     ///
     /// # Errors
@@ -253,13 +384,31 @@ impl DaemonClient {
     /// `&mut self.reader`, not `self.reader` itself, so the next call starts
     /// from wherever this one left off, exactly as `read_line` already did.
     ///
+    /// # Cancel safety
+    /// Not cancel-safe: dropping this call's `Future` before it resolves can
+    /// lose bytes already pulled off `self.reader`'s underlying socket into
+    /// this call's own local buffer, desynchronizing this reader from the
+    /// wire with no way to recover the lost bytes. [`Self::close_session`] is
+    /// the one caller in this crate that cancels a `recv` on timeout, and it
+    /// marks the client unusable (`read_desynchronized`) when it does —
+    /// any other caller wrapping this in its own `tokio::time::timeout` (or
+    /// a `select!` branch) must do the same, or simply discard the client on
+    /// cancellation rather than call `recv` again.
+    ///
     /// # Returns
     /// - `Ok(Some(event))` if a complete message was read and parsed.
     /// - `Ok(None)` if EOF was reached (the connection closed gracefully)
     ///   before any bytes of a new frame arrived.
     /// - `Err(TuiError)` if I/O fails, the frame exceeds [`MAX_FRAME_BYTES`]
-    ///   with no `\n` found, or JSON is malformed.
+    ///   with no `\n` found, JSON is malformed, or this client was already
+    ///   marked `read_desynchronized` by an earlier cancelled `recv`.
     pub async fn recv(&mut self) -> Result<Option<ClientEvent>, TuiError> {
+        if self.read_desynchronized {
+            return Err(TuiError::Io(std::io::Error::other(
+                "this DaemonClient's reader may be desynchronized after a previous cancelled \
+                 recv (see close_session's doc comment); it must be discarded rather than reused",
+            )));
+        }
         let mut buf = Vec::new();
         // `MAX_FRAME_BYTES + 1`: reading exactly one byte past the cap is
         // what lets this method tell "a line that is exactly at the cap,

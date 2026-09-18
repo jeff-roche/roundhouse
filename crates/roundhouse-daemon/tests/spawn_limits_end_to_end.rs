@@ -33,19 +33,33 @@
 //! at length in this plan's Task 4 and unchanged since: `DeliveryExecutor`'s
 //! two `run_workflow_from_storage` callers both build root runs
 //! (`parent_run_id: None`), so no child run is ever driven, and no child run
-//! ever reaches a terminal state in production. Likewise, nothing terminates
-//! a sub-agent session: `SessionState::Closed` has no production writer. So
-//! "drive the child to a terminal state" means calling the termination seams
-//! themselves — `SessionTree::child_terminated` and
-//! `SubAgentSessions::retire_child` — which is what a future run-driver will
-//! call, and what this test calls.
+//! ever reaches a terminal state in production. So this half calls
+//! `SessionTree::child_terminated` directly, standing in for a future
+//! run-driver that would call it for real.
+//!
+//! The sub-agent half is different (Phase 8, T19a Task 6):
+//! `SubAgentSessions::retire_child` is now a real, wired production path —
+//! `scheduler_driver::DeliveryExecutor::drive_workflow_agent_child` and
+//! `DaemonSubAgentHost::close_children` both call it — and it durably closes
+//! the retired child with a terminal `SessionClosed`
+//! (`HeadlessSession::close_and_teardown` → `SessionActor::close` →
+//! `EventWriter::close_session`), not merely an in-memory teardown. (A
+//! tracked child whose own actor reaches `Closed` some other way is retired
+//! by a separate path, `spawn_session_reaper`'s `RetireSubAgent` reap
+//! action, which never calls `retire_child` — see that method's own doc
+//! comment for why it cannot.) This test calls `retire_child` directly
+//! rather than through one of its two production callers only because
+//! neither fits a synthetic sub-agent assembled by hand for a limits test;
+//! the method itself is exactly the one production code calls.
 
 mod common;
 
 use std::sync::Arc;
 
 use roundhouse_bus::limits::MAX_FAN_OUT;
-use roundhouse_core::{JobId, OnDegrade, SessionId, SessionSpec, SessionState, Tier};
+use roundhouse_core::{
+    JobId, OnDegrade, SessionId, SessionOutcome, SessionSpec, SessionState, Tier,
+};
 use roundhouse_daemon::session_bootstrap::{DaemonResources, PolicyRuleSource};
 use roundhouse_daemon::session_registry::SessionRegistry;
 use roundhouse_daemon::sub_agent_host::wire_sub_agent_host;
@@ -264,7 +278,13 @@ async fn agent_and_call_children_share_one_parents_fan_out_ceiling() {
     assert!(
         resources
             .sub_agents
-            .retire_child(retired, &resources.spawn_tree, &registry, &resources.proxy)
+            .retire_child(
+                retired,
+                SessionOutcome::Cancelled,
+                &resources.spawn_tree,
+                &registry,
+                &resources.proxy
+            )
             .await,
         "retiring a live sub-agent reports that it found one"
     );
@@ -285,7 +305,13 @@ async fn agent_and_call_children_share_one_parents_fan_out_ceiling() {
     for session in resources.spawn_tree.descendants(parent) {
         resources
             .sub_agents
-            .retire_child(session, &resources.spawn_tree, &registry, &resources.proxy)
+            .retire_child(
+                session,
+                SessionOutcome::Cancelled,
+                &resources.spawn_tree,
+                &registry,
+                &resources.proxy,
+            )
             .await;
     }
 }

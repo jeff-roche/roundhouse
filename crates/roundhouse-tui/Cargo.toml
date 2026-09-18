@@ -28,3 +28,12 @@ crossterm = "0.29"
 
 [dev-dependencies]
 tempfile = "3"
+# Phase 8, T19a Task 8: `close_session.rs`'s daemon-never-acknowledges test
+# needs `tokio::time::pause`/`#[tokio::test(start_paused = true)]` — a real
+# injected fake clock, not a real-time `sleep`-then-assert — to prove
+# `DaemonClient::close_session`'s own Ack-wait timeout actually elapses,
+# deterministically and without flakiness. Mirrors
+# `roundhouse-daemon/Cargo.toml`'s identical `[dev-dependencies]`-only
+# addition for the same reason; the main `[dependencies]` entry above stays
+# at `["full"]`, unchanged, since production code never pauses time.
+tokio = { version = "1.53", features = ["test-util"] }

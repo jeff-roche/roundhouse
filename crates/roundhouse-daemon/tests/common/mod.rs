@@ -73,6 +73,19 @@ pub async fn real_actor(dir: &Path) -> Arc<SessionActor> {
         .await
         .unwrap();
     let writer = roundhouse_store::spawn_writer(store).await;
+    real_actor_with_writer(dir, writer).await
+}
+
+/// [`real_actor`], but over a caller-supplied `writer` (Phase 8, T19a
+/// Task 8) — for a `CloseSession` test that needs a
+/// `roundhouse_store::test_util`-gated writer rather than an ordinary one,
+/// to pin down exactly when a `CloseSession` reply is sent relative to its
+/// durable append. Mirrors `roundhouse-daemon`'s own `session_manager.rs`
+/// test module's `actor_with_isolate`/`actor_with_isolate_and_writer` split.
+pub async fn real_actor_with_writer(
+    dir: &Path,
+    writer: roundhouse_store::EventWriter,
+) -> Arc<SessionActor> {
     let policy = Arc::new(PolicyEngine::from_rules(vec![]));
     let isolate = available_isolate();
     let spec = SessionSpec::test_requesting(Tier::Sandbox, OnDegrade::Refuse);

@@ -14,8 +14,12 @@ mod common;
 use std::sync::Arc;
 use std::time::Duration;
 
-use roundhouse_core::{EventPayload, NoteLevel};
-use roundhouse_proto::ClientEvent;
+use roundhouse_core::{EventPayload, NoteLevel, SessionId};
+use roundhouse_proto::{ClientEvent, ClientRequest};
+use roundhouse_provider::{
+    BlockDelta, BlockKind, BoxFut, Capabilities, ChatRequest, ChatStream, ModelId, ModelInfo, Plan,
+    Provider, ProviderError, RequestCtx, StreamEvent, TokenCount,
+};
 
 #[tokio::test]
 async fn two_clients_can_create_and_then_attach_to_the_same_session() {
@@ -261,5 +265,166 @@ async fn attach_routes_by_session_id_and_never_leaks_another_sessions_events() {
         should_not_arrive.is_err(),
         "the watcher attached to session A must not receive session B's \
          event at all, got {should_not_arrive:?}"
+    );
+}
+
+/// A single-turn scripted `Provider` returning one final text block and no
+/// tool calls — copied from `submit_turn_e2e.rs`'s `ScriptedTextOnlyProvider`
+/// (see that file's own copy for why: each `tests/*.rs` file is its own
+/// crate, and only `tests/common` is actually shared code).
+struct ScriptedTextOnlyProvider {
+    text: String,
+}
+
+impl Provider for ScriptedTextOnlyProvider {
+    fn capabilities(&self, _model: &ModelId) -> Capabilities {
+        Capabilities::default()
+    }
+    fn resolve(&self, _req: &ChatRequest) -> Result<Plan, ProviderError> {
+        Ok(Plan {
+            endpoint: "fake".into(),
+        })
+    }
+    fn stream_chat<'a>(
+        &'a self,
+        _req: &'a ChatRequest,
+        _ctx: &'a RequestCtx,
+    ) -> BoxFut<'a, Result<ChatStream, ProviderError>> {
+        let text = self.text.clone();
+        Box::pin(async move {
+            let events = vec![
+                StreamEvent::BlockStart {
+                    index: 0,
+                    kind: BlockKind::Text,
+                },
+                StreamEvent::BlockDelta {
+                    index: 0,
+                    delta: BlockDelta::Text(text),
+                },
+                StreamEvent::BlockStop { index: 0 },
+                StreamEvent::MessageStop,
+            ];
+            Ok(ChatStream::from_events(events))
+        })
+    }
+    fn count_tokens<'a>(
+        &'a self,
+        _req: &'a ChatRequest,
+        _ctx: &'a RequestCtx,
+    ) -> BoxFut<'a, Result<TokenCount, ProviderError>> {
+        Box::pin(async { Ok(TokenCount::default()) })
+    }
+    fn list_models<'a>(
+        &'a self,
+        _ctx: &'a RequestCtx,
+    ) -> BoxFut<'a, Result<Vec<ModelInfo>, ProviderError>> {
+        Box::pin(async { Ok(Vec::new()) })
+    }
+}
+
+/// Polls this session's real, on-disk event log until `pred` matches one of
+/// its events, or the bound elapses — copied from `submit_turn_e2e.rs`.
+async fn wait_for_event(
+    db_path: &std::path::Path,
+    session_id: SessionId,
+    what: &str,
+    pred: impl Fn(&EventPayload) -> bool,
+) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    loop {
+        let store = roundhouse_store::open(db_path).await.unwrap();
+        let events = roundhouse_store::session_events(&store, session_id)
+            .await
+            .unwrap();
+        if events.iter().any(|e| pred(&e.payload)) {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "timed out waiting for {what} in session {session_id}'s event log; \
+             saw {} events",
+            events.len()
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
+/// Phase 8, T19a Task 9 (plan item (c)): a viewer — an `Attach`ed, non-creating
+/// connection — disconnecting must never write `SessionClosed`. Only the
+/// creator's own `CloseSession` can ever do that (`drive_established_session`'s
+/// creator-only guard, Task 8); a plain socket drop just runs
+/// `SessionRegistry::detach`, which touches only the subscriber list.
+///
+/// Rather than sleep-then-assert, this settles on a real signal: the creator
+/// submits an ordinary turn and waits for it to complete. That does NOT
+/// prove the dropped viewer's own connection task has actually reached
+/// `detach` — `SessionRegistry` exposes no subscriber count or other cheap
+/// signal this test could poll for that specifically, so there is no direct
+/// way to observe it here. What it does prove is the assertion's own
+/// precondition: this session is genuinely still alive and processing real
+/// work after the drop, which is what makes "no `SessionClosed` was written"
+/// a meaningful negative rather than one that would hold just as well on an
+/// already-dead connection.
+#[tokio::test]
+async fn a_viewer_disconnecting_writes_no_session_closed() {
+    let dir = tempfile::tempdir().unwrap();
+    let socket_path = dir.path().join("round.sock");
+    let db_path = dir.path().join("events.db");
+    let registry = Arc::new(roundhouse_daemon::session_registry::SessionRegistry::new());
+    let listener = roundhouse_daemon::socket_server::bind_socket(&socket_path).unwrap();
+    let provider = Arc::new(ScriptedTextOnlyProvider {
+        text: "all done".to_string(),
+    });
+    let resources = common::resources_with_provider(dir.path(), provider).await;
+    tokio::spawn(roundhouse_daemon::socket_server::accept_loop(
+        listener,
+        registry.clone(),
+        resources,
+    ));
+
+    let mut creator = tokio::time::timeout(
+        Duration::from_secs(2),
+        roundhouse_tui::connect_create(&socket_path, "default"),
+    )
+    .await
+    .expect("connect_create must not hang")
+    .unwrap();
+    let session_id = creator.session_id();
+
+    let viewer = tokio::time::timeout(
+        Duration::from_secs(2),
+        roundhouse_tui::connect_attach(&socket_path, session_id),
+    )
+    .await
+    .expect("connect_attach must not hang")
+    .unwrap();
+    drop(viewer);
+
+    creator
+        .send(&ClientRequest::SubmitTurn {
+            session_id,
+            text: "hello".to_string(),
+        })
+        .await
+        .unwrap();
+    wait_for_event(&db_path, session_id, "a completed chat task", |p| {
+        matches!(p, EventPayload::TaskCompleted { .. })
+    })
+    .await;
+
+    let store = roundhouse_store::open(&db_path).await.unwrap();
+    let events = roundhouse_store::session_events(&store, session_id)
+        .await
+        .unwrap();
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e.payload, EventPayload::SessionClosed { .. })),
+        "a viewer disconnecting must never write SessionClosed, got {:?}",
+        events.iter().map(|e| &e.payload).collect::<Vec<_>>()
+    );
+    assert!(
+        registry.actor(session_id).is_some(),
+        "the session must still be alive after only a viewer (not the creator) disconnected"
     );
 }

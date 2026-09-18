@@ -56,6 +56,23 @@ pub enum ClientRequest {
         session_id: SessionId,
         text: String,
     },
+    /// Phase 8, T19a Task 8: ask the daemon to durably close an
+    /// already-established session — the wire counterpart of
+    /// `roundhouse_engine::SessionActor::close`. A new variant, for the same
+    /// reason `SubmitTurn`'s own doc comment gives: `ClientRequest` is
+    /// `#[non_exhaustive]`, so adding one is additive, and every existing
+    /// consumer already carries the catch-all arm `#[non_exhaustive]`
+    /// requires.
+    ///
+    /// `session_id` is carried, not implied by the connection, for the same
+    /// reason `SubmitTurn::session_id` is: it lets the daemon refuse a frame
+    /// naming a session other than the one this connection established. See
+    /// `roundhouse_daemon::socket_server::drive_established_session`, which
+    /// honors this variant only from the connection that created the
+    /// session, the same creator-only rule `SubmitTurn` already enforces.
+    CloseSession {
+        session_id: SessionId,
+    },
 }
 
 /// Daemon-to-client events over the NDJSON/SSE transport — a thin,

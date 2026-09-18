@@ -3,7 +3,11 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use arc_swap::ArcSwap;
-use roundhouse_core::{Delta, Event, EventPayload, TaskInput, TaskOutput};
+use roundhouse_core::{
+    CancelReason, Delta, Event, EventPayload, Origin, SessionId, SessionOutcome, TaskId, TaskInput,
+    TaskOutput, TaskRunner, Timestamp,
+};
+use rusqlite::OptionalExtension;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::redact::Redactor;
@@ -11,6 +15,22 @@ use crate::txn::{
     begin_immediate, is_sqlite_busy, with_bounded_busy_attempt, INITIAL_BACKOFF, MAX_BUSY_RETRIES,
 };
 use crate::{pool::StorePool, StoreError};
+
+/// The outcome of `EventWriter::close_session` (Task 19a Task 1).
+///
+/// Not `#[non_exhaustive]`: this crate's own `StoreError` convention (see `pool.rs`) is to
+/// leave error/result enums exhaustively matchable and rely on an explicit audit (this
+/// task's own) whenever a variant is added, rather than force every caller to carry a
+/// silent wildcard arm.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CloseReceipt {
+    /// The session's log already ended in `SessionClosed` before this call — the close is
+    /// idempotent, and nothing was appended.
+    AlreadyClosed,
+    /// This call minted the sweep and the `SessionClosed` terminator. `swept` is how many
+    /// open tasks (`Created`/`Decided`/`Running`/`Suspended`) were cancelled.
+    Closed { swept: usize },
+}
 
 pub(crate) enum WriteCmd {
     Append {
@@ -29,6 +49,16 @@ pub(crate) enum WriteCmd {
         events: Vec<Event>,
         state_dir: PathBuf,
         reply: oneshot::Sender<Result<Vec<u64>, StoreError>>,
+    },
+    // Task 19a Task 1: appended at the end of the enum on purpose — lane B
+    // (phase8-t19b-deltas-streaming) adds its own variant to this same file, and keeping
+    // additions additive/append-only here avoids gratuitous merge conflicts.
+    CloseSession {
+        runner: &'static TaskRunner,
+        session_id: SessionId,
+        ts: Timestamp,
+        outcome: SessionOutcome,
+        reply: oneshot::Sender<Result<CloseReceipt, StoreError>>,
     },
 }
 
@@ -86,6 +116,75 @@ pub fn serialize_payload(
     serde_json::to_string(payload)
 }
 
+/// The interpreted tail of one session's log, for the tail guard's purposes only.
+///
+/// `Open`'s payload is deliberately NOT surfaced as a parsed `EventPayload` — callers only
+/// ever need "is it closed or not" plus (for `Open`) the seq to increment from. See
+/// `read_session_tail`'s doc comment for why a payload that fails to parse is folded into
+/// `Open` rather than treated as an error.
+enum SessionTail {
+    /// The session has no events yet.
+    Empty,
+    /// The tail event exists and is *not* `SessionClosed` — includes a tail payload this
+    /// crate itself never wrote (corrupt/garbage JSON), which is deliberately treated the
+    /// same as "not closed" rather than as a hard error (see `read_session_tail`).
+    Open { seq: i64 },
+    /// The tail event is `SessionClosed` — the log has a real terminator.
+    Closed,
+}
+
+/// Reads the highest `seq` and interprets its `payload` for `session_id`'s tail, inside an
+/// already open transaction.
+///
+/// **Fails open on a payload that doesn't parse as JSON**, folding it into `SessionTail::
+/// Open` rather than propagating a `StoreError`. This is deliberate, not an oversight: this
+/// crate's own `recovery.rs` (Task 2's rewrite) is built specifically so crash recovery
+/// never has to deserialize the event log at all — it is driven entirely by the `tasks`
+/// materialized-cache table, precisely so a corrupted/garbage row elsewhere in the log
+/// cannot break recovery (`tests/recovery_scale.rs`'s
+/// `recovery_never_reads_the_event_log_so_a_corrupt_log_cannot_break_it` pins this down).
+/// Recovery's only append path is `EventWriter::append_batch`, which now goes through this
+/// same tail-guard lookup — if a stray pre-existing corrupt tail row turned into a hard
+/// append failure here, one garbled historical byte would permanently wedge a session's
+/// ability to ever be appended to again, which is a strictly worse outcome than declining
+/// to detect `SessionClosed` on that one session. The tail guard's only job is to detect a
+/// genuine, well-formed `SessionClosed` sentinel; "cannot parse the tail" is "cannot prove
+/// this log is closed," which correctly resolves to "treat as open," not "reject."
+fn read_session_tail(
+    tx: &rusqlite::Transaction<'_>,
+    session_id: &str,
+) -> Result<SessionTail, StoreError> {
+    let mut stmt = tx.prepare_cached(
+        "SELECT seq, payload FROM events WHERE session_id = ?1 ORDER BY seq DESC LIMIT 1",
+    )?;
+    let tail: Option<(i64, String)> = stmt
+        .query_row([session_id], |row| Ok((row.get(0)?, row.get(1)?)))
+        .optional()?;
+    Ok(match tail {
+        None => SessionTail::Empty,
+        Some((seq, payload_json)) => match serde_json::from_str::<EventPayload>(&payload_json) {
+            Ok(EventPayload::SessionClosed { .. }) => SessionTail::Closed,
+            _ => SessionTail::Open { seq },
+        },
+    })
+}
+
+/// Task 19a's tail guard: the same per-session `MAX(seq)+1` lookup every append path
+/// always did (`append_event_in_transaction`, `append_one`, `append_batch`), widened to
+/// also read back the tail row's payload via `read_session_tail` and reject with
+/// `StoreError::SessionClosed` if the log already ends in `SessionClosed` — a session's
+/// close is a real terminator, not just another event a later append can follow.
+fn next_seq_or_reject_closed(
+    tx: &rusqlite::Transaction<'_>,
+    session_id: &str,
+) -> Result<i64, StoreError> {
+    match read_session_tail(tx, session_id)? {
+        SessionTail::Empty => Ok(0),
+        SessionTail::Closed => Err(StoreError::SessionClosed(session_id.to_string())),
+        SessionTail::Open { seq } => Ok(seq + 1),
+    }
+}
+
 /// Appends one event using an already-open write transaction.
 ///
 /// This is the composable form of the writer's append operation. It assigns
@@ -103,11 +202,7 @@ pub fn append_event_in_transaction(
     let (payload, redactions) = redactor.redact_event_payload(event.payload.clone());
     let payload_json =
         serialize_payload(&payload).map_err(|error| StoreError::Interact(error.to_string()))?;
-    let next_seq: i64 = txn.query_row(
-        "SELECT COALESCE(MAX(seq), -1) + 1 FROM events WHERE session_id = ?1",
-        [&session_id],
-        |row| row.get(0),
-    )?;
+    let next_seq: i64 = next_seq_or_reject_closed(txn, &session_id)?;
     txn.execute(
         "INSERT INTO events (session_id, seq, ts, task_id, payload, schema_v)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
@@ -184,6 +279,18 @@ pub async fn spawn_writer(store: StorePool) -> EventWriter {
                     let result = append_batch_with_blobs(&store, events, state_dir, redactor).await;
                     let _ = reply.send(result);
                 }
+                WriteCmd::CloseSession {
+                    runner,
+                    session_id,
+                    ts,
+                    outcome,
+                    reply,
+                } => {
+                    let redactor = redactor_for_task.load_full();
+                    let result =
+                        close_session(&store, runner, session_id, ts, outcome, redactor).await;
+                    let _ = reply.send(result);
+                }
             }
         }
     });
@@ -227,8 +334,8 @@ async fn append_one(
         let payload = payload.clone();
 
         let write_result = conn
-            .interact(move |c| -> Result<u64, rusqlite::Error> {
-                with_bounded_busy_attempt(c, |c| {
+            .interact(move |c| -> Result<u64, StoreError> {
+                with_bounded_busy_attempt(c, |c| -> Result<u64, StoreError> {
                     // BEGIN IMMEDIATE: acquire the write lock immediately rather than deferring it.
                     // This enforces single-writer discipline: a writer holds the lock for its entire
                     // transaction, so no two writers can execute concurrently. Deferred transactions
@@ -236,11 +343,10 @@ async fn append_one(
                     // time, which would be both unfair to clients and incompatible with S-LOG-4/5's
                     // retry guarantees.
                     let tx = begin_immediate(c)?;
-                    let next_seq: i64 = tx.query_row(
-                        "SELECT COALESCE(MAX(seq), -1) + 1 FROM events WHERE session_id = ?1",
-                        [&session_id],
-                        |row| row.get(0),
-                    )?;
+                    // Task 19a's tail guard: rejects with `StoreError::SessionClosed` if
+                    // this session's log already ends in `SessionClosed` (see
+                    // `next_seq_or_reject_closed`'s doc comment).
+                    let next_seq: i64 = next_seq_or_reject_closed(&tx, &session_id)?;
                     tx.execute(
                         "INSERT INTO events (session_id, seq, ts, task_id, payload, schema_v)
                      VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
@@ -289,7 +395,9 @@ async fn append_one(
                                 rusqlite::params![redactions, task_id],
                             )?;
                             if rows_affected == 0 {
-                                return Err(rusqlite::Error::StatementChangedRows(0));
+                                return Err(StoreError::Sqlite(
+                                    rusqlite::Error::StatementChangedRows(0),
+                                ));
                             }
                         }
                     }
@@ -302,11 +410,11 @@ async fn append_one(
 
         match write_result {
             Ok(seq) => break seq,
-            Err(err) if is_sqlite_busy(&err) && attempt < MAX_BUSY_RETRIES => {
+            Err(StoreError::Sqlite(err)) if is_sqlite_busy(&err) && attempt < MAX_BUSY_RETRIES => {
                 tokio::time::sleep(INITIAL_BACKOFF * 2u32.pow(attempt - 1)).await;
                 continue;
             }
-            Err(err) => return Err(StoreError::Sqlite(err)),
+            Err(err) => return Err(err),
         }
     };
 
@@ -400,87 +508,109 @@ async fn append_batch(
         let batch = std::sync::Arc::clone(&prepared);
 
         let write_result = conn
-            .interact(move |c| -> Result<Vec<u64>, rusqlite::Error> {
-                with_bounded_busy_attempt(c, |c| {
-                // Same BEGIN IMMEDIATE discipline as append_one: acquire the
-                // exclusive write lock for the whole transaction up front.
-                let tx = begin_immediate(c)?;
-                let mut next_seq_by_session: HashMap<String, i64> = HashMap::new();
-                let mut seqs = Vec::with_capacity(batch.len());
+            .interact(move |c| -> Result<Vec<u64>, StoreError> {
+                with_bounded_busy_attempt(c, |c| -> Result<Vec<u64>, StoreError> {
+                    // Same BEGIN IMMEDIATE discipline as append_one: acquire the
+                    // exclusive write lock for the whole transaction up front.
+                    let tx = begin_immediate(c)?;
+                    let mut next_seq_by_session: HashMap<String, i64> = HashMap::new();
+                    let mut seqs = Vec::with_capacity(batch.len());
 
-                // `prepare_cached`, not `tx.execute`/`tx.query_row` (which each
-                // reparse and recompile the SQL text from scratch on every
-                // call — negligible for `append_one`'s single call, but the
-                // dominant cost at this loop's scale, confirmed empirically
-                // against the 100k-task scale test in
-                // `tests/recovery_scale.rs`): both statements below are
-                // identical text on every iteration, so SQLite's per-connection
-                // statement cache turns each repeat call into a cheap
-                // lookup-and-rebind instead of a fresh parse.
-                for item in batch.iter() {
-                    let next_seq = match next_seq_by_session.get(&item.session_id) {
-                        Some(&seq) => seq,
-                        None => {
-                            let mut select_max_seq = tx.prepare_cached(
-                                "SELECT COALESCE(MAX(seq), -1) + 1 FROM events WHERE session_id = ?1",
-                            )?;
-                            select_max_seq.query_row([&item.session_id], |row| row.get(0))?
-                        }
-                    };
+                    // `prepare_cached`, not `tx.execute`/`tx.query_row` (which each
+                    // reparse and recompile the SQL text from scratch on every
+                    // call — negligible for `append_one`'s single call, but the
+                    // dominant cost at this loop's scale, confirmed empirically
+                    // against the 100k-task scale test in
+                    // `tests/recovery_scale.rs`): both statements below are
+                    // identical text on every iteration, so SQLite's per-connection
+                    // statement cache turns each repeat call into a cheap
+                    // lookup-and-rebind instead of a fresh parse.
+                    //
+                    // Task 19a's tail guard: the first time a `session_id` is seen in this
+                    // batch, `next_seq_or_reject_closed` reads its tail and rejects the WHOLE
+                    // batch (via `?`, out of this `BEGIN IMMEDIATE` transaction, so nothing
+                    // commits) if that session's log already ends in `SessionClosed`. A
+                    // `session_id` already in `next_seq_by_session` was appended to by an
+                    // earlier item in THIS batch, whose tail this loop therefore already
+                    // knows without re-reading it — including whether that earlier item WAS
+                    // the terminator. `closed_in_batch` is what carries that: the guard holds
+                    // for an intra-batch terminator structurally, rather than resting on
+                    // today's callers happening not to mint one into `append_batch`, which
+                    // this `pub` entry point cannot enforce.
+                    let mut closed_in_batch: std::collections::HashSet<String> =
+                        std::collections::HashSet::new();
+                    for item in batch.iter() {
+                        let next_seq = match next_seq_by_session.get(&item.session_id) {
+                            Some(&seq) if !closed_in_batch.contains(&item.session_id) => seq,
+                            Some(_) => {
+                                return Err(StoreError::SessionClosed(item.session_id.clone()))
+                            }
+                            None => next_seq_or_reject_closed(&tx, &item.session_id)?,
+                        };
 
-                    let mut insert_event = tx.prepare_cached(
-                        "INSERT INTO events (session_id, seq, ts, task_id, payload, schema_v)
+                        let mut insert_event = tx.prepare_cached(
+                            "INSERT INTO events (session_id, seq, ts, task_id, payload, schema_v)
                          VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                    )?;
-                    insert_event.execute(rusqlite::params![
-                        item.session_id,
-                        next_seq,
-                        item.ts_nanos,
-                        item.task_id,
-                        item.payload_json,
-                        item.schema_v
-                    ])?;
-                    // Returns this cached statement to the connection's
-                    // statement cache before the next iteration (and before
-                    // `upsert_for_event` below runs its own `prepare_cached`
-                    // calls on the same `tx`) rather than waiting for
-                    // end-of-scope.
-                    drop(insert_event);
-                    // Same transaction as the events insert above, for every
-                    // batch member — not just the first — so the `tasks` cache
-                    // never falls behind for a batch-appended event (Task 0.5's
-                    // invariant, extended to the batched path).
-                    if let Some(task_id) = &item.task_id {
-                        crate::tasks_view::upsert_for_event(
-                            &tx,
-                            task_id,
-                            &item.session_id,
+                        )?;
+                        insert_event.execute(rusqlite::params![
+                            item.session_id,
                             next_seq,
                             item.ts_nanos,
-                            &item.payload,
-                        )?;
-                        // Same gotcha as append_one (Ruling 5): can't shoehorn this into
-                        // upsert_for_event's early-return for TaskDelta/Note payloads. Same
-                        // fail-closed fix as append_one (fix round 1, item 4): a zero-row
-                        // match means this batch member's task_id has no tasks row yet —
-                        // hard error rather than silently dropping the redaction count.
-                        if item.redactions > 0 {
-                            let rows_affected = tx.execute(
+                            item.task_id,
+                            item.payload_json,
+                            item.schema_v
+                        ])?;
+                        // Returns this cached statement to the connection's
+                        // statement cache before the next iteration (and before
+                        // `upsert_for_event` below runs its own `prepare_cached`
+                        // calls on the same `tx`) rather than waiting for
+                        // end-of-scope.
+                        drop(insert_event);
+                        // Same transaction as the events insert above, for every
+                        // batch member — not just the first — so the `tasks` cache
+                        // never falls behind for a batch-appended event (Task 0.5's
+                        // invariant, extended to the batched path).
+                        if let Some(task_id) = &item.task_id {
+                            crate::tasks_view::upsert_for_event(
+                                &tx,
+                                task_id,
+                                &item.session_id,
+                                next_seq,
+                                item.ts_nanos,
+                                &item.payload,
+                            )?;
+                            // Same gotcha as append_one (Ruling 5): can't shoehorn this into
+                            // upsert_for_event's early-return for TaskDelta/Note payloads. Same
+                            // fail-closed fix as append_one (fix round 1, item 4): a zero-row
+                            // match means this batch member's task_id has no tasks row yet —
+                            // hard error rather than silently dropping the redaction count.
+                            if item.redactions > 0 {
+                                let rows_affected = tx.execute(
                                 "UPDATE tasks SET redactions = redactions + ?1 WHERE task_id = ?2",
                                 rusqlite::params![item.redactions, task_id],
                             )?;
-                            if rows_affected == 0 {
-                                return Err(rusqlite::Error::StatementChangedRows(0));
+                                if rows_affected == 0 {
+                                    return Err(StoreError::Sqlite(
+                                        rusqlite::Error::StatementChangedRows(0),
+                                    ));
+                                }
                             }
                         }
+
+                        next_seq_by_session.insert(item.session_id.clone(), next_seq + 1);
+                        // This session's log now ends in its terminator, so
+                        // every later item in this same batch for it is
+                        // rejected by the check above — the intra-batch half
+                        // of the tail guard `next_seq_or_reject_closed`
+                        // applies to what was already committed.
+                        if matches!(item.payload, EventPayload::SessionClosed { .. }) {
+                            closed_in_batch.insert(item.session_id.clone());
+                        }
+                        seqs.push(next_seq as u64);
                     }
 
-                    next_seq_by_session.insert(item.session_id.clone(), next_seq + 1);
-                    seqs.push(next_seq as u64);
-                }
-
-                tx.commit()?;
-                Ok(seqs)
+                    tx.commit()?;
+                    Ok(seqs)
                 })
             })
             .await
@@ -488,11 +618,11 @@ async fn append_batch(
 
         match write_result {
             Ok(seqs) => break seqs,
-            Err(err) if is_sqlite_busy(&err) && attempt < MAX_BUSY_RETRIES => {
+            Err(StoreError::Sqlite(err)) if is_sqlite_busy(&err) && attempt < MAX_BUSY_RETRIES => {
                 tokio::time::sleep(INITIAL_BACKOFF * 2u32.pow(attempt - 1)).await;
                 continue;
             }
-            Err(err) => return Err(StoreError::Sqlite(err)),
+            Err(err) => return Err(err),
         }
     };
 
@@ -687,6 +817,117 @@ async fn append_batch_with_blobs(
     };
 
     result
+}
+
+/// Task 19a Task 1: closes a session in one transaction — mints
+/// `TaskCancelled{by: System, reason: SessionClosed}` for every currently open task, then
+/// appends `SessionClosed{outcome}` as the terminator, sweep events first, terminator
+/// last, all inside one `BEGIN IMMEDIATE`. Idempotent: if the session's tail is already
+/// `SessionClosed`, this is a no-op read (`CloseReceipt::AlreadyClosed`) — nothing is
+/// appended and no `BEGIN IMMEDIATE` write is even attempted beyond the read itself.
+///
+/// The sweep covers `tasks` rows in `Created`, `Decided`, `Running`, **and `Suspended`** —
+/// deliberately wider than `recover_interrupted_tasks` (`recovery.rs`), which only sweeps
+/// `Created`/`Decided`/`Running` and leaves `Suspended` alone because a daemon restart
+/// re-arms a suspended task through the attention-queue path (see `recovery.rs`'s own
+/// module doc comment). A session close has no "later" to re-arm into once the session
+/// itself is gone, so a task merely waiting on an approval/elicitation/reply/peer is
+/// cancelled too, not left stranded forever.
+///
+/// `runner` mints both the sweep's `TaskCancelled` events and the `SessionClosed`
+/// terminator (`record_task_cancelled`/`record_session_closed` — the sole sanctioned way
+/// to produce either, per `TaskRunner`'s own doc comment); `append_event_in_transaction`
+/// (this same file) does the actual appending of each, reusing its tail guard, seq
+/// assignment, redaction, and `tasks`-view upkeep rather than duplicating any of it here.
+async fn close_session(
+    store: &StorePool,
+    runner: &'static TaskRunner,
+    session_id: SessionId,
+    ts: Timestamp,
+    outcome: SessionOutcome,
+    redactor: Arc<Redactor>,
+) -> Result<CloseReceipt, StoreError> {
+    let conn = store.pool.get().await?;
+    let session_id_str = session_id.to_string();
+
+    let mut attempt: u32 = 0;
+    let receipt = loop {
+        attempt += 1;
+        let session_id_str = session_id_str.clone();
+        let outcome = outcome.clone();
+        // Unlike `append_one`/`append_batch` (which redact once, synchronously, before
+        // ever entering `conn.interact`), this function mints and appends more than one
+        // event *inside* the transaction via `append_event_in_transaction`, which needs a
+        // live `&Redactor` at each call site — so the 'static `conn.interact` closure
+        // below needs to own a handle to it. Cloning the `Arc` (one atomic increment) is
+        // cheap and correct on a retry, since nothing here ever mutates the shared
+        // automaton.
+        let redactor = Arc::clone(&redactor);
+
+        let write_result = conn
+            .interact(move |c| -> Result<CloseReceipt, StoreError> {
+                with_bounded_busy_attempt(c, |c| -> Result<CloseReceipt, StoreError> {
+                    let tx = begin_immediate(c)?;
+
+                    if matches!(
+                        read_session_tail(&tx, &session_id_str)?,
+                        SessionTail::Closed
+                    ) {
+                        return Ok(CloseReceipt::AlreadyClosed);
+                    }
+
+                    let mut stmt = tx.prepare(
+                        "SELECT task_id FROM tasks WHERE session_id = ?1 \
+                         AND state IN ('Created', 'Decided', 'Running', 'Suspended')",
+                    )?;
+                    let open_task_ids: Vec<String> = stmt
+                        .query_map([&session_id_str], |row| row.get(0))?
+                        .collect::<rusqlite::Result<_>>()?;
+                    drop(stmt);
+
+                    for task_id_str in &open_task_ids {
+                        let task_id = TaskId::from_uuid(
+                            uuid::Uuid::parse_str(task_id_str).map_err(|error| {
+                                StoreError::Interact(format!(
+                                    "corrupt task_id in tasks table: {error}"
+                                ))
+                            })?,
+                        );
+                        let cancelled = runner.record_task_cancelled(
+                            session_id,
+                            0, // seq reassigned by append_event_in_transaction
+                            ts,
+                            task_id,
+                            Origin::System,
+                            CancelReason::SessionClosed,
+                            1,
+                        );
+                        append_event_in_transaction(&tx, &cancelled, &redactor)?;
+                    }
+
+                    let terminator = runner.record_session_closed(session_id, 0, ts, outcome, 1);
+                    append_event_in_transaction(&tx, &terminator, &redactor)?;
+
+                    tx.commit()?;
+                    Ok(CloseReceipt::Closed {
+                        swept: open_task_ids.len(),
+                    })
+                })
+            })
+            .await
+            .map_err(|e| StoreError::Interact(e.to_string()))?;
+
+        match write_result {
+            Ok(receipt) => break receipt,
+            Err(StoreError::Sqlite(err)) if is_sqlite_busy(&err) && attempt < MAX_BUSY_RETRIES => {
+                tokio::time::sleep(INITIAL_BACKOFF * 2u32.pow(attempt - 1)).await;
+                continue;
+            }
+            Err(err) => return Err(err),
+        }
+    };
+
+    Ok(receipt)
 }
 
 impl EventWriter {
@@ -993,4 +1234,49 @@ impl EventWriter {
         rx.await
             .map_err(|_| StoreError::Interact("writer task dropped reply".into()))?
     }
+
+    /// Closes a session (Task 19a Task 1): sweeps every currently open task
+    /// (`Created`/`Decided`/`Running`/`Suspended`) into
+    /// `TaskCancelled{by: System, reason: SessionClosed}`, then appends
+    /// `SessionClosed{outcome}` as the terminator, sweep events first, terminator last,
+    /// all in one transaction. Idempotent — closing an already-closed session returns
+    /// `CloseReceipt::AlreadyClosed` and appends nothing. See `close_session`'s (the free
+    /// function's) doc comment for the full design.
+    ///
+    /// `runner` is `&'static` because it is the one process-wide `TaskRunner` singleton
+    /// (`TaskRunner::bootstrap()`'s doc comment) — the same convention
+    /// `roundhouse_engine::SessionActor` already uses for its own `runner` field, which is
+    /// this method's intended caller (`SessionActor::close`, a later task in this lane).
+    pub async fn close_session(
+        &self,
+        runner: &'static TaskRunner,
+        session_id: SessionId,
+        ts: Timestamp,
+        outcome: SessionOutcome,
+    ) -> Result<CloseReceipt, StoreError> {
+        let (reply, rx) = oneshot::channel();
+        self.tx
+            .send(WriteCmd::CloseSession {
+                runner,
+                session_id,
+                ts,
+                outcome,
+                reply,
+            })
+            .await
+            .map_err(|_| StoreError::Interact("writer task shut down".into()))?;
+        rx.await
+            .map_err(|_| StoreError::Interact("writer task dropped reply".into()))?
+    }
 }
+
+/// Test-only seam for a lane needing to gate/fail `close_session` specifically (Phase 8,
+/// T19a Task 4's fault-injection and retry tests, and a documented future reuse: the
+/// socket server's close-request handling later pausing a close until an external signal
+/// fires). A CHILD module of this one, not a sibling declared from `lib.rs` — that is what
+/// lets it build an `EventWriter` and call `append_one`/`append_batch`/`close_session`
+/// directly from its own private fields/free functions (all private to this module)
+/// without widening any of their visibility for production callers, per this lane's own
+/// constraint against restructuring `writer.rs` for the parallel lane sharing this file.
+#[cfg(feature = "test-util")]
+pub mod test_util;

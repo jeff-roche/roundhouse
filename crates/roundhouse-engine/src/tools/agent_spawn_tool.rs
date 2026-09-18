@@ -250,6 +250,63 @@ pub trait SubAgentHost: Send + Sync {
     /// no handle on anything the implementor built.
     async fn create_child_session(&self, req: ChildSessionRequest)
         -> Result<(), ChildSessionError>;
+
+    /// Cooperatively closes every child session `parent` has spawned through
+    /// this `agent` tool (Phase 8, T19a Task 4's `SessionActor::close`, step
+    /// 4 — closing a session must close its children first, so none of them
+    /// is left running against a parent that no longer exists).
+    ///
+    /// Default no-op: an implementor with no children to worry about (a
+    /// library fixture, or any `SubAgentHost` built before this method
+    /// existed) closes cleanly without having to implement child-closing
+    /// itself. A real daemon-side implementor is expected to override this
+    /// to walk `parent`'s edges in the shared `SpawnTree` and call `close`
+    /// on each child's own `SessionActor`. Nothing here requires those
+    /// child closes to be sequential, and the real implementor
+    /// (`roundhouse-daemon`'s `DaemonSubAgentHost::close_children`) runs a
+    /// level's siblings concurrently so that a level costs its slowest
+    /// child rather than the sum of its children.
+    ///
+    /// **Nothing here promises this method's future is safe to drop**, and
+    /// an implementor that starts unrecoverable work per child owes that
+    /// property itself. `SessionActor::close` has no timeout of its own, so
+    /// every caller applies one (`socket_server`'s `CLOSE_SESSION_TIMEOUT`,
+    /// `session_manager`'s `SESSION_CLOSE_TIMEOUT`), and a timeout DROPS
+    /// what it bounds — mid-child, with whatever that child's teardown had
+    /// already torn out still torn out. The real implementor closes that by
+    /// detaching each child's retirement onto its own task and awaiting the
+    /// handle, so a dropped cascade still finishes what it started; see its
+    /// own doc comment for what that costs.
+    ///
+    /// # Implementor contract
+    ///
+    /// **Must be idempotent.** `SessionActor::close`'s own retry path can
+    /// call this a second time for the same `parent` after an earlier
+    /// `close` attempt failed at a LATER step (its own durable append) —
+    /// see `close`'s doc comment on why a retry re-runs this step rather
+    /// than skipping it. A real implementor must tolerate being asked to
+    /// close children it has already closed (or is already closing)
+    /// without erroring or double-acting on them.
+    ///
+    /// **Owns handling a child that fails to close.** This method returns
+    /// no `Result` — `SessionActor::close`'s own signature has nowhere to
+    /// carry a per-child failure, and one uncooperative or already-gone
+    /// child must not block the parent's own close indefinitely. An
+    /// implementor is responsible for its own logging/recording of any
+    /// child it could not close (e.g. a durable `Note`, same as other
+    /// best-effort paths in this crate), rather than propagating a failure
+    /// this trait has no channel for.
+    ///
+    /// **Must not let a cascade revisit an ancestor.** Closing a child may
+    /// itself recurse into that child's own `close_children` for its
+    /// grandchildren; an implementor walking `parent`'s edges must not
+    /// follow an edge back up toward `parent` or any of its own ancestors —
+    /// the spawn tree is expected to be acyclic, but this method's own
+    /// walk must not be the thing that turns a corrupted or cyclic edge
+    /// into an infinite close loop.
+    async fn close_children(&self, parent: SessionId) {
+        let _ = parent;
+    }
 }
 
 /// The model-supplied half of an `agent` call, already validated.

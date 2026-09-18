@@ -1,3 +1,4 @@
+use crate::event::EventPayload;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
@@ -93,4 +94,31 @@ pub enum SessionOutcome {
     Completed,
     Cancelled,
     Failed { reason: String },
+}
+
+/// The session-level counterpart to `fold_task_state`: given every
+/// `EventPayload` bearing one `session_id`, in log order, derive the
+/// current `SessionState`. Only the three session-lifecycle variants ever
+/// change the fold — `SessionCreated` to `Created`, `SessionStateChanged`
+/// to its carried `state`, `SessionClosed` to `Closed` — every other
+/// variant (task-lifecycle, `SessionConfigured`, and the cross-cutting
+/// `Message`/`Note`/`Loss` payloads) leaves the running state unchanged.
+/// `Closed` is a terminal fold value: once reached, every later event is
+/// absorbed and the result stays `Closed`, matching the store's append
+/// tail-guard that rejects writes past `SessionClosed`. Returns `None` if
+/// the slice carries no session-lifecycle event at all.
+pub fn fold_session_state(events: &[EventPayload]) -> Option<SessionState> {
+    let mut state = None;
+    for payload in events {
+        if matches!(state, Some(SessionState::Closed)) {
+            break;
+        }
+        state = match payload {
+            EventPayload::SessionCreated { .. } => Some(SessionState::Created),
+            EventPayload::SessionStateChanged { state, .. } => Some(state.clone()),
+            EventPayload::SessionClosed { .. } => Some(SessionState::Closed),
+            _ => state,
+        };
+    }
+    state
 }

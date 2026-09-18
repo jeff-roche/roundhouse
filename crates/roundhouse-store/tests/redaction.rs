@@ -10,7 +10,8 @@
 //! not wired into any provider call site by this task.
 
 use roundhouse_core::{
-    Delta, EventPayload, NoteLevel, Origin, SessionId, TaskId, TaskInput, TaskKind, Timestamp,
+    Delta, EventPayload, NoteLevel, Origin, SessionId, SessionOutcome, TaskId, TaskInput, TaskKind,
+    Timestamp,
 };
 use roundhouse_store::redact::{debug_read_raw_payload_text, Redactor, SecretLeakDisposition};
 use roundhouse_store::{open, session_events, spawn_writer};
@@ -154,6 +155,123 @@ async fn loss_description_carrying_a_secret_is_redacted_like_task_failed_error_m
         }
         other => panic!("unexpected payload: {other:?}"),
     }
+}
+
+/// Phase 8, T19a: `SessionClosed{outcome: Failed{reason}}` carries free text, and it had
+/// no arm in `redact_event_payload` — the same string is redacted when it travels as
+/// `TaskFailed.error.message`, so the terminator was the one shape it could get through.
+#[tokio::test]
+async fn session_closed_failed_reason_is_redacted_like_task_failed_error_message() {
+    let redactor = Redactor::build(&["sk-live-abc123".to_string()]);
+    let (redacted, count) = redactor.redact_event_payload(EventPayload::SessionClosed {
+        outcome: SessionOutcome::Failed {
+            reason: "agent loop failed: upstream said key sk-live-abc123 is invalid".into(),
+        },
+    });
+    assert_eq!(
+        count, 1,
+        "a SessionClosed Failed reason containing a live secret must be counted as \
+         redacted, the same way TaskFailed.error.message already is"
+    );
+    match redacted {
+        EventPayload::SessionClosed {
+            outcome: SessionOutcome::Failed { reason },
+        } => {
+            assert!(
+                !reason.contains("sk-live-abc123"),
+                "the live secret must never survive in the redacted reason: {reason}"
+            );
+            assert!(
+                reason.contains("[REDACTED]"),
+                "the redacted placeholder must appear in its place: {reason}"
+            );
+        }
+        other => panic!("unexpected payload: {other:?}"),
+    }
+}
+
+/// The arm above, proven against the durable row rather than the in-memory payload — the
+/// distinction that matters here, because `events` physically rejects `UPDATE`/`DELETE`,
+/// so a secret that reaches this particular column can never be removed. Goes through the
+/// real `EventWriter::close_session`, the only sanctioned way to mint a terminator, rather
+/// than hand-appending one.
+///
+/// The `Cancelled` close beside it is not decoration: `SessionOutcome` has two unit
+/// variants alongside `Failed`, and an arm written as a blanket `EventPayload::
+/// SessionClosed { .. }` catch would still pass the assertion above while silently
+/// rebuilding those two. This pins that they survive the trip intact.
+#[tokio::test]
+async fn a_secret_in_a_session_closed_reason_never_reaches_the_stored_row() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("events.db");
+    let store = open(&db_path).await.unwrap();
+    let writer = spawn_writer(store).await;
+    writer.set_redactor(Redactor::build(&["sk-live-abc123".to_string()]));
+
+    let failed_session = SessionId::new();
+    writer
+        .close_session(
+            &RUNNER,
+            failed_session,
+            now_ts(),
+            SessionOutcome::Failed {
+                reason: "provider rejected sk-live-abc123".into(),
+            },
+        )
+        .await
+        .unwrap();
+
+    let cancelled_session = SessionId::new();
+    writer
+        .close_session(
+            &RUNNER,
+            cancelled_session,
+            now_ts(),
+            SessionOutcome::Cancelled,
+        )
+        .await
+        .unwrap();
+
+    let query_store = open(&db_path).await.unwrap();
+
+    let raw = raw_terminator_payload(&query_store, failed_session).await;
+    assert!(
+        !raw.contains("sk-live-abc123"),
+        "a secret must never reach the terminator's SQLite row, even read directly: {raw}"
+    );
+    assert!(
+        raw.contains("[REDACTED]"),
+        "the redacted placeholder must appear in its place: {raw}"
+    );
+
+    let raw_cancelled = raw_terminator_payload(&query_store, cancelled_session).await;
+    assert!(
+        raw_cancelled.contains("Cancelled"),
+        "a textless outcome must pass through the new arm untouched: {raw_cancelled}"
+    );
+}
+
+/// The raw `events.payload` text of `session_id`'s last event — the `SessionClosed`
+/// terminator, for a session that has been closed. Read straight out of SQLite rather
+/// than through a fold, so nothing between the write and this assertion can re-redact.
+/// `debug_read_raw_payload_text` does not fit: it keys on a `task_id`, and a terminator
+/// has none.
+async fn raw_terminator_payload(
+    store: &roundhouse_store::StorePool,
+    session_id: SessionId,
+) -> String {
+    let session_id_str = session_id.to_string();
+    let conn = store.pool.get().await.unwrap();
+    conn.interact(move |c| {
+        c.query_row(
+            "SELECT payload FROM events WHERE session_id = ?1 ORDER BY seq DESC LIMIT 1",
+            [session_id_str],
+            |row| row.get::<_, String>(0),
+        )
+        .unwrap()
+    })
+    .await
+    .unwrap()
 }
 
 /// Proves the redaction-count accumulation runs on a path INDEPENDENT of

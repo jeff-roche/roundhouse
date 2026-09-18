@@ -144,7 +144,8 @@ pub enum SpawnTreeRecoveryError {
 /// skipping under-counts one parent's fan-out by one child against a ceiling
 /// of eight (permissive by one), which is the same bounded-permissive tradeoff
 /// [`reconcile_spawn_tree`]'s own KNOWN GAP section already accepts for a
-/// sub-agent child with no durable terminal signal.
+/// still-open sub-agent child recovered across a restart with no
+/// `SubAgentSessions` record behind its edge.
 ///
 /// The tolerance is scoped to that one case. A genuinely unrecoverable problem
 /// — the connection cannot be checked out, the blocking closure cannot run,

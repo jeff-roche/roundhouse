@@ -8,11 +8,21 @@
 //! file proves only that the boot seam wires it to the daemon's one shared
 //! tree and reports what it restored.
 
+mod common;
+
 use std::sync::Arc;
 
 use roundhouse_bus::spawn_tree::SpawnTree;
-use roundhouse_core::{SessionId, SessionOutcome, SessionSpec, TaskRunner, Timestamp};
+use roundhouse_core::{
+    OnDegrade, SessionId, SessionOutcome, SessionSpec, SessionState, TaskId, Tier, Timestamp,
+};
 use roundhouse_daemon::boot::reconcile_spawn_tree_at_boot;
+use roundhouse_daemon::session_bootstrap::PolicyRuleSource;
+use roundhouse_daemon::session_registry::SessionRegistry;
+use roundhouse_daemon::sub_agent_host::wire_sub_agent_host;
+use roundhouse_engine::tools::agent_spawn_tool::dispatch_agent;
+use roundhouse_engine::SessionActor;
+use roundhouse_policy::engine::{CompiledRule, Outcome, PolicyEngine, Predicate, Scope};
 use roundhouse_store::{open, spawn_writer};
 
 fn now_ts() -> Timestamp {
@@ -56,13 +66,14 @@ fn boot_recovery_runs_before_the_background_services_that_consume_the_tree() {
     );
 }
 
-/// `TaskRunner::bootstrap()` panics on a second call per process and each
-/// integration-test binary is its own process, so this file holds exactly one
-/// test that needs a runner — the same posture as `tests/boot.rs`. (The source
-/// scan above needs none.)
+/// `TaskRunner::bootstrap()` panics on a second call per process, and both
+/// `#[tokio::test]`s in this file need one — `common::runner()`'s `OnceLock`
+/// (Phase 8, T19a Task 9) is what lets them share one instance safely,
+/// rather than each calling `bootstrap()` directly the way a single-runner
+/// file like `tests/boot.rs` still does.
 #[tokio::test]
 async fn boot_recovery_rebuilds_the_daemons_spawn_tree_from_the_store() {
-    let runner = TaskRunner::bootstrap();
+    let runner = common::runner();
 
     let dir = tempfile::tempdir().unwrap();
     let store = open(&dir.path().join("events.db")).await.unwrap();
@@ -102,4 +113,147 @@ async fn boot_recovery_rebuilds_the_daemons_spawn_tree_from_the_store() {
         "the live child is back under its parent; the closed one is not"
     );
     assert_eq!(tree.direct_children(parent), 1);
+}
+
+fn allow_agent_rules() -> PolicyRuleSource {
+    Arc::new(|| {
+        vec![CompiledRule::test_new(
+            Scope::Project,
+            Outcome::Allow,
+            Predicate::agent(None, None, Tier::None),
+        )]
+    })
+}
+
+/// Phase 8, T19a Task 9 (plan item (d)): unlike the hand-written events
+/// above, this drives the real production close path — `SessionActor::close`
+/// (this lane's own Task 4/7) cascading through `DaemonSubAgentHost::
+/// close_children` (Task 6) — for a real sub-agent child spawned through the
+/// real `agent` dispatcher, then rebuilds the tree from the same store and
+/// confirms the closed child's edge does not come back.
+///
+/// This is a materially different proof from
+/// `sub_agent_host.rs`'s own `a_retired_sub_agent_child_does_not_reappear_
+/// after_a_restart` (which retires a child directly via `SubAgentSessions::
+/// retire_child`, never through a parent's own close): here the PARENT is
+/// what gets closed, and the child's own `SessionClosed` is a side effect of
+/// that close cascading down, not of anything called on the child directly.
+///
+/// Reconciles into a throwaway tree BEFORE the close, asserting the edge IS
+/// present there — a positive control: without it, nothing shows the edge
+/// would ever have come back at all, so a regression in
+/// `persist_session_created` (no longer writing a parent-bearing
+/// `SessionCreated`) or in `reconcile_spawn_tree`'s own prefilter (no longer
+/// matching this child's row) would leave the post-close assertion
+/// vacuously true.
+#[tokio::test]
+async fn a_cascade_closed_sub_agent_childs_edge_is_not_restored_after_a_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let resources = common::resources_with(
+        dir.path(),
+        common::available_isolate(),
+        Arc::new(common::NoopProvider),
+        allow_agent_rules(),
+    )
+    .await;
+    let registry = Arc::new(SessionRegistry::new());
+
+    let store = open(&dir.path().join("events.db")).await.unwrap();
+    let writer = spawn_writer(store).await;
+    let policy = Arc::new(PolicyEngine::from_rules(vec![CompiledRule::test_new(
+        Scope::Project,
+        Outcome::Allow,
+        Predicate::agent(None, None, Tier::None),
+    )]));
+    let isolate = common::available_isolate();
+    let spec = SessionSpec::test_requesting(Tier::Sandbox, OnDegrade::Refuse);
+    let handle = isolate.prepare(&spec).await.unwrap();
+    let actor = Arc::new(SessionActor::new_with_workspace_root(
+        SessionId::new(),
+        writer,
+        SessionState::Running,
+        common::runner(),
+        policy,
+        dir.path().join("state"),
+        dir.path().join("daemon-binary"),
+        dir.path().canonicalize().unwrap(),
+        isolate,
+        handle,
+        spec,
+        roundhouse_engine::tool_catalog::builtin_tool_defs(),
+    ));
+    let parent = actor.session_id();
+    wire_sub_agent_host(&actor, &resources, &registry);
+    let host = actor
+        .sub_agent_host()
+        .expect("the host was just registered");
+
+    dispatch_agent(
+        &actor,
+        actor.writer(),
+        common::runner(),
+        Some(&host),
+        &serde_json::json!({
+            "prompt": "review the diff",
+            "provider": "anthropic",
+            "budget_tokens": 250,
+        }),
+        TaskId::new(),
+    )
+    .await
+    .expect("the spawn must succeed under an allow rule");
+
+    let child = resources
+        .spawn_tree
+        .descendants(parent)
+        .into_iter()
+        .next()
+        .expect("exactly one real child was spawned");
+
+    // Positive control: reconcile into a throwaway tree BEFORE the close and
+    // confirm the live child's edge WOULD be restored — proving the
+    // post-close assertion below is actually exercising `reconcile_spawn_tree`'s
+    // exclusion filter, not merely observing that nothing was ever going to
+    // come back regardless.
+    let before_close = Arc::new(SpawnTree::new());
+    reconcile_spawn_tree_at_boot(&resources.store, &before_close)
+        .await
+        .unwrap();
+    assert_eq!(
+        before_close.descendants(parent),
+        vec![child],
+        "sanity: before the close, this still-live child's edge must be restorable at all"
+    );
+
+    // The real close path: closing the PARENT must cascade down and close
+    // the CHILD too (`close_children`), never called on the child directly.
+    actor
+        .close(SessionOutcome::Completed)
+        .await
+        .expect("closing the parent must cascade-close its real child too");
+
+    let query_store = open(&dir.path().join("events.db")).await.unwrap();
+    let child_events = roundhouse_store::session_events(&query_store, child)
+        .await
+        .unwrap();
+    assert!(
+        child_events.iter().any(|e| matches!(
+            e.payload,
+            roundhouse_core::EventPayload::SessionClosed { .. }
+        )),
+        "close_children's cascade must have durably closed the real child too, got {:?}",
+        child_events.iter().map(|e| &e.payload).collect::<Vec<_>>()
+    );
+
+    // The restart: a brand-new tree, rebuilt from durable state alone.
+    let after_restart = Arc::new(SpawnTree::new());
+    reconcile_spawn_tree_at_boot(&resources.store, &after_restart)
+        .await
+        .unwrap();
+
+    assert!(
+        after_restart.descendants(parent).is_empty(),
+        "the cascade-closed child's edge must not be restored after a restart, got {:?}",
+        after_restart.descendants(parent)
+    );
 }

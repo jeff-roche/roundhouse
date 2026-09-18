@@ -331,7 +331,14 @@ pub(crate) mod test_support {
         .await
     }
 
-    async fn daemon_resources_with_rules_and_isolate(
+    /// The fixture every other `daemon_resources*` helper above is a
+    /// preset of, exposed directly (Phase 8, T19a) for the one case none of
+    /// those presets covers: a test that supplies its OWN `Isolate` so it
+    /// can observe which sessions' isolation handles were actually released.
+    /// `sub_agent_host`'s multi-sibling cascade test is the caller — it has
+    /// to distinguish "sibling A's isolate was torn down" from "sibling B's
+    /// was", which a shared `available_isolate()` cannot report.
+    pub(crate) async fn daemon_resources_with_rules_and_isolate(
         dir: &std::path::Path,
         workspace_registry: Option<Arc<crate::workspace_registry::WorkspaceRegistry>>,
         policy_rules: crate::session_bootstrap::PolicyRuleSource,

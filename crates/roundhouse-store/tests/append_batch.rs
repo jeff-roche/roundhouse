@@ -158,3 +158,54 @@ async fn append_batch_of_zero_events_is_a_harmless_no_op() {
     let seqs = writer.append_batch(Vec::new()).await.unwrap();
     assert_eq!(seqs, Vec::<u64>::new());
 }
+
+/// **The tail guard holds WITHIN one batch, not just against what was
+/// already committed** (Phase 8, T19a).
+///
+/// `append_batch` seeds each session's next seq from a `MAX(seq)` read the
+/// first time that session is seen, and reuses the in-memory value for every
+/// later item — so the `SessionClosed` tail check
+/// (`next_seq_or_reject_closed`) runs exactly once per session per batch.
+/// A batch that appends a session's own terminator and then appends more
+/// events for it would sail past that one check and commit events after a
+/// terminator, which the store's whole close contract says cannot exist and
+/// which no `UPDATE`/`DELETE` could ever repair. `append_batch` is `pub`, so
+/// "no caller does that today" is not a guarantee it can rest on.
+#[tokio::test]
+async fn append_batch_rejects_an_event_after_a_terminator_minted_in_the_same_batch() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("events.db");
+    let store = open(&db_path).await.unwrap();
+    let writer = spawn_writer(store).await;
+
+    let session = SessionId::new();
+    let batch = vec![
+        task_created_event(session, TaskId::new()),
+        RUNNER.record_session_closed(
+            session,
+            0, // seq — ignored, reassigned by the writer
+            now_ts(),
+            roundhouse_core::SessionOutcome::Completed,
+            1,
+        ),
+        task_created_event(session, TaskId::new()),
+    ];
+
+    let err = writer
+        .append_batch(batch)
+        .await
+        .expect_err("an event after this batch's own terminator must be rejected");
+    assert!(
+        matches!(&err, roundhouse_store::StoreError::SessionClosed(id) if *id == session.to_string()),
+        "the rejection must name the closed session, got {err:?}"
+    );
+
+    // The whole batch is rejected out of its `BEGIN IMMEDIATE`, so not even
+    // the two events that preceded the offending one are committed.
+    let query_store = open(&db_path).await.unwrap();
+    assert_eq!(
+        events_for_session(&query_store, session).await,
+        Vec::<i64>::new(),
+        "a rejected batch must commit nothing at all"
+    );
+}

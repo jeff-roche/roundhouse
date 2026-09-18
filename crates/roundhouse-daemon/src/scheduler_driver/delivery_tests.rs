@@ -165,6 +165,21 @@ impl Harness {
         .unwrap()
     }
 
+    /// The `SessionOutcome` this session's own `SessionClosed` terminator
+    /// carries, or `None` if its log has no terminator at all — the direct
+    /// evidence Phase 8, T19a Task 7's `DeliveryExecutor::close_and_retire`/
+    /// `release_session` split exists to produce.
+    async fn session_close_outcome(&self, session_id: SessionId) -> Option<SessionOutcome> {
+        roundhouse_store::session_events(&self.store, session_id)
+            .await
+            .unwrap()
+            .into_iter()
+            .find_map(|event| match event.payload {
+                EventPayload::SessionClosed { outcome } => Some(outcome),
+                _ => None,
+            })
+    }
+
     async fn run_state(&self, run_id: RunId) -> RunState {
         let conn = self.store.pool.get().await.unwrap();
         conn.interact(move |connection| recover_run(connection, run_id).unwrap().run.state)
@@ -591,6 +606,15 @@ async fn a_ready_delivery_runs_its_workflow_and_releases_its_admission_slot() {
              `Closed` nothing produces, so without an explicit teardown a per-delivery \
              session would live for the daemon's whole life and fill max_sessions"
     );
+    // Phase 8, T19a Task 7: a completed run's session must carry a real `SessionClosed`
+    // terminator, not just be torn down in memory.
+    match harness.session_close_outcome(session_id).await {
+        Some(SessionOutcome::Completed) => {}
+        other => panic!(
+            "a completed delivery must close its session with a Completed terminator, got \
+                 {other:?}"
+        ),
+    }
 }
 
 #[tokio::test]
@@ -616,14 +640,23 @@ async fn a_failing_workflow_fails_its_delivery_and_still_releases_the_slot() {
         "a FAILED run must release its slot too — a held slot wedges the binding shut \
              exactly like the never-released case"
     );
+    let session_id = row.session_id.expect("reserve stamps a session id");
     assert!(
-        harness
-            .sessions
-            .actor(row.session_id.expect("reserve stamps a session id"))
-            .is_none(),
+        harness.sessions.actor(session_id).is_none(),
         "a FAILED run must retire its session too, or a binding that fails every minute \
              fills max_sessions just as fast as one that succeeds"
     );
+    // Phase 8, T19a Task 7: `RunState::Failed` maps to `SessionOutcome::Failed`, carrying
+    // the state's own wire name — never a free-text sentence.
+    match harness.session_close_outcome(session_id).await {
+        Some(SessionOutcome::Failed { reason }) => {
+            assert_eq!(reason, RunState::Failed.wire_name());
+        }
+        other => panic!(
+            "a failed delivery must close its session with a Failed terminator naming the \
+                 run's own wire name, got {other:?}"
+        ),
+    }
 }
 
 /// A parked run is not terminal. Completing or failing its delivery would
@@ -651,13 +684,18 @@ async fn a_parked_run_leaves_its_delivery_running_and_holds_its_slot() {
         1,
         "a parked run is still live, so its admission slot must stay held"
     );
+    let session_id = row.session_id.expect("reserve stamps a session id");
     assert!(
-        harness
-            .sessions
-            .actor(row.session_id.expect("reserve stamps a session id"))
-            .is_some(),
+        harness.sessions.actor(session_id).is_some(),
         "a parked run's session must NOT be retired — the resume that answers its gate \
              runs in this session"
+    );
+    // Phase 8, T19a Task 7: a parked run is not terminal, so its session must carry no
+    // `SessionClosed` terminator at all.
+    assert!(
+        harness.session_close_outcome(session_id).await.is_none(),
+        "a parked run's session must not be closed — writing a terminator here would make \
+             the eventual resume's own appends trip the store's tail guard"
     );
 }
 
@@ -748,6 +786,16 @@ async fn an_undrivable_run_still_fails_its_delivery_and_releases_everything() {
     assert!(
         harness.sessions.actor(session_id).is_none(),
         "the session must be retired even when the failure is infra-level"
+    );
+    // Phase 8, T19a Task 7: a run loop error never reaches a terminal `RunState` (pinned
+    // below: the row is left `Running`), so this must go through
+    // `release_session`, not `close_and_retire` — a terminator here would
+    // precede whatever a future recovery pass appends to this same
+    // `session_id`.
+    assert!(
+        harness.session_close_outcome(session_id).await.is_none(),
+        "a run loop error that never reached a terminal RunState must write no SessionClosed \
+             terminator"
     );
 
     // The narrower gap, pinned so it is a known state rather than a
@@ -1095,6 +1143,24 @@ async fn an_unresolvable_job_fails_the_delivery_rather_than_the_driver() {
     assert!(
         harness.workspace_root.is_dir(),
         "the workspace must be untouched by a failed resolution"
+    );
+    // Phase 8, T19a Task 7: `run_claimed`'s own `Err(DeliveryError)` branch must go
+    // through `release_session`, writing no terminator — this failure is
+    // reached before any workflow ever ran.
+    //
+    // Like the redrive-continuation test's first boot,
+    // this assertion is vacuous by itself — an unresolvable job fails
+    // resolution before `*session` is ever set, so `release_session`
+    // receives `None` here too, and `None` can't distinguish
+    // `release_session` from `close_and_retire`. Kept as a sanity check on
+    // this call site's own behavior, not as independent proof of
+    // `release_session`'s no-terminator guarantee; see
+    // `release_session_writes_no_terminator_for_a_real_session` in
+    // `child_run_tests` for the direct, non-vacuous proof.
+    let session_id = row.session_id.expect("reserve stamps a session id");
+    assert!(
+        harness.session_close_outcome(session_id).await.is_none(),
+        "a pre-run infra failure (Err(DeliveryError)) must write no SessionClosed terminator"
     );
 }
 
@@ -2788,6 +2854,14 @@ mod recovery_tests {
             fresh_sessions.actor(session_id).is_none(),
             "a finished cancellation must retire its session"
         );
+        // Phase 8, T19a Task 7: `RunState::Cancelled` maps to `SessionOutcome::Cancelled`.
+        match harness.session_close_outcome(session_id).await {
+            Some(SessionOutcome::Cancelled) => {}
+            other => panic!(
+                "a delivery whose run reached Cancelled must close its session with a \
+                     Cancelled terminator, got {other:?}"
+            ),
+        }
     }
 
     #[tokio::test]
@@ -2964,6 +3038,89 @@ mod recovery_tests {
                  3 retries against an already-charged slot, exactly as every other \
                  leave-it-as-it-is path in this mechanism does"
         );
+    }
+
+    /// Phase 8, T19a Task 7: `release_session` (no terminator) must not
+    /// poison a `session_id` for a LATER, successful redrive.
+    ///
+    /// The FIRST boot's own "no terminator" assertion
+    /// below is vacuous by itself — `rebuild_and_drive_recovered_run`
+    /// returns every `DeliveryError` (including `NoWorkspaceRegistry`,
+    /// forced here) BEFORE `*session` is ever set, so `release_session`
+    /// receives `None` and the `session_id` has zero events at that point;
+    /// `None` can never distinguish `release_session` from
+    /// `close_and_retire`. (`release_session_writes_no_terminator_for_a_
+    /// real_session`, in `child_run_tests`, is the direct, non-vacuous
+    /// proof of `release_session`'s own behavior against a real session.)
+    /// The SECOND boot below is what this test actually establishes: with a
+    /// real workspace registry, redriving the exact same delivery/run/
+    /// session must still reach a genuine `Cancelled` terminator — proving
+    /// the first (failed) attempt did not leave anything behind that would
+    /// make this append fail with `StoreError::SessionClosed`.
+    #[tokio::test]
+    async fn a_cancellation_requested_delivery_whose_redrive_infra_failed_is_still_redrivable_to_a_real_terminator(
+    ) {
+        let harness = harness(completing_workflow()).await;
+        let (run_id, session_id) = harness
+            .simulate_cancellation_requested_before_crash(RunState::Running)
+            .await;
+
+        // First boot: the redrive's own infra fails (no workspace
+        // registry), after `control::cancel` already committed
+        // `Cancelling` — the exact scenario the previous test pins.
+        // `release_session` runs here, since this delivery never reached
+        // `Ok(DrivenRun::Outcome(RunOutcome::Terminal { .. }))`.
+        let (failed_attempt, _registry, _sessions) = harness
+            .fresh_executor_after_restart_without_workspace_registry()
+            .await;
+        recover_after_restart(
+            &failed_attempt,
+            &bindings_map(&harness.stored),
+            DateTime::from_timestamp_nanos(0),
+            &never_cancelled(),
+        )
+        .await;
+        // Trivially true here (`session` was `None` throughout — see this
+        // test's own doc comment), kept as a sanity check that the fixture
+        // still behaves as documented rather than as independent proof.
+        assert!(
+            harness.session_close_outcome(session_id).await.is_none(),
+            "an infra-failed redrive must write no SessionClosed terminator"
+        );
+
+        // Second boot: a real, working executor redrives the SAME
+        // session_id/run_id to completion.
+        let (fresh, fresh_registry, fresh_sessions) = harness.fresh_executor_after_restart();
+        recover_after_restart(
+            &fresh,
+            &bindings_map(&harness.stored),
+            DateTime::from_timestamp_nanos(0),
+            &never_cancelled(),
+        )
+        .await;
+
+        assert_eq!(
+            harness.state_of(&harness.delivery.delivery_id).await,
+            DeliveryState::Cancelled,
+            "a later, working redrive of the same delivery must still reach its real \
+                 terminal state — the first attempt's release_session must not have tripped \
+                 the store's own tail guard"
+        );
+        assert_eq!(harness.run_state(run_id).await, RunState::Cancelled);
+        match harness.session_close_outcome(session_id).await {
+            Some(SessionOutcome::Cancelled) => {}
+            other => panic!(
+                "the later, successful redrive must close the session with a Cancelled \
+                     terminator, got {other:?}"
+            ),
+        }
+        assert_eq!(
+            fresh_registry
+                .active_run_count(harness.stored.binding.id)
+                .unwrap(),
+            0
+        );
+        assert!(fresh_sessions.actor(session_id).is_none());
     }
 
     #[tokio::test]
