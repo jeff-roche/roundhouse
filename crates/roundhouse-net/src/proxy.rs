@@ -236,6 +236,21 @@ impl LoopbackProxy {
         self.sessions.contains_key(token)
     }
 
+    /// How many sessions are currently registered. Read-only, added
+    /// (Phase 8, T19a Task 9) for a real end-to-end test that closes a
+    /// session created through the full `CreateSession` -> `create_real_session`
+    /// socket path, where the minted bearer token itself is never handed back
+    /// to the caller (it lives only inside `session_bootstrap`'s own
+    /// `RealSession`/`spawn_session_reaper` wiring) — so, unlike
+    /// [`Self::is_registered`], such a test cannot name the one token to
+    /// check. A daemon fixture that creates exactly one session can instead
+    /// prove `deregister_session` genuinely ran by observing this drop to
+    /// zero, the same "prove a negative genuinely happened" motivation
+    /// [`Self::is_registered`]'s own doc comment describes.
+    pub fn registered_count(&self) -> usize {
+        self.sessions.len()
+    }
+
     /// Binds an ephemeral loopback port, serves forever in a spawned task,
     /// and returns the bound address. `runner` is the process-wide
     /// `TaskRunner` authority (per S-LOG-1, minted exactly once at daemon
